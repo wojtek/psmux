@@ -98,8 +98,107 @@ struct DragState {
     _right_initial: u16,
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn get_program_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "pmux".to_string())
+        .to_lowercase()
+        .replace(".exe", "")
+}
+
+fn print_help() {
+    let prog = get_program_name();
+    println!(r#"{prog} - PowerShell Terminal Multiplexer for Windows
+
+USAGE:
+    {prog} [COMMAND] [OPTIONS]
+
+COMMANDS:
+    (no command)        Start a new session or attach to existing one
+    new-session         Create a new session
+        -s <name>       Session name (default: "default")
+        -d              Start detached (in background)
+    attach, attach-session
+                        Attach to an existing session
+        -t <name>       Target session name
+    ls, list-sessions   List all active sessions
+    new-window          Create a new window in current session
+    split-window        Split current pane
+        -h              Split horizontally (side by side)
+        -v              Split vertically (top/bottom, default)
+    kill-pane           Close the current pane
+    capture-pane        Capture the content of current pane
+    server              Run as a server (internal use)
+    help                Show this help message
+    version             Show version information
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+
+KEY BINDINGS (default prefix: Ctrl+B):
+    prefix + c          Create new window
+    prefix + n          Next window
+    prefix + p          Previous window
+    prefix + "          Split pane horizontally
+    prefix + %          Split pane vertically
+    prefix + o          Switch to next pane
+    prefix + x          Kill current pane
+    prefix + d          Detach from session
+    prefix + [          Enter copy mode
+    prefix + :          Enter command mode
+    prefix + ,          Rename current window
+    prefix + w          Window chooser
+    prefix + q          Display pane numbers
+
+ENVIRONMENT VARIABLES:
+    PMUX_SESSION_NAME       Default session name
+    PMUX_DEFAULT_SESSION    Fallback default session name
+    PMUX_CURSOR_STYLE       Cursor style (block, underline, bar)
+    PMUX_CURSOR_BLINK       Cursor blinking (true/false)
+
+CONFIG FILES:
+    ~/.pmux.conf            Main configuration file
+    ~/.pmuxrc               Alternative configuration file
+    ~/.pmux/pmuxrc          Session directory configuration
+
+EXAMPLES:
+    {prog}                          Start or attach to default session
+    {prog} new-session -s work      Create a new session named "work"
+    {prog} attach -t work           Attach to session "work"
+    {prog} ls                       List all sessions
+    {prog} split-window -h          Split current pane horizontally
+
+For more information, visit: https://github.com/marlocarlo/pmux
+"#, prog = prog);
+}
+
+fn print_version() {
+    let prog = get_program_name();
+    println!("{} {}", prog, VERSION);
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
+    
+    // Handle help and version flags first
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "-h" | "--help" | "help" => {
+                print_help();
+                return Ok(());
+            }
+            "-V" | "--version" | "version" => {
+                print_version();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    
     if args.len() > 1 {
         match args[1].as_str() {
             "ls" | "list-sessions" => {
