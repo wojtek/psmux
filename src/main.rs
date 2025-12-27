@@ -2172,7 +2172,14 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 let _ = std::io::Write::write_all(&mut s, b"send-key space\n");
                             }
                         }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
+                            let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+                            if let Some(mut s) = try_connect() {
+                                let _ = std::io::Write::write_all(&mut s, format!("send-key C-{}\n", c).as_bytes());
+                            }
+                        }
+                        KeyCode::Char(c) => {
                             if let Some(mut s) = try_connect() {
                                 let _ = std::io::Write::write_all(&mut s, format!("send-text {}\n", c).as_bytes());
                             }
@@ -3017,7 +3024,12 @@ fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     let Some(active) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
     match key.code {
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
+            let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+            let _ = active.master.write_all(&[ctrl_char]);
+        }
+        KeyCode::Char(c) => {
             let _ = write!(active.master, "{}", c);
         }
         KeyCode::Enter => { let _ = write!(active.master, "\r"); }
@@ -6043,6 +6055,12 @@ fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "pageup" => { let _ = write!(p.master, "\x1b[5~"); }
             "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
             "space" => { let _ = write!(p.master, " "); }
+            // Control keys: C-c, C-d, C-z, etc.
+            s if s.starts_with("C-") && s.len() == 3 => {
+                let c = s.chars().nth(2).unwrap_or('c');
+                let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+                let _ = p.master.write_all(&[ctrl_char]);
+            }
             _ => {}
         }
     }
