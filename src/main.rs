@@ -2030,8 +2030,15 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
         })?;
         if event::poll(Duration::from_millis(16))? {  // ~60fps, faster response
             match event::read()? { Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL) { quit = true; }
-                else if matches!(key.code, KeyCode::Char('b')) && key.modifiers.contains(KeyModifiers::CONTROL) { prefix_armed = true; }
+                // Handle Ctrl+Q (quit) - check both modifier and raw control char
+                let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || matches!(key.code, KeyCode::Char('\x11')); // Raw Ctrl+Q
+                // Handle Ctrl+B (prefix) - check both modifier and raw control char
+                let is_ctrl_b = (matches!(key.code, KeyCode::Char('b')) && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || matches!(key.code, KeyCode::Char('\x02')); // Raw Ctrl+B
+                
+                if is_ctrl_q { quit = true; }
+                else if is_ctrl_b { prefix_armed = true; }
                 else if prefix_armed {
                     // tmux-like prefix mappings
                     match key.code {
@@ -2701,7 +2708,10 @@ fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState) -
 }
 
 fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
-    if matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Handle Ctrl+Q (quit) - check both modifier and raw control char
+    let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
+        || matches!(key.code, KeyCode::Char('\x11')); // Raw Ctrl+Q
+    if is_ctrl_q {
         return Ok(true);
     }
 
