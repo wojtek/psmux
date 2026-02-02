@@ -23,6 +23,72 @@ use std::env;
 use crossterm::style::Print;
 use serde::{Serialize, Deserialize};
 
+/// Enable virtual terminal processing on Windows Console Host.
+/// This is required for ANSI color codes to work in conhost.exe (legacy console).
+#[cfg(windows)]
+fn enable_virtual_terminal_processing() {
+    // Windows API constants
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !handle.is_null() {
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_virtual_terminal_processing() {
+    // No-op on non-Windows platforms
+}
+
+/// Install a console control handler on Windows to prevent termination on client detach.
+/// When the psmux client exits (after Ctrl+B d), Windows console events may propagate
+/// to the server process. This handler ignores CTRL_CLOSE_EVENT and related events
+/// to keep the server running.
+#[cfg(windows)]
+fn install_console_ctrl_handler() {
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    const CTRL_LOGOFF_EVENT: u32 = 5;
+    const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        // Return TRUE (1) to indicate we handled the event and prevent termination
+        match ctrl_type {
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => 1,
+            _ => 0, // Let other events (like CTRL_C_EVENT) be handled normally
+        }
+    }
+
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_console_ctrl_handler() {
+    // No-op on non-Windows platforms
+}
+
 struct Pane {
     master: Box<dyn MasterPty>,
     child: Box<dyn portable_pty::Child>,
@@ -1775,6 +1841,7 @@ fn main() -> io::Result<()> {
     }
     env::set_var("PSMUX_ACTIVE", "1");
     let mut stdout = io::stdout();
+    enable_virtual_terminal_processing();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture)?;
     apply_cursor_style(&mut stdout)?;
@@ -1910,7 +1977,9 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                 if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
                                 if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
-                                spans.push(Span::styled(cell.text.clone(), style));
+                                // Render empty cells as space to maintain column alignment
+                                let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
+                                spans.push(Span::styled(text, style));
                             }
                             lines.push(Line::from(spans));
                         }
@@ -2200,6 +2269,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         KeyCode::Enter => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key enter\n"); } }
                         KeyCode::Tab => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key tab\n"); } }
                         KeyCode::Backspace => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key backspace\n"); } }
+                        KeyCode::Delete => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key delete\n"); } }
                         KeyCode::Esc => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key esc\n"); } }
                         KeyCode::Left => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key left\n"); } }
                         KeyCode::Right => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key right\n"); } }
@@ -2207,6 +2277,8 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         KeyCode::Down => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key down\n"); } }
                         KeyCode::PageUp => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pageup\n"); } }
                         KeyCode::PageDown => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pagedown\n"); } }
+                        KeyCode::Home => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key home\n"); } }
+                        KeyCode::End => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key end\n"); } }
                         _ => {}
                     }
                 }
@@ -2728,6 +2800,14 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         }
         Mode::Prefix { armed_at } => {
             let elapsed = armed_at.elapsed().as_millis() as u64;
+            
+            // First check for custom bindings
+            let key_tuple = (key.code, key.modifiers);
+            if let Some(bind) = app.binds.iter().find(|b| b.key == key_tuple).cloned() {
+                app.mode = Mode::Passthrough;
+                return execute_action(app, &bind.action);
+            }
+            
             let handled = match key.code {
                 KeyCode::Left => { move_focus(app, FocusDir::Left); true }
                 KeyCode::Right => { move_focus(app, FocusDir::Right); true }
@@ -3166,15 +3246,25 @@ fn detect_shell() -> CommandBuilder {
     match pwsh.or(cmd) {
         Some(path) => {
             let mut builder = CommandBuilder::new(&path);
-            // If it's PowerShell, disable inline predictions (ghost text) which doesn't render well in PTY
+            // Set terminal capability environment variables for color support
+            builder.env("TERM", "xterm-256color");
+            builder.env("COLORTERM", "truecolor");
+            // If it's PowerShell, configure for PTY environment
             if path.to_lowercase().contains("pwsh") {
-                // Use -NoExit with a command to disable predictions, then continue interactive
+                // Use -NoExit with a command to:
+                // 1. Force ANSI color output (needed for ConPTY)
+                // 2. Disable inline predictions (ghost text) which doesn't render well in PTY
                 builder.args(["-NoLogo", "-NoExit", "-Command", 
-                    "Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
+                    "$PSStyle.OutputRendering = 'Ansi'; Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
             }
             builder
         }
-        None => CommandBuilder::new("pwsh.exe"),
+        None => {
+            let mut builder = CommandBuilder::new("pwsh.exe");
+            builder.env("TERM", "xterm-256color");
+            builder.env("COLORTERM", "truecolor");
+            builder
+        }
     }
 }
 
@@ -3301,6 +3391,75 @@ fn fire_hooks(app: &mut AppState, event: &str) {
             let _ = execute_command_string(app, &cmd);
         }
     }
+}
+
+/// Execute an Action (from key bindings)
+fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
+    match action {
+        Action::DisplayPanes => {
+            let win = &app.windows[app.active_idx];
+            let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+            compute_rects(&win.root, app.last_window_area, &mut rects);
+            app.display_map.clear();
+            for (i, (path, _)) in rects.into_iter().enumerate() {
+                let n = i + 1;
+                if n <= 10 { app.display_map.push((n, path)); } else { break; }
+            }
+            app.mode = Mode::PaneChooser { opened_at: Instant::now() };
+        }
+        Action::MoveFocus(dir) => {
+            move_focus(app, *dir);
+        }
+        Action::NewWindow => {
+            let pty_system = PtySystemSelection::default()
+                .get()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+            create_window(&*pty_system, app)?;
+        }
+        Action::SplitHorizontal => {
+            split_active(app, LayoutKind::Horizontal)?;
+        }
+        Action::SplitVertical => {
+            split_active(app, LayoutKind::Vertical)?;
+        }
+        Action::KillPane => {
+            kill_active_pane(app)?;
+        }
+        Action::NextWindow => {
+            if !app.windows.is_empty() {
+                app.last_window_idx = app.active_idx;
+                app.active_idx = (app.active_idx + 1) % app.windows.len();
+            }
+        }
+        Action::PrevWindow => {
+            if !app.windows.is_empty() {
+                app.last_window_idx = app.active_idx;
+                app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+            }
+        }
+        Action::CopyMode => {
+            enter_copy_mode(app);
+        }
+        Action::Paste => {
+            paste_latest(app)?;
+        }
+        Action::Detach => {
+            return Ok(true); // Signal to quit/detach
+        }
+        Action::RenameWindow => {
+            app.mode = Mode::RenamePrompt { input: String::new() };
+        }
+        Action::WindowChooser => {
+            app.mode = Mode::WindowChooser { selected: app.active_idx };
+        }
+        Action::ZoomPane => {
+            toggle_zoom(app);
+        }
+        Action::Command(cmd) => {
+            execute_command_string(app, cmd)?;
+        }
+    }
+    Ok(false)
 }
 
 /// Execute a command string (used by menus, hooks, confirm dialogs, etc.)
@@ -4052,7 +4211,24 @@ fn parse_command_to_action(cmd: &str) -> Option<Action> {
     
     match parts[0] {
         "display-panes" => Some(Action::DisplayPanes),
-        "select-pane" => {
+        "new-window" | "neww" => Some(Action::NewWindow),
+        "split-window" | "splitw" => {
+            if parts.iter().any(|p| *p == "-h") {
+                Some(Action::SplitHorizontal)
+            } else {
+                Some(Action::SplitVertical)
+            }
+        }
+        "kill-pane" => Some(Action::KillPane),
+        "next-window" | "next" => Some(Action::NextWindow),
+        "previous-window" | "prev" => Some(Action::PrevWindow),
+        "copy-mode" => Some(Action::CopyMode),
+        "paste-buffer" => Some(Action::Paste),
+        "detach-client" | "detach" => Some(Action::Detach),
+        "rename-window" | "renamew" => Some(Action::RenameWindow),
+        "choose-window" | "choose-tree" => Some(Action::WindowChooser),
+        "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") => Some(Action::ZoomPane),
+        "select-pane" | "selectp" => {
             if parts.iter().any(|p| *p == "-U") {
                 Some(Action::MoveFocus(FocusDir::Up))
             } else if parts.iter().any(|p| *p == "-D") {
@@ -4062,10 +4238,12 @@ fn parse_command_to_action(cmd: &str) -> Option<Action> {
             } else if parts.iter().any(|p| *p == "-R") {
                 Some(Action::MoveFocus(FocusDir::Right))
             } else {
-                None
+                // Generic select-pane without direction - store as command
+                Some(Action::Command(cmd.to_string()))
             }
         }
-        _ => None  // Other commands would need more Action variants
+        // For any other command, store it as a Command action to be executed later
+        _ => Some(Action::Command(cmd.to_string()))
     }
 }
 
@@ -4073,6 +4251,18 @@ fn parse_command_to_action(cmd: &str) -> Option<Action> {
 fn format_action(action: &Action) -> String {
     match action {
         Action::DisplayPanes => "display-panes".to_string(),
+        Action::NewWindow => "new-window".to_string(),
+        Action::SplitHorizontal => "split-window -h".to_string(),
+        Action::SplitVertical => "split-window -v".to_string(),
+        Action::KillPane => "kill-pane".to_string(),
+        Action::NextWindow => "next-window".to_string(),
+        Action::PrevWindow => "previous-window".to_string(),
+        Action::CopyMode => "copy-mode".to_string(),
+        Action::Paste => "paste-buffer".to_string(),
+        Action::Detach => "detach-client".to_string(),
+        Action::RenameWindow => "rename-window".to_string(),
+        Action::WindowChooser => "choose-window".to_string(),
+        Action::ZoomPane => "resize-pane -Z".to_string(),
         Action::MoveFocus(dir) => {
             let flag = match dir {
                 FocusDir::Up => "-U",
@@ -4082,6 +4272,7 @@ fn format_action(action: &Action) -> String {
             };
             format!("select-pane {}", flag)
         }
+        Action::Command(cmd) => cmd.clone(),
     }
 }
 
@@ -4287,17 +4478,11 @@ fn parse_bind_key(app: &mut AppState, line: &str) {
     let command = parts[i..].join(" ");
     
     if let Some(key) = parse_key_name(key_str) {
-        // Store the binding - for now we just support display-panes and focus commands
-        let action = match command.as_str() {
-            "display-panes" => Some(Action::DisplayPanes),
-            s if s.starts_with("select-pane -U") => Some(Action::MoveFocus(FocusDir::Up)),
-            s if s.starts_with("select-pane -D") => Some(Action::MoveFocus(FocusDir::Down)),
-            s if s.starts_with("select-pane -L") => Some(Action::MoveFocus(FocusDir::Left)),
-            s if s.starts_with("select-pane -R") => Some(Action::MoveFocus(FocusDir::Right)),
-            _ => None,
-        };
-        if let Some(act) = action {
-            app.binds.push(Bind { key, action: act });
+        // Use parse_command_to_action which now supports all commands
+        if let Some(action) = parse_command_to_action(&command) {
+            // Remove any existing binding for this key
+            app.binds.retain(|b| b.key != key);
+            app.binds.push(Bind { key, action });
         }
     }
 }
@@ -4454,6 +4639,22 @@ fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'static>>
 }
 
 fn map_color(name: &str) -> Color {
+    // Handle indexed colors: "idx:N"
+    if let Some(idx_str) = name.strip_prefix("idx:") {
+        if let Ok(idx) = idx_str.parse::<u8>() {
+            return Color::Indexed(idx);
+        }
+    }
+    // Handle RGB colors: "rgb:R,G,B"
+    if let Some(rgb_str) = name.strip_prefix("rgb:") {
+        let parts: Vec<&str> = rgb_str.split(',').collect();
+        if parts.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+    }
+    // Handle named colors
     match name.to_lowercase().as_str() {
         "black" => Color::Black,
         "red" => Color::Red,
@@ -4608,7 +4809,25 @@ fn save_latest_buffer(app: &mut AppState, file: &str) -> io::Result<()> {
 }
 
 #[derive(Clone)]
-enum Action { DisplayPanes, MoveFocus(FocusDir) }
+enum Action { 
+    DisplayPanes, 
+    MoveFocus(FocusDir),
+    /// Execute an arbitrary tmux-style command string
+    Command(String),
+    /// Common actions with direct handling
+    NewWindow,
+    SplitHorizontal,
+    SplitVertical,
+    KillPane,
+    NextWindow,
+    PrevWindow,
+    CopyMode,
+    Paste,
+    Detach,
+    RenameWindow,
+    WindowChooser,
+    ZoomPane,
+}
 
 #[derive(Clone)]
 struct Bind { key: (KeyCode, KeyModifiers), action: Action }
@@ -4736,6 +4955,9 @@ fn focus_pane_by_id(app: &mut AppState, pid: usize) {
     if let Some(p) = found { win.active_path = p; }
 }
 fn run_server(session_name: String) -> io::Result<()> {
+    // Install console control handler to prevent termination on client detach
+    install_console_ctrl_handler();
+
     let pty_system = PtySystemSelection::default()
         .get()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
@@ -6085,7 +6307,11 @@ fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         match k {
             "enter" => { let _ = write!(p.master, "\r"); }
             "tab" => { let _ = write!(p.master, "\t"); }
-            "backspace" => { let _ = write!(p.master, "\x08"); }
+            // Use DEL (0x7F) for backspace - this is what modern terminals expect
+            // and what PSReadLine's BackwardDeleteChar responds to correctly.
+            // Using 0x08 (BS) can cause issues with some terminal applications.
+            "backspace" => { let _ = p.master.write_all(&[0x7F]); }
+            "delete" => { let _ = write!(p.master, "\x1b[3~"); }
             "esc" => { let _ = write!(p.master, "\x1b"); }
             "left" => { let _ = write!(p.master, "\x1b[D"); }
             "right" => { let _ = write!(p.master, "\x1b[C"); }
@@ -6093,6 +6319,8 @@ fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "down" => { let _ = write!(p.master, "\x1b[B"); }
             "pageup" => { let _ = write!(p.master, "\x1b[5~"); }
             "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
+            "home" => { let _ = write!(p.master, "\x1b[H"); }
+            "end" => { let _ = write!(p.master, "\x1b[F"); }
             "space" => { let _ = write!(p.master, " "); }
             // Control keys: C-c, C-d, C-z, etc.
             s if s.starts_with("C-") && s.len() == 3 => {
