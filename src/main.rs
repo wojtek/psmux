@@ -583,14 +583,15 @@ fn main() -> io::Result<()> {
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
                 let mut cmd = std::process::Command::new(&exe);
                 cmd.arg("server").arg("-s").arg(&name);
-                // On Windows, use CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW to run in background
-                // DETACHED_PROCESS causes PTY issues
+                // On Windows, use DETACHED_PROCESS to completely detach from parent console.
+                // This ensures the server survives when the parent SSH/console dies.
+                // CREATE_NEW_PROCESS_GROUP prevents Ctrl+C signals from propagating.
                 #[cfg(windows)]
                 {
                     use std::os::windows::process::CommandExt;
                     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                    const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+                    const DETACHED_PROCESS: u32 = 0x00000008;
+                    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
                 }
                 let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 
@@ -1816,8 +1817,8 @@ fn main() -> io::Result<()> {
             {
                 use std::os::windows::process::CommandExt;
                 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+                const DETACHED_PROCESS: u32 = 0x00000008;
+                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
             }
             let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             
