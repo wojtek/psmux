@@ -676,7 +676,16 @@ fn main() -> io::Result<()> {
                 }
                 let mut cmd = "send-keys".to_string();
                 if literal { cmd.push_str(" -l"); }
-                for k in keys { cmd.push_str(&format!(" {}", k)); }
+                // Quote arguments that contain spaces to preserve them
+                for k in keys { 
+                    if k.contains(' ') || k.contains('\t') {
+                        // Escape any existing quotes and wrap in quotes
+                        let escaped = k.replace('\\', "\\\\").replace('"', "\\\"");
+                        cmd.push_str(&format!(" \"{}\"", escaped));
+                    } else {
+                        cmd.push_str(&format!(" {}", k)); 
+                    }
+                }
                 cmd.push('\n');
                 send_control(cmd)?;
                 return Ok(());
@@ -4955,6 +4964,40 @@ fn focus_pane_by_id(app: &mut AppState, pid: usize) {
     rec(&win.root, &mut Vec::new(), &mut found, pid);
     if let Some(p) = found { win.active_path = p; }
 }
+
+/// Parse a command line string, respecting quoted arguments.
+/// Handles double-quoted strings with escape sequences.
+fn parse_command_line(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+    
+    for c in line.chars() {
+        if escape_next {
+            current.push(c);
+            escape_next = false;
+        } else if c == '\\' && in_quotes {
+            escape_next = true;
+        } else if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                args.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    
+    if !current.is_empty() {
+        args.push(current);
+    }
+    
+    args
+}
+
 fn run_server(session_name: String) -> io::Result<()> {
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -5013,9 +5056,10 @@ fn run_server(session_name: String) -> io::Result<()> {
                 let mut line = String::new();
                 let mut r = io::BufReader::new(stream.try_clone().unwrap());
                 let _ = r.read_line(&mut line);
-                let mut parts = line.split_whitespace();
-                let cmd = parts.next().unwrap_or("");
-                let mut args: Vec<&str> = parts.by_ref().collect();
+                // Use quote-aware parser to preserve arguments with spaces
+                let parsed = parse_command_line(&line);
+                let cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
+                let args: Vec<&str> = parsed.iter().skip(1).map(|s| s.as_str()).collect();
                 let mut target_win: Option<usize> = None;
                 let mut target_pane: Option<usize> = None;
                 let mut i = 0;
