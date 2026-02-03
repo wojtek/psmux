@@ -2293,6 +2293,18 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 let _ = std::io::Write::write_all(&mut s, b"send-key space\n");
                             }
                         }
+                        // Ctrl+Alt+char: send as C-M-x
+                        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) => {
+                            if let Some(mut s) = try_connect() {
+                                let _ = std::io::Write::write_all(&mut s, format!("send-key C-M-{}\n", c.to_ascii_lowercase()).as_bytes());
+                            }
+                        }
+                        // Alt+char: send as M-x
+                        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
+                            if let Some(mut s) = try_connect() {
+                                let _ = std::io::Write::write_all(&mut s, format!("send-key M-{}\n", c).as_bytes());
+                            }
+                        }
                         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
                             if let Some(mut s) = try_connect() {
@@ -3209,6 +3221,15 @@ fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     let Some(active) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
     match key.code {
+        // Ctrl+Alt+char: send ESC followed by control character
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) => {
+            let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+            let _ = active.master.write_all(&[0x1b, ctrl_char]);
+        }
+        // Alt+char: send ESC (0x1b) followed by the character
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
+            let _ = write!(active.master, "\x1b{}", c);
+        }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
@@ -5665,14 +5686,15 @@ fn run_server(session_name: String) -> io::Result<()> {
                         // Parse key names and send
                         let parts: Vec<&str> = keys.split_whitespace().collect();
                         for (i, key) in parts.iter().enumerate() {
-                            let is_special = matches!(key.to_uppercase().as_str(), 
+                            let key_upper = key.to_uppercase();
+                            let is_special = matches!(key_upper.as_str(), 
                                 "ENTER" | "TAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
                                 "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
                                 "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
                                 "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
-                            ) || key.to_uppercase().starts_with("C-");
+                            ) || key_upper.starts_with("C-") || key_upper.starts_with("M-");
                             
-                            match key.to_uppercase().as_str() {
+                            match key_upper.as_str() {
                                 "ENTER" => send_text_to_active(&mut app, "\r")?,
                                 "TAB" => send_text_to_active(&mut app, "\t")?,
                                 "ESCAPE" | "ESC" => send_text_to_active(&mut app, "\x1b")?,
@@ -5700,6 +5722,13 @@ fn run_server(session_name: String) -> io::Result<()> {
                                 "F10" => send_text_to_active(&mut app, "\x1b[21~")?,
                                 "F11" => send_text_to_active(&mut app, "\x1b[23~")?,
                                 "F12" => send_text_to_active(&mut app, "\x1b[24~")?,
+                                s if s.starts_with("C-M-") || s.starts_with("C-m-") => {
+                                    // Ctrl+Alt/Meta key - send ESC followed by control character
+                                    if let Some(c) = key.chars().nth(4) {
+                                        let ctrl = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                                        send_text_to_active(&mut app, &format!("\x1b{}", ctrl as char))?;
+                                    }
+                                }
                                 s if s.starts_with("C-") => {
                                     // Ctrl+key
                                     if let Some(c) = s.chars().nth(2) {
@@ -5707,16 +5736,24 @@ fn run_server(session_name: String) -> io::Result<()> {
                                         send_text_to_active(&mut app, &String::from(ctrl as char))?;
                                     }
                                 }
+                                s if s.starts_with("M-") => {
+                                    // Alt/Meta key - send ESC followed by character
+                                    if let Some(c) = key.chars().nth(2) {
+                                        // Use original key to preserve case
+                                        send_text_to_active(&mut app, &format!("\x1b{}", c))?;
+                                    }
+                                }
                                 _ => {
                                     send_text_to_active(&mut app, key)?;
                                     // Add space after non-special keys unless it's the last one before a special key
                                     if i + 1 < parts.len() {
-                                        let next_is_special = matches!(parts[i + 1].to_uppercase().as_str(),
+                                        let next_upper = parts[i + 1].to_uppercase();
+                                        let next_is_special = matches!(next_upper.as_str(),
                                             "ENTER" | "TAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
                                             "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
                                             "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
                                             "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
-                                        ) || parts[i + 1].to_uppercase().starts_with("C-");
+                                        ) || next_upper.starts_with("C-") || next_upper.starts_with("M-");
                                         if !next_is_special {
                                             send_text_to_active(&mut app, " ")?;
                                         }
@@ -6571,6 +6608,17 @@ fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 let c = s.chars().nth(2).unwrap_or('c');
                 let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
                 let _ = p.master.write_all(&[ctrl_char]);
+            }
+            // Alt keys: M-x, Alt-x (Meta/Alt sends ESC prefix)
+            s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
+                let c = s.chars().nth(2).unwrap_or('a');
+                let _ = write!(p.master, "\x1b{}", c);
+            }
+            // Ctrl+Alt keys: C-M-x (sends ESC followed by control char)
+            s if (s.starts_with("C-M-") || s.starts_with("c-m-")) && s.len() == 5 => {
+                let c = s.chars().nth(4).unwrap_or('c');
+                let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+                let _ = p.master.write_all(&[0x1b, ctrl_char]);
             }
             _ => {}
         }
