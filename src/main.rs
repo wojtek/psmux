@@ -415,7 +415,6 @@ fn cleanup_stale_port_files() {
                         ).is_err() {
                             // Server not responding - remove stale port file
                             let _ = std::fs::remove_file(&path);
-                        } else {
                         }
                     } else {
                         // Invalid port file content
@@ -589,6 +588,7 @@ fn main() -> io::Result<()> {
                     }
                     if cmd_parts.is_empty() { None } else { Some(cmd_parts.join(" ")) }
                 };
+                
                 // Check if session already exists AND is actually running
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let port_path = format!("{}\\.psmux\\{}.port", home, name);
@@ -621,24 +621,15 @@ fn main() -> io::Result<()> {
                 if let Some(ref init_cmd) = initial_cmd {
                     cmd.arg("-c").arg(init_cmd);
                 }
-                // Redirect stderr to a file for debugging (only if debug is needed)
-                // In production, stderr would go to null
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let debug_path = format!("{}\\.psmux\\server_debug.txt", home);
-                if let Ok(file) = std::fs::File::create(&debug_path) {
-                    cmd.stderr(std::process::Stdio::from(file));
-                } else {
-                    cmd.stderr(std::process::Stdio::null());
-                }
-                // On Windows, use CREATE_NEW_PROCESS_GROUP to prevent Ctrl+C from propagating
-                // to the server. Do NOT use CREATE_NEW_CONSOLE - it causes shells spawned
-                // via ConPTY to exit immediately. The server inherits the parent's console
-                // but doesn't interact with it directly (uses ConPTY for shells).
+                // On Windows, use DETACHED_PROCESS to completely detach from parent console.
+                // This ensures the server survives when the parent SSH/console dies.
+                // CREATE_NEW_PROCESS_GROUP prevents Ctrl+C signals from propagating.
                 #[cfg(windows)]
                 {
                     use std::os::windows::process::CommandExt;
                     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+                    const DETACHED_PROCESS: u32 = 0x00000008;
+                    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
                 }
                 let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 
@@ -846,7 +837,7 @@ fn main() -> io::Result<()> {
                 }
                 cmd.push('\n');
                 let resp = send_control_with_response(cmd)?;
-                println!("{}", resp);
+                print!("{}", resp);
                 return Ok(());
             }
             // kill-window - Kill a window
@@ -1238,8 +1229,8 @@ fn main() -> io::Result<()> {
             "rotate-window" | "rotatew" => {
                 let mut cmd = "rotate-window".to_string();
                 let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
+                while i < args.len() {
+                    match args[i].as_str() {
                         "-D" => { cmd.push_str(" -D"); }
                         "-U" => { cmd.push_str(" -U"); }
                         "-t" => {
@@ -1887,16 +1878,12 @@ fn main() -> io::Result<()> {
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
             let mut cmd = std::process::Command::new(&exe);
             cmd.arg("server").arg("-s").arg(&session_name);
-            // Redirect stdio to prevent inheriting parent's handles
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
                 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);
+                const DETACHED_PROCESS: u32 = 0x00000008;
+                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
             }
             let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             
@@ -2472,17 +2459,21 @@ fn send_control_with_response(line: String) -> io::Result<String> {
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(5000)));  // Longer timeout
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     // Send AUTH first, then the command
     let _ = write!(stream, "AUTH {}\n{}", session_key, line);
     let _ = stream.flush();
-    // Read response - wait for connection close or data
     let mut buf = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
-    let response = String::from_utf8_lossy(&buf).to_string();
-    // Skip the "OK\n" prefix if present
-    let response = response.strip_prefix("OK\n").unwrap_or(&response).to_string();
-    Ok(response)
+    let mut temp = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut stream, &mut temp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&temp[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
@@ -2572,15 +2563,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
                 match cmd {
                     "new-window" => {
-                        // Extract command after all flags
-                        let cmd_arg = args.iter().find(|a| !a.starts_with('-') && !a.starts_with('%') && !a.starts_with('@')).map(|s| s.to_string());
-                        let _ = tx.send(CtrlReq::NewWindow(cmd_arg));
+                        // Parse optional command - find first non-flag argument after command
+                        let cmd_str: Option<String> = args.iter()
+                            .find(|a| !a.starts_with('-'))
+                            .map(|s| s.trim_matches('"').to_string());
+                        let _ = tx.send(CtrlReq::NewWindow(cmd_str));
                     }
                     "split-window" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-                        // Extract command after all flags
-                        let cmd_arg = args.iter().find(|a| !a.starts_with('-') && !a.starts_with('%') && !a.starts_with('@')).map(|s| s.to_string());
-                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_arg));
+                        // Parse optional command - find first non-flag argument after flags
+                        let cmd_str: Option<String> = args.iter()
+                            .find(|a| !a.starts_with('-'))
+                            .map(|s| s.trim_matches('"').to_string());
+                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str));
                     }
                     "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" => {
@@ -2817,7 +2812,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     create_window(&*pty_system, &mut app, cmd.as_deref())?;
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
@@ -2898,11 +2893,13 @@ fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, c
     let pair = pty_system
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+
     let shell_cmd = build_command(command);
     let child = pair
         .slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
     let mut reader = pair
@@ -2991,11 +2988,11 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('%') => {
-                    split_active(app, LayoutKind::Horizontal, None)?;
+                    split_active(app, LayoutKind::Horizontal)?;
                     true
                 }
                 KeyCode::Char('"') => {
-                    split_active(app, LayoutKind::Vertical, None)?;
+                    split_active(app, LayoutKind::Vertical)?;
                     true
                 }
                 KeyCode::Char('x') => {
@@ -3307,7 +3304,11 @@ fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
     Ok(())
 }
 
-fn split_active(app: &mut AppState, kind: LayoutKind, command: Option<&str>) -> io::Result<()> {
+fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
+    split_active_with_command(app, kind, None)
+}
+
+fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: Option<&str>) -> io::Result<()> {
     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
     let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
@@ -3439,19 +3440,21 @@ fn build_command(command: Option<&str>) -> CommandBuilder {
         }
     } else {
         // No command specified - start default interactive shell
-        // Use pwsh if available, otherwise cmd.exe
         let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
-        
-        match pwsh {
+        let cmd_exe = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
+        match pwsh.or(cmd_exe) {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
-                builder.args(["-NoLogo"]);
+                if path.to_lowercase().contains("pwsh") {
+                    builder.args(["-NoLogo", "-NoExit", "-Command", 
+                        "$PSStyle.OutputRendering = 'Ansi'; Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
+                }
                 builder
             }
             None => {
-                let mut builder = CommandBuilder::new("cmd.exe");
+                let mut builder = CommandBuilder::new("pwsh.exe");
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder
@@ -3468,15 +3471,11 @@ fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
     match parts[0] {
         "new-window" => {
             let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
-            // Extract command after all flags
-            let cmd = parts.iter().skip(1).find(|p| !p.starts_with('-')).map(|s| *s);
-            create_window(&*pty_system, app, cmd)?;
+            create_window(&*pty_system, app, None)?;
         }
         "split-window" => {
             let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-            // Extract command after all flags
-            let cmd = parts.iter().skip(1).find(|p| !p.starts_with('-')).map(|s| *s);
-            split_active(app, kind, cmd)?;
+            split_active(app, kind)?;
         }
         "kill-pane" => { kill_active_pane(app)?; }
         "capture-pane" => { capture_active_pane(app)?; }
@@ -3613,10 +3612,10 @@ fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
             create_window(&*pty_system, app, None)?;
         }
         Action::SplitHorizontal => {
-            split_active(app, LayoutKind::Horizontal, None)?;
+            split_active(app, LayoutKind::Horizontal)?;
         }
         Action::SplitVertical => {
-            split_active(app, LayoutKind::Vertical, None)?;
+            split_active(app, LayoutKind::Vertical)?;
         }
         Action::KillPane => {
             kill_active_pane(app)?;
@@ -3824,15 +3823,10 @@ fn reap_children(app: &mut AppState) -> io::Result<bool> {
                     app.windows[i].active_path = first_leaf_path(&app.windows[i].root);
                 }
             }
-            None => { 
-                app.windows.remove(i); 
-            }
+            None => { app.windows.remove(i); }
         }
     }
-    let all_empty = app.windows.is_empty();
-    if all_empty {
-    }
-    Ok(all_empty)
+    Ok(app.windows.is_empty())
 }
 
 fn vt_to_color(c: vt100::Color) -> Color {
@@ -4226,13 +4220,8 @@ fn prune_exited(n: Node) -> Option<Node> {
     match n {
         Node::Leaf(mut p) => {
             match p.child.try_wait() {
-                Ok(Some(status)) => {
-                    None
-                },
-                Ok(None) => Some(Node::Leaf(p)),  // Still running
-                Err(e) => {
-                    Some(Node::Leaf(p))
-                }
+                Ok(Some(_)) => None,
+                _ => Some(Node::Leaf(p)),
             }
         }
         Node::Split { kind, sizes: _sizes, children } => {
@@ -5038,8 +5027,8 @@ enum Action {
 #[derive(Clone)]
 struct Bind { key: (KeyCode, KeyModifiers), action: Action }
 enum CtrlReq {
-    NewWindow(Option<String>),              // optional command to run
-    SplitWindow(LayoutKind, Option<String>), // layout kind, optional command
+    NewWindow(Option<String>),
+    SplitWindow(LayoutKind, Option<String>),
     KillPane,
     CapturePane(mpsc::Sender<String>),
     FocusWindow(usize),
@@ -5196,28 +5185,6 @@ fn parse_command_line(line: &str) -> Vec<String> {
 }
 
 fn run_server(session_name: String, initial_command: Option<String>) -> io::Result<()> {
-    // On Windows, hide the console window if we have one.
-    // The server doesn't need to show a console - it uses ConPTY for shells.
-    #[cfg(windows)]
-    {
-        use std::os::raw::c_int;
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetConsoleWindow() -> *mut std::ffi::c_void;
-        }
-        #[link(name = "user32")]
-        extern "system" {
-            fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: c_int) -> c_int;
-        }
-        const SW_HIDE: c_int = 0;
-        unsafe {
-            let hwnd = GetConsoleWindow();
-            if !hwnd.is_null() {
-                ShowWindow(hwnd, SW_HIDE);
-            }
-        }
-    }
-    
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
 
@@ -5335,13 +5302,10 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
                 let args: Vec<&str> = parsed.iter().skip(1).map(|s| s.as_str()).collect();
                 let mut target_win: Option<usize> = None;
                 let mut target_pane: Option<usize> = None;
-                let mut consumed_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let mut i = 0;
                 while i < args.len() {
                     if args[i] == "-t" {
-                        consumed_indices.insert(i);
                         if let Some(v) = args.get(i+1) {
-                            consumed_indices.insert(i+1);
                             if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
                             else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
                         }
@@ -5353,19 +5317,19 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
                 if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
                 match cmd {
                     "new-window" => {
-                        // Extract command after all flags, excluding consumed -t arguments
-                        let cmd_arg = args.iter().enumerate()
-                            .find(|(idx, a)| !consumed_indices.contains(idx) && !a.starts_with('-') && !a.starts_with('%') && !a.starts_with('@'))
-                            .map(|(_, s)| s.to_string());
-                        let _ = tx.send(CtrlReq::NewWindow(cmd_arg));
+                        // Parse optional command - find first non-flag argument
+                        let cmd_str: Option<String> = args.iter()
+                            .find(|a| !a.starts_with('-'))
+                            .map(|s| s.trim_matches('"').to_string());
+                        let _ = tx.send(CtrlReq::NewWindow(cmd_str));
                     }
                     "split-window" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-                        // Extract command after all flags, excluding consumed -t arguments
-                        let cmd_arg = args.iter().enumerate()
-                            .find(|(idx, a)| !consumed_indices.contains(idx) && !a.starts_with('-') && !a.starts_with('%') && !a.starts_with('@'))
-                            .map(|(_, s)| s.to_string());
-                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_arg));
+                        // Parse optional command - find first non-flag argument after flags
+                        let cmd_str: Option<String> = args.iter()
+                            .find(|a| !a.starts_with('-'))
+                            .map(|s| s.trim_matches('"').to_string());
+                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str));
                     }
                     "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" => {
@@ -5430,8 +5394,8 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
                     "next-window" => { let _ = tx.send(CtrlReq::NextWindow); }
                     "previous-window" => { let _ = tx.send(CtrlReq::PrevWindow); }
                     "rename-window" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
-                    "list-windows" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); let _ = stream.flush(); } }
-                    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); let _ = stream.flush(); } }
+                    "list-windows" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); } }
+                    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); } }
                     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
                     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
                     // New tmux-compatible commands
@@ -5743,8 +5707,6 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
                     }
                     _ => {}
                 }
-                // Shutdown the stream to signal end of response
-                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
     });
@@ -5752,7 +5714,7 @@ fn run_server(session_name: String, initial_command: Option<String>) -> io::Resu
         while let Some(req) = app.control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             match req {
                 CtrlReq::NewWindow(cmd) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); resize_all_panes(&mut app); }
-                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
