@@ -28,6 +28,8 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 - **tmux-compatible** — Same commands, same keybindings, zero learning curve
 - **Aliases included** — Use `psmux`, `pmux`, or `tmux` command, your choice
 
+![psmux in action - monitoring system info](psmux_sysinfo.gif)
+
 ## Features
 
 - Split panes horizontally and vertically
@@ -37,6 +39,8 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 - Copy mode with vim-like keybindings
 - **Scrollback history** (1000 lines per pane)
 - Synchronized input to multiple panes
+
+![psmux windows and panes](psmux_windows.gif)
 
 ## Requirements
 
