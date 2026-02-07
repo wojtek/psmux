@@ -116,10 +116,9 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
                         if w == 0 {
                             spans.push(Span::styled(" ", style));
                             c += 1;
-                        } else if w >= 2 && c + 1 < target_cols {
+                        } else if w >= 2 {
                             spans.push(Span::styled(text, style));
-                            spans.push(Span::styled(" ", style));
-                            c += 2;
+                            c += 2; // skip continuation cell
                         } else {
                             spans.push(Span::styled(text, style));
                             c += 1;
@@ -133,7 +132,7 @@ pub fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur
             }
             f.render_widget(pane_block, area);
             f.render_widget(Clear, inner);
-            let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+            let para = Paragraph::new(Text::from(lines));
             f.render_widget(para, inner);
             if is_active {
                 let (cr, cc) = screen.cursor_position();

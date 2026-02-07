@@ -364,7 +364,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         for r in 0..inner.height.min(content.len() as u16) {
                             let mut spans: Vec<Span> = Vec::new();
                             let row = &content[r as usize];
-                            for c in 0..inner.width.min(row.len() as u16) {
+                            let max_c = inner.width.min(row.len() as u16);
+                            let mut c: u16 = 0;
+                            while c < max_c {
                                 let cell = &row[c as usize];
                                 let mut fg = map_color(&cell.fg);
                                 let mut bg = map_color(&cell.bg);
@@ -378,13 +380,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
                                 if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
                                 let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
+                                let char_width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
                                 spans.push(Span::styled(text, style));
+                                if char_width >= 2 {
+                                    c += 2; // skip continuation cell after wide character
+                                } else {
+                                    c += 1;
+                                }
                             }
                             lines.push(Line::from(spans));
                         }
                         f.render_widget(pane_block, area);
                         f.render_widget(Clear, inner);
-                        let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+                        let para = Paragraph::new(Text::from(lines));
                         f.render_widget(para, inner);
 
                         if *copy_mode && *active && *scroll_offset > 0 {
