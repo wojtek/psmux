@@ -109,14 +109,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
             .map(|mut f| std::io::Write::write_all(&mut f, session_key.as_bytes()));
     }
     
-    let session_key_clone = session_key.clone();
     thread::spawn(move || {
         for conn in listener.incoming() {
             if let Ok(stream) = conn {
+                let tx = tx.clone();
+                let session_key_clone = session_key.clone();
+                thread::spawn(move || {
                 // Clone stream for writing, original goes into BufReader for reading
                 let mut write_stream = match stream.try_clone() {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(_) => return,
                 };
                 
                 // Set initial long timeout for auth
@@ -126,7 +128,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 // Read the authentication line
                 let mut auth_line = String::new();
                 if r.read_line(&mut auth_line).is_err() {
-                    continue;
+                    return;
                 }
                 
                 // Verify session key
@@ -135,13 +137,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     // Legacy client without auth - reject for security
                     let _ = write_stream.write_all(b"ERROR: Authentication required\n");
                     let _ = write_stream.flush();
-                    continue;
+                    return;
                 }
                 let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
                 if provided_key != session_key_clone {
                     let _ = write_stream.write_all(b"ERROR: Invalid session key\n");
                     let _ = write_stream.flush();
-                    continue;
+                    return;
                 }
                 // Auth successful - send OK and flush immediately
                 let _ = write_stream.write_all(b"OK\n");
@@ -157,7 +159,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 let mut global_pane_is_id = false;
                 let mut line = String::new();
                 if r.read_line(&mut line).is_err() {
-                    continue;
+                    return;
                 }
                 
                 // Check if client requests persistent connection mode
@@ -170,7 +172,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
                     line.clear();
                     if r.read_line(&mut line).is_err() {
-                        continue;
+                        return;
                     }
                 }
                 
@@ -184,7 +186,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     // Now read the actual command line
                     line.clear();
                     if r.read_line(&mut line).is_err() {
-                        continue;
+                        return;
                     }
                 }
                 
@@ -658,6 +660,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         Ok(_) => {} // Continue processing
                     }
                 } // end command loop
+                }); // end per-connection thread
             }
         }
     });
@@ -705,8 +708,9 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     let layout_json = dump_layout_json(&mut app)?;
                     let windows_json = list_windows_json(&app)?;
+                    let tree_json = list_tree_json(&app)?;
                     let prefix_str = format_key_binding(&app.prefix_key);
-                    let combined = format!("{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\"}}", layout_json, windows_json, prefix_str);
+                    let combined = format!("{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{}}}", layout_json, windows_json, prefix_str, tree_json);
                     let _ = resp.send(combined);
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; sent_pty_input = true; }

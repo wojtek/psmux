@@ -187,11 +187,9 @@ pub fn parse_target(target: &str) -> ParsedTarget {
     } else if target.starts_with('.') {
         (None, Some(target))
     } else {
-        if target.parse::<usize>().is_ok() {
-            (None, Some(target))
-        } else {
-            (Some(target.to_string()), None)
-        }
+        // A bare string without ':' or '.' is always a session name, even if numeric.
+        // Window/pane specifiers require explicit syntax like ":0" or ".1"
+        (Some(target.to_string()), None)
     };
     
     result.session = session_part;

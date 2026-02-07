@@ -64,6 +64,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let current_session = name.clone();
     let mut last_sent_size: (u16, u16) = (0, 0);
     let mut last_event_time = Instant::now();
+    let mut last_tree: Vec<WinTree> = Vec::new();
     // Default prefix is Ctrl+B, updated dynamically from server config
     let mut prefix_key: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
     // Precompute the raw control character for the default prefix
@@ -78,6 +79,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         windows: Vec<WinStatus>,
         #[serde(default)]
         prefix: Option<String>,
+        #[serde(default)]
+        tree: Vec<WinTree>,
     }
 
     loop {
@@ -123,13 +126,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     tree_chooser = true;
                                     tree_entries.clear();
                                     tree_selected = 0;
-                                    if let Ok(buf) = send_auth_cmd_response(&addr, &session_key, b"list-tree\n") {
-                                        let infos: Vec<WinTree> = serde_json::from_str(&buf).unwrap_or_default();
-                                        for wi in infos {
-                                            tree_entries.push((true, wi.id, 0, wi.name));
-                                            for pi in wi.panes {
-                                                tree_entries.push((false, wi.id, pi.id, pi.title));
-                                            }
+                                    // Build tree entries from the last dump-state (no separate TCP needed)
+                                    for wi in &last_tree {
+                                        tree_entries.push((true, wi.id, 0, wi.name.clone()));
+                                        for pi in &wi.panes {
+                                            tree_entries.push((false, wi.id, pi.id, pi.title.clone()));
                                         }
                                     }
                                 }
@@ -327,6 +328,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
 
         let root = state.layout;
         let windows = state.windows;
+        last_tree = state.tree;
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {
