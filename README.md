@@ -73,7 +73,7 @@ cargo install psmux
 ### Using Scoop
 
 ```powershell
-scoop install https://raw.githubusercontent.com/marlocarlo/psmux/master/scoop/psmux.json
+scoop install https://raw.githubusercontent.com/souhaiebtar/psmux/master/scoop/psmux.json
 ```
 
 This installs `psmux`, `pmux`, and `tmux` from the Scoop manifest stored in this repository.
