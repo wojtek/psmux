@@ -437,7 +437,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
                 CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
-                CtrlReq::MouseUp(_,_) => { app.drag = None; }
+                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
                 CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
                 CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }

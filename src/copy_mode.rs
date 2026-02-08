@@ -1,4 +1,6 @@
 use std::io::{self, Write};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 
 use crate::types::*;
 use crate::tree::*;
@@ -7,6 +9,25 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.mode = Mode::CopyMode; 
     app.copy_scroll_offset = 0;
 }
+
+#[cfg(windows)]
+fn copy_to_system_clipboard(text: &str) {
+    if let Ok(mut child) = Command::new("cmd")
+        .args(["/C", "clip"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_to_system_clipboard(_text: &str) {}
 
 pub fn current_prompt_pos(app: &mut AppState) -> Option<(u16,u16)> {
     let win = &mut app.windows[app.active_idx];
@@ -77,7 +98,8 @@ pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
         }
         if r < r1 { text.push('\n'); }
     }
-    app.paste_buffers.push(text);
+    app.paste_buffers.push(text.clone());
+    copy_to_system_clipboard(&text);
     Ok(())
 }
 

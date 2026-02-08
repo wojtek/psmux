@@ -9,7 +9,7 @@ use ratatui::prelude::*;
 use crate::types::*;
 use crate::tree::*;
 use crate::pane::{create_window, detect_shell};
-use crate::copy_mode::{scroll_copy_up, scroll_copy_down};
+use crate::copy_mode::{scroll_copy_up, scroll_copy_down, yank_selection};
 
 pub fn toggle_zoom(app: &mut AppState) {
     let win = &mut app.windows[app.active_idx];
@@ -37,7 +37,23 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
-    for (path, area) in rects.iter() { if area.contains(ratatui::layout::Position { x, y }) { win.active_path = path.clone(); } }
+    let mut active_area: Option<Rect> = None;
+    for (path, area) in rects.iter() {
+        if area.contains(ratatui::layout::Position { x, y }) {
+            win.active_path = path.clone();
+            active_area = Some(*area);
+        }
+    }
+
+    if matches!(app.mode, Mode::CopyMode) {
+        if let Some(area) = active_area {
+            let (row, col) = copy_cell_for_area(area, x, y);
+            app.copy_anchor = Some((row, col));
+            app.copy_pos = Some((row, col));
+        }
+        return;
+    }
+
     let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16)> = Vec::new();
     compute_split_borders(&win.root, app.last_window_area, &mut borders);
     let tol = 1u16;
@@ -53,7 +69,46 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     }
 }
 
-pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) { let win = &mut app.windows[app.active_idx]; if let Some(d) = &app.drag { adjust_split_sizes(&mut win.root, d, x, y); } }
+pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+
+    if matches!(app.mode, Mode::CopyMode) {
+        if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
+            win.active_path = path.clone();
+            let (row, col) = copy_cell_for_area(*area, x, y);
+            if app.copy_anchor.is_none() {
+                app.copy_anchor = Some((row, col));
+            }
+            app.copy_pos = Some((row, col));
+        }
+        return;
+    }
+
+    if let Some(d) = &app.drag { adjust_split_sizes(&mut win.root, d, x, y); }
+}
+
+pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+
+    if matches!(app.mode, Mode::CopyMode) {
+        if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
+            win.active_path = path.clone();
+            let (row, col) = copy_cell_for_area(*area, x, y);
+            if app.copy_anchor.is_none() {
+                app.copy_anchor = Some((row, col));
+            }
+            app.copy_pos = Some((row, col));
+        }
+        let _ = yank_selection(app);
+        return;
+    }
+
+    app.drag = None;
+}
 
 fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
     // Convert global terminal coordinates to 1-based pane-local coordinates.
@@ -71,6 +126,22 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
         .min(inner_h.saturating_sub(1))
         .saturating_add(1);
     (col, row)
+}
+
+fn copy_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
+    // Convert global terminal coordinates to 0-based pane-local coordinates.
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2).max(1);
+    let inner_h = area.height.saturating_sub(2).max(1);
+
+    let col = x
+        .saturating_sub(inner_x)
+        .min(inner_w.saturating_sub(1));
+    let row = y
+        .saturating_sub(inner_y)
+        .min(inner_h.saturating_sub(1));
+    (row, col)
 }
 
 fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
