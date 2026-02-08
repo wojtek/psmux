@@ -542,11 +542,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 Span::styled(format!("[{}] ", name), Style::default().fg(Color::Black).bg(Color::Green)),
             ];
             for (i, w) in windows.iter().enumerate() {
-                let win_text = format!("{}:{}", i, w.name);
                 if w.active {
-                    status_spans.push(Span::styled(format!("{}* ", win_text), Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)));
+                    status_spans.push(Span::styled(
+                        format!("{}: {} ", i, w.name),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
                 } else {
-                    status_spans.push(Span::styled(format!("{} ", win_text), Style::default().fg(Color::Black).bg(Color::Green)));
+                    status_spans.push(Span::styled(
+                        format!("{}: {} ", i, w.name),
+                        Style::default().fg(Color::Black).bg(Color::Green),
+                    ));
                 }
             }
             let status_bar = Paragraph::new(Line::from(status_spans)).style(Style::default().bg(Color::Green).fg(Color::Black));
