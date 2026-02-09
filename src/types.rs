@@ -153,6 +153,8 @@ pub struct DragState {
     pub start_y: u16,
     pub left_initial: u16,
     pub _right_initial: u16,
+    /// Total pixel dimension of the parent split area along the split axis.
+    pub total_pixels: u16,
 }
 
 #[derive(Clone)]

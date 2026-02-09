@@ -11,6 +11,24 @@ use crate::tree::*;
 use crate::pane::{create_window, detect_shell};
 use crate::copy_mode::{scroll_copy_up, scroll_copy_down, yank_selection};
 
+/// Write a mouse event to the child PTY using the encoding the child requested.
+fn write_mouse_event_remote(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+    match enc {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let ch = if press { 'M' } else { 'm' };
+            let _ = write!(master, "\x1b[<{};{};{}{}", button, col, row, ch);
+        }
+        _ => {
+            if press {
+                let cb = (button + 32) as u8;
+                let cx = ((col as u8).min(223)) + 32;
+                let cy = ((row as u8).min(223)) + 32;
+                let _ = master.write_all(&[0x1b, b'[', b'M', cb, cx, cy]);
+            }
+        }
+    }
+}
+
 pub fn toggle_zoom(app: &mut AppState) {
     let win = &mut app.windows[app.active_idx];
     if app.zoom_saved.is_none() {
@@ -68,21 +86,34 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     }
 
     let mut on_border = false;
-    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16)> = Vec::new();
+    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16, u16)> = Vec::new();
     compute_split_borders(&win.root, app.last_window_area, &mut borders);
     let tol = 1u16;
-    for (path, kind, idx, pos) in borders.iter() {
+    for (path, kind, idx, pos, total_px) in borders.iter() {
         match kind {
             LayoutKind::Horizontal => {
-                if x >= pos.saturating_sub(tol) && x <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right }); } on_border = true; break; }
+                if x >= pos.saturating_sub(tol) && x <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right, total_pixels: *total_px }); } on_border = true; break; }
             }
             LayoutKind::Vertical => {
-                if y >= pos.saturating_sub(tol) && y <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right }); } on_border = true; break; }
+                if y >= pos.saturating_sub(tol) && y <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right, total_pixels: *total_px }); } on_border = true; break; }
             }
         }
     }
 
-
+    // Forward left-click to child PTY if it has mouse mode enabled
+    if !on_border {
+        if let Some(area) = active_area {
+            let col = x.saturating_sub(area.x) + 1;
+            let row = y.saturating_sub(area.y) + 1;
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                if mode != vt100::MouseProtocolMode::None {
+                    let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                    write_mouse_event_remote(&mut active.master, 0, col, row, true, enc);
+                }
+            }
+        }
+    }
 }
 
 pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
@@ -104,6 +135,19 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
 
     if let Some(d) = &app.drag {
         adjust_split_sizes(&mut win.root, d, x, y);
+    } else {
+        // Forward drag to child if it has ButtonMotion or AnyMotion mode
+        if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+            let col = x.saturating_sub(area.x) + 1;
+            let row = y.saturating_sub(area.y) + 1;
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                if mode == vt100::MouseProtocolMode::ButtonMotion || mode == vt100::MouseProtocolMode::AnyMotion {
+                    let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                    write_mouse_event_remote(&mut active.master, 32, col, row, true, enc);
+                }
+            }
+        }
     }
 }
 
@@ -126,16 +170,57 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     }
 
     app.drag = None;
+
+    // Forward mouse release to child PTY if it has PressRelease or better
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let col = x.saturating_sub(area.x) + 1;
+        let row = y.saturating_sub(area.y) + 1;
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+            if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
+                let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                write_mouse_event_remote(&mut active.master, 0, col, row, false, enc);
+            }
+        }
+    }
 }
 
-/// Forward a non-left mouse button press/release to the child PTY.
-/// Currently a no-op — mouse passthrough disabled until child app mouse mode detection is implemented.
-pub fn remote_mouse_button(_app: &mut AppState, _x: u16, _y: u16, _button: u8, _press: bool) {
+/// Forward a non-left mouse button press/release to the child PTY (only if child has mouse mode).
+pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press: bool) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let col = x.saturating_sub(area.x) + 1;
+        let row = y.saturating_sub(area.y) + 1;
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+            if (press && mode != vt100::MouseProtocolMode::None)
+                || (!press && mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press)
+            {
+                let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                write_mouse_event_remote(&mut active.master, button, col, row, press, enc);
+            }
+        }
+    }
 }
 
-/// Forward mouse motion to the child PTY.
-/// Currently a no-op — mouse passthrough disabled until child app mouse mode detection is implemented.
-pub fn remote_mouse_motion(_app: &mut AppState, _x: u16, _y: u16) {
+/// Forward mouse motion to the child PTY (only if child has AnyMotion mode).
+pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let col = x.saturating_sub(area.x) + 1;
+        let row = y.saturating_sub(area.y) + 1;
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+            if mode == vt100::MouseProtocolMode::AnyMotion {
+                let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                write_mouse_event_remote(&mut active.master, 35, col, row, true, enc);
+            }
+        }
+    }
 }
 
 fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {

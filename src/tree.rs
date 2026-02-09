@@ -153,8 +153,9 @@ pub fn kill_all_children(node: &mut Node) {
     }
 }
 
-pub fn compute_split_borders(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16)>) {
-    fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16)>) {
+/// Returns borders as (path, kind, idx, pixel_pos, total_pixels_along_axis).
+pub fn compute_split_borders(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16, u16)>) {
+    fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, LayoutKind, usize, u16, u16)>) {
         match node {
             Node::Leaf(_) => {}
             Node::Split { kind, sizes, children } => {
@@ -165,12 +166,16 @@ pub fn compute_split_borders(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>,
                     LayoutKind::Horizontal => Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area),
                     LayoutKind::Vertical => Layout::default().direction(Direction::Vertical).constraints(constraints).split(area),
                 };
+                let total_px = match *kind {
+                    LayoutKind::Horizontal => area.width,
+                    LayoutKind::Vertical => area.height,
+                };
                 for i in 0..children.len()-1 {
                     let pos = match *kind {
                         LayoutKind::Horizontal => rects[i].x + rects[i].width,
                         LayoutKind::Vertical => rects[i].y + rects[i].height,
                     };
-                    out.push((path.clone(), *kind, i, pos));
+                    out.push((path.clone(), *kind, i, pos, total_px));
                 }
                 for (i, child) in children.iter().enumerate() { path.push(i); rec(child, rects[i], path, out); path.pop(); }
             }
@@ -192,14 +197,17 @@ pub fn split_sizes_at<'a>(node: &'a Node, path: Vec<usize>, idx: usize) -> Optio
 
 pub fn adjust_split_sizes(root: &mut Node, d: &DragState, x: u16, y: u16) {
     if let Some(Node::Split { sizes, .. }) = get_split_mut(root, &d.split_path) {
-        let total = sizes[d.index] + sizes[d.index+1];
+        let total_pct = sizes[d.index] + sizes[d.index+1];
         let min_pct = 5u16;
-        let delta: i16 = match d.kind {
-            LayoutKind::Horizontal => (x as i32 - d.start_x as i32).clamp(-100, 100) as i16,
-            LayoutKind::Vertical => (y as i32 - d.start_y as i32).clamp(-100, 100) as i16,
+        // Convert pixel delta to percentage delta
+        let pixel_delta: i32 = match d.kind {
+            LayoutKind::Horizontal => x as i32 - d.start_x as i32,
+            LayoutKind::Vertical => y as i32 - d.start_y as i32,
         };
-        let left = (d.left_initial as i16 + delta).clamp(min_pct as i16, (total - min_pct) as i16) as u16;
-        let right = total - left;
+        let total_px = d.total_pixels.max(1) as i32;
+        let pct_delta = (pixel_delta * total_pct as i32) / total_px;
+        let left = (d.left_initial as i32 + pct_delta).clamp(min_pct as i32, (total_pct - min_pct) as i32) as u16;
+        let right = total_pct - left;
         sizes[d.index] = left;
         sizes[d.index+1] = right;
     }

@@ -12,6 +12,26 @@ use crate::commands::*;
 use crate::copy_mode::*;
 use crate::layout::cycle_top_layout;
 
+/// Write a mouse event to the child PTY using the encoding the child requested.
+fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+    match enc {
+        vt100::MouseProtocolEncoding::Sgr => {
+            let ch = if press { 'M' } else { 'm' };
+            let _ = write!(master, "\x1b[<{};{};{}{}", button, col, row, ch);
+        }
+        _ => {
+            // Default / Utf8 X10-style encoding: \x1b[M Cb Cx Cy (all + 32)
+            if press {
+                let cb = (button + 32) as u8;
+                let cx = ((col as u8).min(223)) + 32;
+                let cy = ((row as u8).min(223)) + 32;
+                let _ = master.write_all(&[0x1b, b'[', b'M', cb, cx, cy]);
+            }
+            // X10-style has no release encoding for individual buttons
+        }
+    }
+}
+
 pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
     let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
         || matches!(key.code, KeyCode::Char('\x11'));
@@ -407,7 +427,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, window_area, &mut rects);
-    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16)> = Vec::new();
+    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16, u16)> = Vec::new();
     compute_split_borders(&win.root, window_area, &mut borders);
     let mut active_area = rects
         .iter()
@@ -426,12 +446,12 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             // Check if click is on a split border (for dragging)
             let mut on_border = false;
             let tol = 1u16;
-            for (path, kind, idx, pos) in borders.iter() {
+            for (path, kind, idx, pos, total_px) in borders.iter() {
                 match kind {
                     LayoutKind::Horizontal => {
                         if me.column >= pos.saturating_sub(tol) && me.column <= pos + tol {
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right });
+                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
                             }
                             on_border = true;
                             break;
@@ -440,7 +460,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                     LayoutKind::Vertical => {
                         if me.row >= pos.saturating_sub(tol) && me.row <= pos + tol {
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right });
+                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
                             }
                             on_border = true;
                             break;
@@ -457,21 +477,112 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 }
             }
 
+            // Forward left-click to child PTY if it has mouse mode enabled
+            if !on_border {
+                if let Some(area) = active_area {
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                        if mode != vt100::MouseProtocolMode::None {
+                            let (col, row) = pane_cell(area, me.column, me.row);
+                            let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                            write_mouse_event(&mut active.master, 0, col, row, true, enc);
+                        }
+                    }
+                }
+            }
 
         }
-        MouseEventKind::Down(MouseButton::Right) => {}
-        MouseEventKind::Down(MouseButton::Middle) => {}
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                    if mode != vt100::MouseProtocolMode::None {
+                        let (col, row) = pane_cell(area, me.column, me.row);
+                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                        write_mouse_event(&mut active.master, 2, col, row, true, enc);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Middle) => {
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                    if mode != vt100::MouseProtocolMode::None {
+                        let (col, row) = pane_cell(area, me.column, me.row);
+                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                        write_mouse_event(&mut active.master, 1, col, row, true, enc);
+                    }
+                }
+            }
+        }
         MouseEventKind::Up(MouseButton::Left) => {
             app.drag = None;
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                    if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
+                        let (col, row) = pane_cell(area, me.column, me.row);
+                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                        write_mouse_event(&mut active.master, 0, col, row, false, enc);
+                    }
+                }
+            }
         }
-        MouseEventKind::Up(MouseButton::Right) => {}
-        MouseEventKind::Up(MouseButton::Middle) => {}
+        MouseEventKind::Up(MouseButton::Right) => {
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                    if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
+                        let (col, row) = pane_cell(area, me.column, me.row);
+                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                        write_mouse_event(&mut active.master, 2, col, row, false, enc);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Middle) => {
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                    if mode != vt100::MouseProtocolMode::None && mode != vt100::MouseProtocolMode::Press {
+                        let (col, row) = pane_cell(area, me.column, me.row);
+                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                        write_mouse_event(&mut active.master, 1, col, row, false, enc);
+                    }
+                }
+            }
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(d) = &app.drag {
                 adjust_split_sizes(&mut win.root, d, me.column, me.row);
+            } else {
+                // Forward drag to child if it has ButtonMotion or AnyMotion mode
+                if let Some(area) = active_area {
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                        if mode == vt100::MouseProtocolMode::ButtonMotion || mode == vt100::MouseProtocolMode::AnyMotion {
+                            let (col, row) = pane_cell(area, me.column, me.row);
+                            let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                            write_mouse_event(&mut active.master, 32, col, row, true, enc);
+                        }
+                    }
+                }
             }
         }
-        MouseEventKind::Moved => {}
+        MouseEventKind::Moved => {
+            // Forward motion to child if it has AnyMotion mode
+            if let Some(area) = active_area {
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let mode = active.term.lock().unwrap().screen().mouse_protocol_mode();
+                    if mode == vt100::MouseProtocolMode::AnyMotion {
+                        let (col, row) = pane_cell(area, me.column, me.row);
+                        let enc = active.term.lock().unwrap().screen().mouse_protocol_encoding();
+                        write_mouse_event(&mut active.master, 35, col, row, true, enc);
+                    }
+                }
+            }
+        }
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, Mode::CopyMode) {
                 scroll_copy_up(app, 3);
