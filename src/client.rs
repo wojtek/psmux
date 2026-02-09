@@ -291,8 +291,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         use crossterm::event::{MouseEventKind, MouseButton};
                         match me.kind {
                             MouseEventKind::Down(MouseButton::Left) => { cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Down(MouseButton::Right) => { cmd_batch.push(format!("mouse-down-right {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Down(MouseButton::Middle) => { cmd_batch.push(format!("mouse-down-middle {} {}\n", me.column, me.row)); }
                             MouseEventKind::Drag(MouseButton::Left) => { cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row)); }
                             MouseEventKind::Up(MouseButton::Left) => { cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Up(MouseButton::Right) => { cmd_batch.push(format!("mouse-up-right {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Up(MouseButton::Middle) => { cmd_batch.push(format!("mouse-up-middle {} {}\n", me.column, me.row)); }
+                            MouseEventKind::Moved => { cmd_batch.push(format!("mouse-move {} {}\n", me.column, me.row)); }
                             MouseEventKind::ScrollUp => { cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row)); }
                             MouseEventKind::ScrollDown => { cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row)); }
                             _ => {}

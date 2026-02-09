@@ -34,6 +34,19 @@ pub fn toggle_zoom(app: &mut AppState) {
 }
 
 pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
+    // Check tab click on status bar
+    let status_row = app.last_window_area.y + app.last_window_area.height;
+    if y == status_row {
+        for &(win_idx, x_start, x_end) in app.tab_positions.iter() {
+            if x >= x_start && x < x_end && win_idx < app.windows.len() {
+                app.last_window_idx = app.active_idx;
+                app.active_idx = win_idx;
+                return;
+            }
+        }
+        return;
+    }
+
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
@@ -54,16 +67,28 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
+    let mut on_border = false;
     let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16)> = Vec::new();
     compute_split_borders(&win.root, app.last_window_area, &mut borders);
     let tol = 1u16;
     for (path, kind, idx, pos) in borders.iter() {
         match kind {
             LayoutKind::Horizontal => {
-                if x >= pos.saturating_sub(tol) && x <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right }); } break; }
+                if x >= pos.saturating_sub(tol) && x <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right }); } on_border = true; break; }
             }
             LayoutKind::Vertical => {
-                if y >= pos.saturating_sub(tol) && y <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right }); } break; }
+                if y >= pos.saturating_sub(tol) && y <= pos + tol { if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) { app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: x, start_y: y, left_initial: left, _right_initial: right }); } on_border = true; break; }
+            }
+        }
+    }
+
+    // Forward left-click to child PTY
+    if !on_border {
+        if let Some(area) = active_area {
+            let col = x.saturating_sub(area.x) + 1;
+            let row = y.saturating_sub(area.y) + 1;
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                let _ = write!(active.master, "\x1b[<0;{};{}M", col, row);
             }
         }
     }
@@ -86,7 +111,18 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
-    if let Some(d) = &app.drag { adjust_split_sizes(&mut win.root, d, x, y); }
+    if let Some(d) = &app.drag {
+        adjust_split_sizes(&mut win.root, d, x, y);
+    } else {
+        // Forward drag to child PTY (SGR: button 32 = motion + left held)
+        if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+            let col = x.saturating_sub(area.x) + 1;
+            let row = y.saturating_sub(area.y) + 1;
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                let _ = write!(active.master, "\x1b[<32;{};{}M", col, row);
+            }
+        }
+    }
 }
 
 pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
@@ -108,6 +144,46 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     }
 
     app.drag = None;
+
+    // Forward mouse release to child PTY (SGR: button 0 release = lowercase m)
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let col = x.saturating_sub(area.x) + 1;
+        let row = y.saturating_sub(area.y) + 1;
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = write!(active.master, "\x1b[<0;{};{}m", col, row);
+        }
+    }
+}
+
+/// Forward a non-left mouse button press/release to the child PTY.
+/// `button`: 1 = middle, 2 = right (SGR encoding).
+/// `press`: true = press (M), false = release (m).
+pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press: bool) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let col = x.saturating_sub(area.x) + 1;
+        let row = y.saturating_sub(area.y) + 1;
+        let end_char = if press { 'M' } else { 'm' };
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = write!(active.master, "\x1b[<{};{};{}{}", button, col, row, end_char);
+        }
+    }
+}
+
+/// Forward mouse motion (no button held) to the child PTY.
+pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let col = x.saturating_sub(area.x) + 1;
+        let row = y.saturating_sub(area.y) + 1;
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = write!(active.master, "\x1b[<35;{};{}M", col, row);
+        }
+    }
 }
 
 fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {

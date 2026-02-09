@@ -65,6 +65,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         pipe_panes: Vec::new(),
         last_window_idx: 0,
         last_pane_path: Vec::new(),
+        tab_positions: Vec::new(),
     };
 
     load_config(&mut app);
@@ -204,14 +205,37 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 Mode::ConfirmMode { .. } => "CONFIRM",
             };
             let time_str = Local::now().format("%H:%M").to_string();
-            let mut windows_list = String::new();
-            for (i, _) in app.windows.iter().enumerate() {
-                let display_idx = i + app.window_base_index;
-                if i == app.active_idx { windows_list.push_str(&format!(" #[{}]", display_idx)); } else { windows_list.push_str(&format!(" {}", display_idx)); }
-            }
             let status_spans = parse_status(&app.status_left, &app, &time_str);
             let mut right_spans = parse_status(&app.status_right, &app, &time_str);
+
+            // Build status bar: left status + window tabs + right-aligned time
             let mut combined: Vec<Span<'static>> = status_spans;
+            combined.push(Span::raw(" "));
+
+            // Track x position for tab click detection
+            let status_x = chunks[1].x;
+            let mut cursor_x: u16 = status_x;
+            for s in combined.iter() {
+                cursor_x += s.content.len() as u16;
+            }
+
+            // Render window tabs with position tracking
+            let mut tab_pos: Vec<(usize, u16, u16)> = Vec::new();
+            for (i, w) in app.windows.iter().enumerate() {
+                let display_idx = i + app.window_base_index;
+                let label = format!(" {} ", display_idx);
+                let start_x = cursor_x;
+                cursor_x += label.len() as u16;
+                tab_pos.push((i, start_x, cursor_x));
+                if i == app.active_idx {
+                    combined.push(Span::styled(label, Style::default().bg(Color::Black).fg(Color::Green).add_modifier(Modifier::BOLD)));
+                } else {
+                    combined.push(Span::styled(label, Style::default().bg(Color::Green).fg(Color::Black)));
+                }
+            }
+            app.tab_positions = tab_pos;
+
+            // Right-align the time
             combined.push(Span::raw(" "));
             combined.append(&mut right_spans);
             let status_bar = Paragraph::new(Line::from(combined)).style(Style::default().bg(Color::Green).fg(Color::Black));
@@ -439,8 +463,13 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
+                CtrlReq::MouseDownRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, true); }
+                CtrlReq::MouseDownMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, true); }
                 CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
                 CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
+                CtrlReq::MouseUpRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, false); }
+                CtrlReq::MouseUpMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, false); }
+                CtrlReq::MouseMove(x,y) => { remote_mouse_motion(&mut app, x, y); }
                 CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
                 CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }

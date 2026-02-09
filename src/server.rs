@@ -64,6 +64,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         pipe_panes: Vec::new(),
         last_window_idx: 0,
         last_pane_path: Vec::new(),
+        tab_positions: Vec::new(),
     };
     load_config(&mut app);
     // Create initial window with optional command
@@ -337,11 +338,26 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "mouse-down" => {
                         if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDown(x,y)); } }
                     }
+                    "mouse-down-right" => {
+                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDownRight(x,y)); } }
+                    }
+                    "mouse-down-middle" => {
+                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDownMiddle(x,y)); } }
+                    }
                     "mouse-drag" => {
                         if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDrag(x,y)); } }
                     }
                     "mouse-up" => {
                         if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseUp(x,y)); } }
+                    }
+                    "mouse-up-right" => {
+                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseUpRight(x,y)); } }
+                    }
+                    "mouse-up-middle" => {
+                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseUpMiddle(x,y)); } }
+                    }
+                    "mouse-move" => {
+                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseMove(x,y)); } }
                     }
                     "scroll-up" => {
                         let x = args.get(0).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
@@ -775,8 +791,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
+                CtrlReq::MouseDownRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, true); }
+                CtrlReq::MouseDownMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, true); }
                 CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
                 CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
+                CtrlReq::MouseUpRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, false); }
+                CtrlReq::MouseUpMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, false); }
+                CtrlReq::MouseMove(x,y) => { remote_mouse_motion(&mut app, x, y); }
                 CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
                 CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }

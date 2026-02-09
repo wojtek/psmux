@@ -141,6 +141,8 @@ pub struct AppState {
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
+    /// Tab positions on status bar: (window_index, x_start, x_end)
+    pub tab_positions: Vec<(usize, u16, u16)>,
 }
 
 pub struct DragState {
@@ -203,8 +205,13 @@ pub enum CtrlReq {
     FocusPaneCmd(usize),
     FocusWindowCmd(usize),
     MouseDown(u16,u16),
+    MouseDownRight(u16,u16),
+    MouseDownMiddle(u16,u16),
     MouseDrag(u16,u16),
     MouseUp(u16,u16),
+    MouseUpRight(u16,u16),
+    MouseUpMiddle(u16,u16),
+    MouseMove(u16,u16),
     ScrollUp(u16, u16),
     ScrollDown(u16, u16),
     NextWindow,

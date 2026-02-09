@@ -386,6 +386,24 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
 }
 
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
+    use crossterm::event::{MouseEventKind, MouseButton};
+
+    // --- Tab click: check if click is on the status bar row ---
+    let status_row = window_area.y + window_area.height; // status bar is 1 row below window area
+    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) && me.row == status_row {
+        for &(win_idx, x_start, x_end) in app.tab_positions.iter() {
+            if me.column >= x_start && me.column < x_end {
+                if win_idx < app.windows.len() {
+                    app.last_window_idx = app.active_idx;
+                    app.active_idx = win_idx;
+                }
+                return Ok(());
+            }
+        }
+        // Click was on status bar but not on a tab — ignore
+        return Ok(());
+    }
+
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, window_area, &mut rects);
@@ -396,14 +414,17 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
         .find(|(path, _)| *path == win.active_path)
         .map(|(_, area)| *area);
 
-    use crossterm::event::{MouseEventKind, MouseButton};
+    /// Convert absolute screen coordinates to pane-local 1-based cell coordinates.
+    fn pane_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
+        let col = abs_x.saturating_sub(area.x) + 1;
+        let row = abs_y.saturating_sub(area.y) + 1;
+        (col, row)
+    }
+
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            for (path, area) in rects.iter() {
-                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
-                    win.active_path = path.clone();
-                }
-            }
+            // Check if click is on a split border (for dragging)
+            let mut on_border = false;
             let tol = 1u16;
             for (path, kind, idx, pos) in borders.iter() {
                 match kind {
@@ -412,6 +433,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
                                 app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right });
                             }
+                            on_border = true;
                             break;
                         }
                     }
@@ -420,18 +442,97 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                             if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
                                 app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: me.row, left_initial: left, _right_initial: right });
                             }
+                            on_border = true;
                             break;
                         }
                     }
+                }
+            }
+
+            // Switch pane focus if clicking inside a pane
+            for (path, area) in rects.iter() {
+                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
+                    win.active_path = path.clone();
+                    active_area = Some(*area);
+                }
+            }
+
+            // Forward mouse down to child PTY (SGR encoding: button 0 = left press)
+            if !on_border {
+                if let Some(area) = active_area {
+                    let (col, row) = pane_cell(area, me.column, me.row);
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        let _ = write!(active.master, "\x1b[<0;{};{}M", col, row);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Forward right-click to child PTY (SGR encoding: button 2)
+            if let Some(area) = active_area {
+                let (col, row) = pane_cell(area, me.column, me.row);
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(active.master, "\x1b[<2;{};{}M", col, row);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Middle) => {
+            // Forward middle-click to child PTY (SGR encoding: button 1)
+            if let Some(area) = active_area {
+                let (col, row) = pane_cell(area, me.column, me.row);
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(active.master, "\x1b[<1;{};{}M", col, row);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.drag = None;
+            // Forward mouse up to child PTY (SGR encoding: button 0 = left release)
+            if let Some(area) = active_area {
+                let (col, row) = pane_cell(area, me.column, me.row);
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(active.master, "\x1b[<0;{};{}m", col, row);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Right) => {
+            if let Some(area) = active_area {
+                let (col, row) = pane_cell(area, me.column, me.row);
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(active.master, "\x1b[<2;{};{}m", col, row);
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Middle) => {
+            if let Some(area) = active_area {
+                let (col, row) = pane_cell(area, me.column, me.row);
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(active.master, "\x1b[<1;{};{}m", col, row);
                 }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some(d) = &app.drag {
                 adjust_split_sizes(&mut win.root, d, me.column, me.row);
+            } else {
+                // Forward mouse drag to child PTY (SGR encoding: button 32 = motion + left held)
+                if let Some(area) = active_area {
+                    let (col, row) = pane_cell(area, me.column, me.row);
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        let _ = write!(active.master, "\x1b[<32;{};{}M", col, row);
+                    }
+                }
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => { app.drag = None; }
+        MouseEventKind::Moved => {
+            // Forward mouse motion to child PTY (SGR encoding: button 35 = motion, no button)
+            if let Some(area) = active_area {
+                let (col, row) = pane_cell(area, me.column, me.row);
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    let _ = write!(active.master, "\x1b[<35;{};{}M", col, row);
+                }
+            }
+        }
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, Mode::CopyMode) {
                 scroll_copy_up(app, 3);
