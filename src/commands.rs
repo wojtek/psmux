@@ -10,6 +10,13 @@ use crate::layout::cycle_top_layout;
 use crate::window_ops::toggle_zoom;
 use crate::window_ops;
 
+/// Extract a window index from a tmux-style target string.
+/// Handles formats like "0", ":0", ":=0", "=0", stripping leading ':'/'=' chars.
+fn parse_window_target(target: &str) -> Option<usize> {
+    let s = target.trim_start_matches(':').trim_start_matches('=');
+    s.parse::<usize>().ok()
+}
+
 /// Parse a command string to an Action
 pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
@@ -277,7 +284,7 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
         "previous-window" => { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); }
         "select-window" => {
             if let Some(tidx) = parts.iter().position(|p| *p == "-t").and_then(|i| parts.get(i+1)) {
-                if let Ok(n) = tidx.parse::<usize>() {
+                if let Some(n) = parse_window_target(tidx) {
                     if n >= app.window_base_index {
                         let internal_idx = n - app.window_base_index;
                         if internal_idx < app.windows.len() {
@@ -343,7 +350,7 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
         "select-window" | "selectw" => {
             if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
                 if let Some(t) = parts.get(t_pos + 1) {
-                    if let Ok(idx) = t.parse::<usize>() {
+                    if let Some(idx) = parse_window_target(t) {
                         if idx >= app.window_base_index {
                             let internal_idx = idx - app.window_base_index;
                             if internal_idx < app.windows.len() {
