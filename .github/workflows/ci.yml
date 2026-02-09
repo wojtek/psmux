@@ -17,8 +17,18 @@ env:
 
 jobs:
   build:
-    name: Build Windows
+    name: Build ${{ matrix.label }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            label: Windows x64
+          - target: i686-pc-windows-msvc
+            label: Windows x86
+          - target: aarch64-pc-windows-msvc
+            label: Windows ARM64
 
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +36,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --target ${{ matrix.target }}

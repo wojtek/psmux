@@ -26,14 +26,33 @@ if ($LocalBuild) {
 } else {
     Write-Host "Downloading latest release..." -ForegroundColor Yellow
     
+    # Detect architecture
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    switch ($arch) {
+        "X64"  { $archLabel = "x64";   $assetPattern = "windows-x64" }
+        "X86"  { $archLabel = "x86";   $assetPattern = "windows-x86" }
+        "Arm64"{ $archLabel = "arm64"; $assetPattern = "windows-arm64" }
+        default {
+            Write-Host "Unsupported architecture: $arch" -ForegroundColor Red
+            exit 1
+        }
+    }
+    Write-Host "Detected architecture: $archLabel" -ForegroundColor Cyan
+    
     # Get latest release info
     $ReleasesUrl = "https://api.github.com/repos/marlocarlo/psmux/releases/latest"
     try {
         $Release = Invoke-RestMethod -Uri $ReleasesUrl -Headers @{ "User-Agent" = "psmux-installer" }
-        $Asset = $Release.assets | Where-Object { $_.name -match "windows.*x64.*zip" } | Select-Object -First 1
+        $Asset = $Release.assets | Where-Object { $_.name -match "$assetPattern.*zip" } | Select-Object -First 1
+        
+        # Fallback: if no arch-specific asset, try x64 (Windows on ARM can run x64 via emulation)
+        if (-not $Asset -and $archLabel -eq "arm64") {
+            Write-Host "No ARM64 build found, falling back to x64 (runs via emulation)..." -ForegroundColor Yellow
+            $Asset = $Release.assets | Where-Object { $_.name -match "windows-x64.*zip" } | Select-Object -First 1
+        }
         
         if (-not $Asset) {
-            throw "No Windows x64 release asset found"
+            throw "No compatible release asset found for $archLabel"
         }
         
         $DownloadUrl = $Asset.browser_download_url

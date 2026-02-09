@@ -13,8 +13,21 @@ env:
 
 jobs:
   build:
-    name: Build Windows
+    name: Build ${{ matrix.label }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            label: Windows x64
+            artifact: windows-x64
+          - target: i686-pc-windows-msvc
+            label: Windows x86
+            artifact: windows-x86
+          - target: aarch64-pc-windows-msvc
+            label: Windows ARM64 (Snapdragon)
+            artifact: windows-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -22,20 +35,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Create release package
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}"
-          $zipName = "psmux-$version-windows-x64"
+          $zipName = "psmux-$version-${{ matrix.artifact }}"
           New-Item -ItemType Directory -Path $zipName -Force
-          Copy-Item "target/x86_64-pc-windows-msvc/release/psmux.exe" "$zipName/psmux.exe"
-          Copy-Item "target/x86_64-pc-windows-msvc/release/pmux.exe" "$zipName/pmux.exe"
-          Copy-Item "target/x86_64-pc-windows-msvc/release/tmux.exe" "$zipName/tmux.exe"
+          Copy-Item "target/${{ matrix.target }}/release/psmux.exe" "$zipName/psmux.exe"
+          Copy-Item "target/${{ matrix.target }}/release/pmux.exe" "$zipName/pmux.exe"
+          Copy-Item "target/${{ matrix.target }}/release/tmux.exe" "$zipName/tmux.exe"
           Copy-Item "README.md" "$zipName/"
           Copy-Item "LICENSE" "$zipName/"
           Compress-Archive -Path "$zipName/*" -DestinationPath "$zipName.zip"
@@ -43,8 +56,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: psmux-release
-          path: psmux-*-windows-x64.zip
+          name: psmux-${{ matrix.artifact }}
+          path: psmux-*-${{ matrix.artifact }}.zip
 
   release:
     name: Create Release
@@ -61,11 +74,20 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            psmux-release/*.zip
+            psmux-windows-x64/*.zip
+            psmux-windows-x86/*.zip
+            psmux-windows-arm64/*.zip
           body: |
             ## psmux ${{ github.ref_name }}
             
             Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal.
+            
+            ### Downloads
+            | Platform | File |
+            |----------|------|
+            | Windows x64 (Intel/AMD 64-bit) | `psmux-${{ github.ref_name }}-windows-x64.zip` |
+            | Windows x86 (Intel/AMD 32-bit) | `psmux-${{ github.ref_name }}-windows-x86.zip` |
+            | Windows ARM64 (Snapdragon/Surface Pro X) | `psmux-${{ github.ref_name }}-windows-arm64.zip` |
             
             ### Installation
             
@@ -79,8 +101,13 @@ jobs:
             scoop install https://raw.githubusercontent.com/${{ github.repository }}/master/scoop/psmux.json
             ```
             
+            **Via Chocolatey:**
+            ```powershell
+            choco install psmux
+            ```
+            
             **Manual Installation:**
-            1. Download `psmux-${{ github.ref_name }}-windows-x64.zip`
+            1. Download the zip matching your architecture
             2. Extract to a folder in your PATH
             3. `psmux`, `pmux`, and `tmux` commands will all be available
             
