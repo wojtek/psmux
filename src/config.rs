@@ -226,19 +226,24 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "terminal-overrides" => {}
         "default-terminal" => {}
         "update-environment" => {}
-        "bell-action" => {}
-        "visual-bell" => {}
+        "bell-action" => { app.bell_action = value.to_string(); }
+        "visual-bell" => { app.visual_bell = matches!(value, "on" | "true" | "1"); }
         "activity-action" => {}
         "silence-action" => {}
-        "monitor-silence" => {}
-        "message-style" | "message-command-style" => {}
-        "clock-mode-colour" | "clock-mode-style" => {}
-        "pane-border-format" | "pane-border-status" => {}
-        "popup-style" | "popup-border-style" | "popup-border-lines" => {}
-        "window-style" | "window-active-style" => {}
-        "wrap-search" => {}
-        "lock-after-time" | "lock-command" => {}
-        _ => {}
+        "monitor-silence" => {
+            if let Ok(n) = value.parse::<u64>() { app.monitor_silence = n; }
+        }
+        "message-style" | "message-command-style" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "clock-mode-colour" | "clock-mode-style" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "pane-border-format" | "pane-border-status" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "popup-style" | "popup-border-style" | "popup-border-lines" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "window-style" | "window-active-style" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "wrap-search" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "lock-after-time" | "lock-command" => { app.environment.insert(key.to_string(), value.to_string()); }
+        _ => {
+            // Store any unknown option in the environment map for plugin compat
+            app.environment.insert(key.to_string(), value.to_string());
+        }
     }
 }
 

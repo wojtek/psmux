@@ -421,6 +421,11 @@ pub fn get_active_pane_id(node: &Node, path: &[usize]) -> Option<usize> {
     }
 }
 
+/// Get the pane ID at a specific path (used by format vars for pane position lookup).
+pub fn get_active_pane_id_at_path(node: &Node, path: &[usize]) -> Option<usize> {
+    get_active_pane_id(node, path)
+}
+
 pub fn find_window_index_by_id(app: &AppState, wid: usize) -> Option<usize> {
     app.windows.iter().position(|w| w.id == wid)
 }

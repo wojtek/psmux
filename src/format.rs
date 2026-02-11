@@ -576,9 +576,40 @@ fn apply_modifier(m: &Modifier, value: &str, app: &AppState, win_idx: usize) -> 
                 else { "0".into() }
             }
         }
-        Modifier::SearchContent { .. } => {
-            // Search for format in pane content — return line number or 0
-            "0".to_string()
+        Modifier::SearchContent { _regex, _case_insensitive } => {
+            // #{C:pattern} — Search for pattern in pane content, return line number or empty
+            let pattern = value;
+            if pattern.is_empty() { return String::new(); }
+            if let Some(w) = app.windows.get(win_idx) {
+                if let Some(p) = active_pane(&w.root, &w.active_path) {
+                    if let Ok(parser) = p.term.lock() {
+                        let screen = parser.screen();
+                        let re_result = if *_regex {
+                            let pat = if *_case_insensitive { format!("(?i){}", pattern) } else { pattern.to_string() };
+                            regex::Regex::new(&pat).ok()
+                        } else {
+                            let escaped = regex::escape(pattern);
+                            let pat = if *_case_insensitive { format!("(?i){}", escaped) } else { escaped };
+                            regex::Regex::new(&pat).ok()
+                        };
+                        if let Some(re) = re_result {
+                            for r in 0..p.last_rows {
+                                let mut row_text = String::with_capacity(p.last_cols as usize);
+                                for c in 0..p.last_cols {
+                                    if let Some(cell) = screen.cell(r, c) {
+                                        let t = cell.contents();
+                                        if t.is_empty() { row_text.push(' '); } else { row_text.push_str(t); }
+                                    } else { row_text.push(' '); }
+                                }
+                                if re.is_match(&row_text) {
+                                    return r.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            String::new()
         }
         Modifier::Width => {
             value.chars().count().to_string()
@@ -643,6 +674,9 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "display-panes-time" => Some(app.display_panes_time_ms.to_string()),
         "focus-events" => Some(if app.focus_events { "on".into() } else { "off".into() }),
         "aggressive-resize" => Some(if app.aggressive_resize { "on".into() } else { "off".into() }),
+        "monitor-silence" => Some(app.monitor_silence.to_string()),
+        "bell-action" => Some(app.bell_action.clone()),
+        "visual-bell" => Some(if app.visual_bell { "on".into() } else { "off".into() }),
         _ => app.environment.get(name).cloned(),
     }
 }
@@ -792,15 +826,13 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_activity_flag" => if win.activity_flag { "1".into() } else { "0".into() },
         "window_zoomed_flag" => if app.zoom_saved.is_some() && win_idx == app.active_idx { "1".into() } else { "0".into() },
         "window_layout" | "window_visible_layout" => generate_window_layout(&win.root, app.last_window_area),
-        "window_width" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_cols.to_string() } else { "80".into() }
-        }
-        "window_height" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_rows.to_string() } else { "24".into() }
-        }
+        "window_width" => app.last_window_area.width.to_string(),
+        "window_height" => app.last_window_area.height.to_string(),
         "window_format" => "1".into(),
         "window_activity" => app.created_at.timestamp().to_string(),
-        "window_silence_flag" | "window_bell_flag" | "window_linked" => "0".into(),
+        "window_silence_flag" => if win.silence_flag { "1".into() } else { "0".into() },
+        "window_bell_flag" => if win.bell_flag { "1".into() } else { "0".into() },
+        "window_linked" => "0".into(),
         "window_linked_sessions" => "0".into(),
         "window_linked_sessions_list" => String::new(),
         "window_last_flag" => if win_idx == app.last_window_idx { "1".into() } else { "0".into() },
@@ -881,16 +913,114 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         }
         "pane_dead_signal" | "pane_dead_status" | "pane_dead_time" => "0".into(),
         "pane_format" => "1".into(),
-        "pane_input_off" | "pane_marked" | "pane_marked_set" | "pane_last"
+        "pane_input_off"
         | "pane_pipe" | "pane_unseen_changes" => "0".into(),
-        "pane_left" | "pane_top" => "0".into(),
+        "pane_last" => {
+            // Check if this pane was the last active pane
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if !app.last_pane_path.is_empty() {
+                    if let Some(last_p) = active_pane(&win.root, &app.last_pane_path) {
+                        if last_p.id == p.id { return "1".into(); }
+                    }
+                }
+            }
+            "0".into()
+        }
+        "pane_marked" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                if let Some((mw, mp)) = app.marked_pane {
+                    if mw == win_idx && mp == p.id { "1".into() } else { "0".into() }
+                } else { "0".into() }
+            } else { "0".into() }
+        }
+        "pane_marked_set" => {
+            if app.marked_pane.is_some() { "1".into() } else { "0".into() }
+        }
+        "pane_left" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) { rect.x.to_string() } else { "0".into() }
+            } else { "0".into() }
+        }
+        "pane_top" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) { rect.y.to_string() } else { "0".into() }
+            } else { "0".into() }
+        }
         "pane_right" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_cols.saturating_sub(1).to_string() } else { "79".into() }
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) { (rect.x + rect.width).saturating_sub(1).to_string() } else { "79".into() }
+            } else { "79".into() }
         }
         "pane_bottom" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_rows.saturating_sub(1).to_string() } else { "23".into() }
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) { (rect.y + rect.height).saturating_sub(1).to_string() } else { "23".into() }
+            } else { "23".into() }
         }
-        "pane_at_top" | "pane_at_bottom" | "pane_at_left" | "pane_at_right" => "1".into(),
+        "pane_at_top" => {
+            // Check if pane is at the top edge of the window
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) {
+                    if rect.y == app.last_window_area.y { "1".into() } else { "0".into() }
+                } else { "1".into() }
+            } else { "1".into() }
+        }
+        "pane_at_bottom" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) {
+                    let bottom = rect.y + rect.height;
+                    let win_bottom = app.last_window_area.y + app.last_window_area.height;
+                    if bottom >= win_bottom { "1".into() } else { "0".into() }
+                } else { "1".into() }
+            } else { "1".into() }
+        }
+        "pane_at_left" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) {
+                    if rect.x == app.last_window_area.x { "1".into() } else { "0".into() }
+                } else { "1".into() }
+            } else { "1".into() }
+        }
+        "pane_at_right" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                let mut rects = Vec::new();
+                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                if let Some((_, rect)) = rects.iter().find(|(path, _)| {
+                    crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
+                }) {
+                    let right = rect.x + rect.width;
+                    let win_right = app.last_window_area.x + app.last_window_area.width;
+                    if right >= win_right { "1".into() } else { "0".into() }
+                } else { "1".into() }
+            } else { "1".into() }
+        }
         "pane_search_string" => app.copy_search_query.clone(),
         "pane_start_command" => app.default_shell.clone(),
         "pane_start_path" | "pane_tabs" => String::new(),
@@ -930,16 +1060,82 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         // ── Copy mode ──
         "copy_cursor_x" => app.copy_pos.map(|(_, c)| c.to_string()).unwrap_or("0".into()),
         "copy_cursor_y" => app.copy_pos.map(|(r, _)| r.to_string()).unwrap_or("0".into()),
-        "copy_cursor_word" | "copy_cursor_line" => String::new(),
+        "copy_cursor_word" => {
+            // Return the word under the copy cursor
+            if let (Some((r, c)), Some(w)) = (app.copy_pos, app.windows.get(win_idx)) {
+                if let Some(p) = active_pane(&w.root, &w.active_path) {
+                    if let Ok(parser) = p.term.lock() {
+                        let screen = parser.screen();
+                        let cols = p.last_cols;
+                        let mut row_text = String::with_capacity(cols as usize);
+                        for col in 0..cols {
+                            if let Some(cell) = screen.cell(r, col) {
+                                let t = cell.contents();
+                                if t.is_empty() { row_text.push(' '); } else { row_text.push_str(t); }
+                            } else { row_text.push(' '); }
+                        }
+                        let chars: Vec<char> = row_text.chars().collect();
+                        let ci = c as usize;
+                        if ci < chars.len() && !chars[ci].is_whitespace() {
+                            let seps = &app.word_separators;
+                            let cls = |ch: &char| -> u8 {
+                                if ch.is_whitespace() { 0 }
+                                else if seps.contains(*ch) { 1 }
+                                else { 2 }
+                            };
+                            let target = cls(&chars[ci]);
+                            let mut start = ci;
+                            while start > 0 && cls(&chars[start - 1]) == target { start -= 1; }
+                            let mut end = ci;
+                            while end + 1 < chars.len() && cls(&chars[end + 1]) == target { end += 1; }
+                            return chars[start..=end].iter().collect();
+                        }
+                    }
+                }
+            }
+            String::new()
+        }
+        "copy_cursor_line" => {
+            // Return the line under the copy cursor
+            if let (Some((r, _)), Some(w)) = (app.copy_pos, app.windows.get(win_idx)) {
+                if let Some(p) = active_pane(&w.root, &w.active_path) {
+                    if let Ok(parser) = p.term.lock() {
+                        let screen = parser.screen();
+                        let cols = p.last_cols;
+                        let mut row_text = String::with_capacity(cols as usize);
+                        for col in 0..cols {
+                            if let Some(cell) = screen.cell(r, col) {
+                                let t = cell.contents();
+                                if t.is_empty() { row_text.push(' '); } else { row_text.push_str(t); }
+                            } else { row_text.push(' '); }
+                        }
+                        return row_text.trim_end().to_string();
+                    }
+                }
+            }
+            String::new()
+        }
         "selection_present" | "selection_active" => if app.copy_anchor.is_some() { "1".into() } else { "0".into() },
         "selection_start_x" => app.copy_anchor.map(|(_, c)| c.to_string()).unwrap_or("0".into()),
         "selection_start_y" => app.copy_anchor.map(|(r, _)| r.to_string()).unwrap_or("0".into()),
         "selection_end_x" => app.copy_pos.map(|(_, c)| c.to_string()).unwrap_or("0".into()),
         "selection_end_y" => app.copy_pos.map(|(r, _)| r.to_string()).unwrap_or("0".into()),
         "search_present" => if !app.copy_search_query.is_empty() { "1".into() } else { "0".into() },
-        "search_match" => String::new(),
-        "scroll_position" | "scroll_region_upper" => app.copy_scroll_offset.to_string(),
-        "scroll_region_lower" => "0".into(),
+        "search_match" => {
+            if !app.copy_search_matches.is_empty() {
+                app.copy_search_matches.get(app.copy_search_idx)
+                    .map(|_| app.copy_search_query.clone())
+                    .unwrap_or_default()
+            } else { String::new() }
+        }
+        "scroll_position" => app.copy_scroll_offset.to_string(),
+        "scroll_region_upper" => "0".into(),
+        "scroll_region_lower" => {
+            if let Some(p) = active_pane(&win.root, &win.active_path) {
+                return p.last_rows.saturating_sub(1).to_string();
+            }
+            "0".into()
+        }
 
         // ── Buffer ──
         "buffer_size" => app.paste_buffers.first().map(|b| b.len().to_string()).unwrap_or("0".into()),
@@ -986,7 +1182,8 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "prefix" => format_key_binding(&app.prefix_key),
         "status" => if app.status_visible { "on".into() } else { "off".into() },
         "mode_keys" => app.mode_keys.clone(),
-        "history_size" | "history_limit" => app.history_limit.to_string(),
+        "history_limit" => app.history_limit.to_string(),
+        "history_size" => app.history_limit.to_string(),
         "alternate_on" => {
             if let Some(p) = active_pane(&win.root, &win.active_path) {
                 if let Ok(parser) = p.term.lock() {
@@ -998,7 +1195,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "alternate_saved_x" | "alternate_saved_y" => "0".into(),
 
         // ── Misc ──
-        "origin_flag" | "insert_flag" | "keypad_cursor_flag" | "keypad_flag" | "cursor_flag" => "0".into(),
+        "origin_flag" | "insert_flag" | "keypad_cursor_flag" | "keypad_flag" => "0".into(),
         "wrap_flag" => "1".into(),
         "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
 

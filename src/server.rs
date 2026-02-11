@@ -510,7 +510,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             else if args.iter().any(|a| *a == "-L") { "L" }
                             else if args.iter().any(|a| *a == "-R") { "R" }
                             else if args.iter().any(|a| *a == "-l") { "last" }
+                            else if args.iter().any(|a| *a == "-m") { "mark" }
+                            else if args.iter().any(|a| *a == "-M") { "unmark" }
+                            else if args.iter().any(|a| *a == "-e") { "enable-input" }
+                            else if args.iter().any(|a| *a == "-d") { "disable-input" }
                             else { "" };
+                        // Check for -T title
+                        let title = args.windows(2).find(|w| w[0] == "-T").map(|w| w[1].to_string());
+                        if let Some(t) = title {
+                            let _ = tx.send(CtrlReq::SetPaneTitle(t));
+                        }
                         let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
                     }
                     "select-window" | "selectw" => {
@@ -520,11 +529,20 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     "list-panes" | "lsp" => {
                         let fmt = args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].to_string());
+                        let all = args.iter().any(|a| *a == "-a" || *a == "-s");
                         let (rtx, rrx) = mpsc::channel::<String>();
                         if let Some(fmt_str) = fmt {
-                            let _ = tx.send(CtrlReq::ListPanesFormat(rtx, fmt_str));
+                            if all {
+                                let _ = tx.send(CtrlReq::ListAllPanesFormat(rtx, fmt_str));
+                            } else {
+                                let _ = tx.send(CtrlReq::ListPanesFormat(rtx, fmt_str));
+                            }
                         } else {
-                            let _ = tx.send(CtrlReq::ListPanes(rtx));
+                            if all {
+                                let _ = tx.send(CtrlReq::ListAllPanes(rtx));
+                            } else {
+                                let _ = tx.send(CtrlReq::ListPanes(rtx));
+                            }
                         }
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
@@ -975,9 +993,16 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         }
                     }
                     "list-sessions" | "ls" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::SessionInfo(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        let fmt = args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].to_string());
+                        if let Some(fmt_str) = fmt {
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt_str));
+                            if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        } else {
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                            if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        }
                         if !persistent { break; }
                     }
                     "new-session" | "new" => {
@@ -1688,6 +1713,73 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 app.copy_pos = Some(a);
                             }
                         }
+                        "clear-selection" => {
+                            app.copy_anchor = None;
+                            app.copy_selection_mode = crate::types::SelectionMode::Char;
+                        }
+                        "append-selection" => {
+                            // Append to existing buffer instead of replacing
+                            let _ = yank_selection(&mut app);
+                            if app.paste_buffers.len() >= 2 {
+                                let appended = format!("{}{}", app.paste_buffers[1], app.paste_buffers[0]);
+                                app.paste_buffers[0] = appended;
+                            }
+                        }
+                        "append-selection-and-cancel" => {
+                            let _ = yank_selection(&mut app);
+                            if app.paste_buffers.len() >= 2 {
+                                let appended = format!("{}{}", app.paste_buffers[1], app.paste_buffers[0]);
+                                app.paste_buffers[0] = appended;
+                            }
+                            app.mode = Mode::Passthrough;
+                            app.copy_scroll_offset = 0;
+                            app.copy_pos = None;
+                        }
+                        "copy-line" => {
+                            // Select entire current line and yank
+                            if let Some((r, _)) = crate::copy_mode::get_copy_pos(&mut app) {
+                                app.copy_anchor = Some((r, 0));
+                                app.copy_selection_mode = crate::types::SelectionMode::Line;
+                                let cols = app.windows.get(app.active_idx)
+                                    .and_then(|w| active_pane(&w.root, &w.active_path))
+                                    .map(|p| p.last_cols).unwrap_or(80);
+                                app.copy_pos = Some((r, cols.saturating_sub(1)));
+                                let _ = yank_selection(&mut app);
+                            }
+                            app.mode = Mode::Passthrough;
+                            app.copy_scroll_offset = 0;
+                            app.copy_pos = None;
+                        }
+                        s if s.starts_with("goto-line") => {
+                            // goto-line <N> — jump to line N in scrollback
+                            let n = s.strip_prefix("goto-line").unwrap_or("").trim()
+                                .parse::<u16>().unwrap_or(0);
+                            app.copy_pos = Some((n, 0));
+                        }
+                        "jump-forward" => { app.copy_find_char_pending = Some(0); }
+                        "jump-backward" => { app.copy_find_char_pending = Some(1); }
+                        "jump-to-forward" => { app.copy_find_char_pending = Some(2); }
+                        "jump-to-backward" => { app.copy_find_char_pending = Some(3); }
+                        "jump-again" => {
+                            // Repeat last find-char in same direction
+                            // We'd need to store last char; for now emit the pending
+                        }
+                        "jump-reverse" => {
+                            // Repeat last find-char in reverse direction
+                        }
+                        "next-paragraph" => {
+                            crate::copy_mode::move_next_paragraph(&mut app);
+                        }
+                        "previous-paragraph" => {
+                            crate::copy_mode::move_prev_paragraph(&mut app);
+                        }
+                        "next-matching-bracket" => {
+                            crate::copy_mode::move_matching_bracket(&mut app);
+                        }
+                        "stop-selection" => {
+                            // Keep cursor position but stop extending selection
+                            app.copy_anchor = None;
+                        }
                         _ => {} // ignore unknown copy-mode commands
                     }
                 }
@@ -1705,6 +1797,17 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 win.active_path = app.last_pane_path.clone();
                                 app.last_pane_path = tmp;
                             }
+                        }
+                        "mark" => {
+                            // select-pane -m: mark the current pane
+                            let win = &app.windows[app.active_idx];
+                            if let Some(pid) = get_active_pane_id(&win.root, &win.active_path) {
+                                app.marked_pane = Some((app.active_idx, pid));
+                            }
+                        }
+                        "unmark" => {
+                            // select-pane -M: clear the marked pane
+                            app.marked_pane = None;
                         }
                         _ => {}
                     }
@@ -1747,6 +1850,30 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::ListPanesFormat(resp, fmt) => {
                     let text = format_list_panes(&app, &fmt, app.active_idx);
                     let _ = resp.send(text);
+                }
+                CtrlReq::ListAllPanes(resp) => {
+                    let mut output = String::new();
+                    fn collect_all_panes(node: &Node, panes: &mut Vec<(usize, u16, u16)>) {
+                        match node {
+                            Node::Leaf(p) => { panes.push((p.id, p.last_cols, p.last_rows)); }
+                            Node::Split { children, .. } => { for c in children { collect_all_panes(c, panes); } }
+                        }
+                    }
+                    for (wi, win) in app.windows.iter().enumerate() {
+                        let mut panes = Vec::new();
+                        collect_all_panes(&win.root, &mut panes);
+                        for (id, cols, rows) in panes {
+                            output.push_str(&format!("{}:{}: %{} [{}x{}]\n", app.session_name, wi + app.window_base_index, id, cols, rows));
+                        }
+                    }
+                    let _ = resp.send(output);
+                }
+                CtrlReq::ListAllPanesFormat(resp, fmt) => {
+                    let mut lines = Vec::new();
+                    for wi in 0..app.windows.len() {
+                        lines.push(format_list_panes(&app, &fmt, wi));
+                    }
+                    let _ = resp.send(lines.join("\n"));
                 }
                 CtrlReq::KillWindow => {
                     if app.windows.len() > 1 {

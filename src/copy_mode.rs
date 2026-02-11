@@ -790,3 +790,110 @@ pub fn capture_active_pane_styled(app: &mut AppState) -> io::Result<Option<Strin
     }
     Ok(Some(text))
 }
+
+/// Move to next empty line (paragraph boundary) — } key
+pub fn move_next_paragraph(app: &mut AppState) {
+    let (r, _) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+    // Skip current non-blank lines, then find next blank line
+    let mut row = r + 1;
+    // Skip non-blank
+    while row < rows {
+        if let Some((text, _)) = read_row_text(app, row) {
+            if text.trim().is_empty() { break; }
+        } else { break; }
+        row += 1;
+    }
+    // Skip blank lines to find start of next paragraph
+    while row < rows {
+        if let Some((text, _)) = read_row_text(app, row) {
+            if !text.trim().is_empty() { break; }
+        } else { break; }
+        row += 1;
+    }
+    app.copy_pos = Some((row.min(rows.saturating_sub(1)), 0));
+}
+
+/// Move to previous empty line (paragraph boundary) — { key
+pub fn move_prev_paragraph(app: &mut AppState) {
+    let (r, _) = match get_copy_pos(app) { Some(p) => p, None => return };
+    if r == 0 { return; }
+    let mut row = r.saturating_sub(1);
+    // Skip non-blank
+    loop {
+        if let Some((text, _)) = read_row_text(app, row) {
+            if text.trim().is_empty() { break; }
+        } else { break; }
+        if row == 0 { app.copy_pos = Some((0, 0)); return; }
+        row -= 1;
+    }
+    // Skip blank lines
+    loop {
+        if let Some((text, _)) = read_row_text(app, row) {
+            if !text.trim().is_empty() { break; }
+        } else { break; }
+        if row == 0 { app.copy_pos = Some((0, 0)); return; }
+        row -= 1;
+    }
+    app.copy_pos = Some((row, 0));
+}
+
+/// Move to matching bracket — % key
+pub fn move_matching_bracket(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return };
+    let p = match active_pane(&win.root, &win.active_path) { Some(p) => p, None => return };
+    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    let screen = parser.screen();
+    
+    // Get char at cursor
+    let ch = screen.cell(r, c).map(|cell| {
+        let t = cell.contents();
+        t.chars().next().unwrap_or(' ')
+    }).unwrap_or(' ');
+    
+    let (open, close, forward) = match ch {
+        '(' => ('(', ')', true),
+        ')' => ('(', ')', false),
+        '[' => ('[', ']', true),
+        ']' => ('[', ']', false),
+        '{' => ('{', '}', true),
+        '}' => ('{', '}', false),
+        '<' => ('<', '>', true),
+        '>' => ('<', '>', false),
+        _ => return,
+    };
+    
+    let rows = p.last_rows;
+    let cols = p.last_cols;
+    let mut depth = 1i32;
+    let mut cr = r;
+    let mut cc = c;
+    
+    loop {
+        if forward {
+            cc += 1;
+            if cc >= cols { cc = 0; cr += 1; }
+            if cr >= rows { return; }
+        } else {
+            if cc == 0 {
+                if cr == 0 { return; }
+                cr -= 1;
+                cc = cols.saturating_sub(1);
+            } else { cc -= 1; }
+        }
+        
+        let cell_ch = screen.cell(cr, cc).map(|cell| {
+            cell.contents().chars().next().unwrap_or(' ')
+        }).unwrap_or(' ');
+        
+        if cell_ch == open { depth += if forward { 1 } else { -1 }; }
+        if cell_ch == close { depth += if forward { -1 } else { 1 }; }
+        if depth == 0 {
+            app.copy_pos = Some((cr, cc));
+            return;
+        }
+    }
+}

@@ -44,6 +44,12 @@ pub struct Window {
     pub id: usize,
     /// Activity flag: set when pane output is received while window is not active
     pub activity_flag: bool,
+    /// Bell flag: set when a bell (\x07) is detected in a pane
+    pub bell_flag: bool,
+    /// Silence flag: set when no output for monitor-silence seconds
+    pub silence_flag: bool,
+    /// Last output timestamp for silence detection
+    pub last_output_time: std::time::Instant,
     /// Last observed combined data_version for activity detection
     pub last_seen_version: u64,
 }
@@ -243,6 +249,14 @@ pub struct AppState {
     pub window_status_current_format: String,
     /// window-status-separator: between window status entries
     pub window_status_separator: String,
+    /// Marked pane: (window_index, pane_id) — set by select-pane -m
+    pub marked_pane: Option<(usize, usize)>,
+    /// monitor-silence: seconds of silence before flagging (0 = off)
+    pub monitor_silence: u64,
+    /// bell-action: "any", "none", "current", "other"
+    pub bell_action: String,
+    /// visual-bell: show visual indicator on bell
+    pub visual_bell: bool,
 }
 
 impl AppState {
@@ -317,6 +331,10 @@ impl AppState {
             window_status_format: "#I:#W#F".to_string(),
             window_status_current_format: "#I:#W#F".to_string(),
             window_status_separator: " ".to_string(),
+            marked_pane: None,
+            monitor_silence: 0,
+            bell_action: "any".to_string(),
+            visual_bell: false,
         }
     }
 }
@@ -411,6 +429,8 @@ pub enum CtrlReq {
     SelectWindow(usize),
     ListPanes(mpsc::Sender<String>),
     ListPanesFormat(mpsc::Sender<String>, String),
+    ListAllPanes(mpsc::Sender<String>),
+    ListAllPanesFormat(mpsc::Sender<String>, String),
     KillWindow,
     KillSession,
     HasSession(mpsc::Sender<bool>),

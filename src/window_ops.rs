@@ -468,6 +468,9 @@ pub fn break_pane_to_window(app: &mut AppState) {
             name: win_name,
             id: app.next_win_id,
             activity_flag: false,
+            bell_flag: false,
+            silence_flag: false,
+            last_output_time: std::time::Instant::now(),
             last_seen_version: 0,
         });
         app.next_win_id += 1;
