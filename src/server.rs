@@ -1269,11 +1269,12 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
                 if app.automatic_rename && !in_copy {
                     for win in app.windows.iter_mut() {
+                        // Respect manual renames — don't auto-rename windows the user renamed
+                        if win.manual_rename { continue; }
                         if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
                             if p.dead { continue; }
-                            // Throttle: only check foreground process every ~500ms
-                            // (GetConsoleProcessList involves console attach/detach)
-                            if p.last_title_check.elapsed() < std::time::Duration::from_millis(500) {
+                            // Throttle: only check foreground process every ~1s
+                            if p.last_title_check.elapsed() < std::time::Duration::from_millis(1000) {
                                 continue;
                             }
                             p.last_title_check = std::time::Instant::now();
@@ -1518,7 +1519,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); state_dirty = true; }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
-                CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; meta_dirty = true; hook_event = Some("after-rename-window"); }
+                CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; win.manual_rename = true; meta_dirty = true; hook_event = Some("after-rename-window"); }
                 CtrlReq::ListWindows(resp) => { let json = list_windows_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ListWindowsTmux(resp) => { let text = list_windows_tmux(&app); let _ = resp.send(text); }
                 CtrlReq::ListWindowsFormat(resp, fmt) => { let text = format_list_windows(&app, &fmt); let _ = resp.send(text); }
@@ -2851,7 +2852,16 @@ fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) 
         "monitor-activity" => { app.monitor_activity = matches!(value, "on" | "true" | "1"); }
         "visual-activity" => { app.visual_activity = matches!(value, "on" | "true" | "1"); }
         "synchronize-panes" => { app.sync_input = matches!(value, "on" | "true" | "1"); }
-        "automatic-rename" => { app.automatic_rename = matches!(value, "on" | "true" | "1"); }
+        "automatic-rename" => {
+            app.automatic_rename = matches!(value, "on" | "true" | "1");
+            // When user explicitly enables automatic-rename, clear manual_rename
+            // on the active window so auto-rename can take effect again.
+            if app.automatic_rename {
+                if let Some(w) = app.windows.get_mut(app.active_idx) {
+                    w.manual_rename = false;
+                }
+            }
+        }
         "prediction-dimming" | "dim-predictions" => {
             app.prediction_dimming = !matches!(value, "off" | "false" | "0");
         }

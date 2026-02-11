@@ -52,6 +52,9 @@ pub struct Window {
     pub last_output_time: std::time::Instant,
     /// Last observed combined data_version for activity detection
     pub last_seen_version: u64,
+    /// True when the user has manually renamed this window (auto-rename won't override).
+    /// Cleared when `set automatic-rename on` is explicitly set.
+    pub manual_rename: bool,
 }
 
 /// A menu item for display-menu

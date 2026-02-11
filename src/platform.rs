@@ -468,9 +468,6 @@ pub mod process_info {
         fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
         fn Process32FirstW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
         fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
-        fn FreeConsole() -> i32;
-        fn AttachConsole(process_id: u32) -> i32;
-        fn GetConsoleProcessList(process_list: *mut u32, process_count: u32) -> u32;
     }
 
     #[link(name = "ntdll")]
@@ -580,26 +577,45 @@ pub mod process_info {
         Some(path.trim_end_matches('\\').to_string())
     }
 
+    /// Append a line to ~/.psmux/autorename.log (first 100 entries only).
+    fn autorename_log(msg: &str) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        if n > 100 { return; }
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+        let path = format!("{}/.psmux/autorename.log", home);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+        }
+    }
+
     /// Get the name of the foreground process in the pane.
-    /// Tries process-tree walk first, then falls back to GetConsoleProcessList
-    /// which correctly handles ConPTY's process reparenting on Windows.
+    /// Walks the process tree from the shell PID to find the deepest
+    /// non-system descendant (the user's foreground command).
     pub fn get_foreground_process_name(pid: u32) -> Option<String> {
-        // Fast path: walk the process tree.
-        if let Some(target) = find_foreground_child_pid(pid) {
-            if target != pid {
-                if let Some(name) = get_process_name(target) {
-                    return Some(name);
+        // Walk the process tree to find the foreground child.
+        let result = find_foreground_child_pid(pid);
+        match result {
+            Some(target) if target != pid => {
+                let name = get_process_name(target);
+                autorename_log(&format!("pid={} fg_child={} name={:?}", pid, target, name));
+                if let Some(n) = name {
+                    return Some(n);
                 }
             }
-        }
-        // Slow path: query console process list (handles ConPTY reparenting).
-        if let Some(fg_pid) = get_console_foreground_pid(pid) {
-            if let Some(name) = get_process_name(fg_pid) {
-                return Some(name);
+            Some(_) => {
+                autorename_log(&format!("pid={} fg_child=self (no children)", pid));
+            }
+            None => {
+                autorename_log(&format!("pid={} fg_child=None (BFS found nothing)", pid));
             }
         }
-        // Final fallback: shell's own process name.
-        get_process_name(pid)
+        // Fallback: shell's own process name.
+        let shell_name = get_process_name(pid);
+        autorename_log(&format!("pid={} fallback_name={:?}", pid, shell_name));
+        shell_name
     }
 
     /// Get the CWD of the foreground process in the pane.
@@ -611,53 +627,7 @@ pub mod process_info {
                 }
             }
         }
-        if let Some(fg_pid) = get_console_foreground_pid(pid) {
-            if let Some(cwd) = get_process_cwd(fg_pid) {
-                return Some(cwd);
-            }
-        }
         get_process_cwd(pid)
-    }
-
-    /// Use GetConsoleProcessList to find the foreground process in a ConPTY.
-    ///
-    /// On Windows with ConPTY, child processes spawned by the shell may not
-    /// appear as descendants in the process tree (their parent PID can point
-    /// to psmux or conhost instead of the shell).  However, all processes in
-    /// a ConPTY share the same console session.  By attaching to the shell's
-    /// console and calling GetConsoleProcessList we get every PID in that
-    /// session, then pick the most recently created non-shell, non-system one.
-    fn get_console_foreground_pid(shell_pid: u32) -> Option<u32> {
-        unsafe {
-            FreeConsole();
-            if AttachConsole(shell_pid) == 0 {
-                return None;
-            }
-            let mut pids = [0u32; 64];
-            let count = GetConsoleProcessList(pids.as_mut_ptr(), 64);
-            FreeConsole();
-
-            if count == 0 { return None; }
-            let count = count.min(64) as usize;
-
-            // Sort descending by PID (highest ≈ most recently created).
-            let mut candidates: Vec<u32> = pids[..count].iter()
-                .copied()
-                .filter(|&p| p != 0 && p != shell_pid)
-                .collect();
-            candidates.sort_unstable_by(|a, b| b.cmp(a));
-
-            // Pick the first non-system process.
-            for pid in candidates {
-                if let Some(name) = get_process_name(pid) {
-                    let lower = format!("{}.exe", name.to_lowercase());
-                    if !is_system_exe(&lower) {
-                        return Some(pid);
-                    }
-                }
-            }
-            None
-        }
     }
 
     /// Known system/infrastructure processes that should be skipped when
@@ -679,7 +649,10 @@ pub mod process_info {
     fn find_foreground_child_pid(root_pid: u32) -> Option<u32> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE || snap == 0 { return None; }
+            if snap == INVALID_HANDLE || snap == 0 {
+                autorename_log(&format!("root={} SNAPSHOT FAILED", root_pid));
+                return None;
+            }
 
             // Collect (pid, ppid, exe_name_lower) for every process.
             let mut entries: Vec<(u32, u32, String)> = Vec::with_capacity(512);
@@ -695,6 +668,16 @@ pub mod process_info {
                 }
             }
             CloseHandle(snap);
+
+            autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
+
+            // Log direct children of root_pid
+            let direct: Vec<_> = entries.iter()
+                .filter(|(_, ppid, _)| *ppid == root_pid)
+                .collect();
+            for (pid, _, name) in &direct {
+                autorename_log(&format!("  direct_child: pid={} name={}", pid, name));
+            }
 
             // BFS: collect all descendants with their depth.
             // Each entry is (pid, exe_name, depth).
@@ -712,6 +695,11 @@ pub mod process_info {
                         queue.push((*pid, depth + 1));
                     }
                 }
+            }
+
+            autorename_log(&format!("root={} descendants={}", root_pid, descendants.len()));
+            for (pid, name, depth) in &descendants {
+                autorename_log(&format!("  desc: pid={} name={} depth={}", pid, name, depth));
             }
 
             if descendants.is_empty() {
@@ -745,9 +733,12 @@ pub mod process_info {
             let selection = if !user_pool.is_empty() { user_pool } else { pool.iter().collect() };
 
             // Deepest first, then largest PID as tiebreaker.
-            selection.iter()
+            let result = selection.iter()
                 .max_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)))
-                .map(|(pid, _, _)| *pid)
+                .map(|(pid, _, _)| *pid);
+
+            autorename_log(&format!("root={} selected={:?}", root_pid, result));
+            result
         }
     }
 
