@@ -121,7 +121,12 @@ pub enum Mode {
     },
     /// Big clock display (tmux clock-mode)
     ClockMode,
+    /// Interactive buffer chooser (prefix =)
+    BufferChooser { selected: usize },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SelectionMode { Char, Line, Rect }
 
 #[derive(Debug, Clone, Copy)]
 pub enum FocusDir { Left, Right, Up, Down }
@@ -143,6 +148,8 @@ pub struct AppState {
     pub copy_anchor: Option<(u16,u16)>,
     pub copy_pos: Option<(u16,u16)>,
     pub copy_scroll_offset: usize,
+    /// Selection mode: Char (default), Line (V), Rect (C-v)
+    pub copy_selection_mode: SelectionMode,
     /// Copy-mode search query
     pub copy_search_query: String,
     /// Copy-mode search matches: (row, col_start, col_end) in screen coords
@@ -151,6 +158,8 @@ pub struct AppState {
     pub copy_search_idx: usize,
     /// Search direction: true = forward (/), false = backward (?)
     pub copy_search_forward: bool,
+    /// Pending find-char operation: (f=0,F=1,t=2,T=3) for next char input
+    pub copy_find_char_pending: Option<u8>,
     pub display_map: Vec<(usize, Vec<usize>)>,
     /// Key tables: "prefix" (default), "root", "copy-mode-vi", "copy-mode-emacs", etc.
     pub key_tables: std::collections::HashMap<String, Vec<Bind>>,
@@ -249,10 +258,12 @@ impl AppState {
             copy_anchor: None,
             copy_pos: None,
             copy_scroll_offset: 0,
+            copy_selection_mode: SelectionMode::Char,
             copy_search_query: String::new(),
             copy_search_matches: Vec::new(),
             copy_search_idx: 0,
             copy_search_forward: true,
+            copy_find_char_pending: None,
             display_map: Vec::new(),
             key_tables: std::collections::HashMap::new(),
             control_rx: None,
@@ -336,7 +347,7 @@ pub enum Action {
 pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>),
+    NewWindow(Option<String>, Option<String>),
     SplitWindow(LayoutKind, Option<String>),
     KillPane,
     CapturePane(mpsc::Sender<String>),
@@ -354,6 +365,7 @@ pub enum CtrlReq {
     SendPaste(String),
     ZoomPane,
     CopyEnter,
+    CopyEnterPageUp,
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
@@ -374,6 +386,7 @@ pub enum CtrlReq {
     PrevWindow,
     RenameWindow(String),
     ListWindows(mpsc::Sender<String>),
+    ListWindowsTmux(mpsc::Sender<String>),
     ListTree(mpsc::Sender<String>),
     ToggleSync,
     SetPaneTitle(String),
@@ -390,6 +403,7 @@ pub enum CtrlReq {
     SetBuffer(String),
     ListBuffers(mpsc::Sender<String>),
     ShowBuffer(mpsc::Sender<String>),
+    ShowBufferAt(mpsc::Sender<String>, usize),
     DeleteBuffer,
     DisplayMessage(mpsc::Sender<String>, String),
     LastWindow,

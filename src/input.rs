@@ -257,6 +257,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     app.mode = Mode::ClockMode;
                     true
                 }
+                // --- buffer chooser (=) ---
+                KeyCode::Char('=') => {
+                    app.mode = Mode::BufferChooser { selected: 0 };
+                    true
+                }
                 _ => false,
             };
 
@@ -318,6 +323,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             Ok(false)
         }
         Mode::CopyMode => {
+            // Handle find-char pending state (waiting for char after f/F/t/T)
+            if let Some(pending) = app.copy_find_char_pending.take() {
+                if let KeyCode::Char(ch) = key.code {
+                    match pending {
+                        0 => crate::copy_mode::find_char_forward(app, ch),
+                        1 => crate::copy_mode::find_char_backward(app, ch),
+                        2 => crate::copy_mode::find_char_to_forward(app, ch),
+                        3 => crate::copy_mode::find_char_to_backward(app, ch),
+                        _ => {}
+                    }
+                }
+                return Ok(false);
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => { 
                     app.mode = Mode::Passthrough; 
@@ -333,8 +351,8 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Left | KeyCode::Char('h') => { move_copy_cursor(app, -1, 0); }
                 KeyCode::Right | KeyCode::Char('l') => { move_copy_cursor(app, 1, 0); }
-                KeyCode::Up | KeyCode::Char('k') => { scroll_copy_up(app, 1); }
-                KeyCode::Down | KeyCode::Char('j') => { scroll_copy_down(app, 1); }
+                KeyCode::Up | KeyCode::Char('k') => { move_copy_cursor(app, 0, -1); }
+                KeyCode::Down | KeyCode::Char('j') => { move_copy_cursor(app, 0, 1); }
                 // Page scroll: C-b / PageUp = page up, C-f / PageDown = page down
                 KeyCode::PageUp => { scroll_copy_up(app, 10); }
                 KeyCode::PageDown => { scroll_copy_down(app, 10); }
@@ -365,14 +383,92 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('w') => { crate::copy_mode::move_word_forward(app); }
                 KeyCode::Char('b') => { crate::copy_mode::move_word_backward(app); }
                 KeyCode::Char('e') => { crate::copy_mode::move_word_end(app); }
+                // WORD motions: W = next WORD, B = prev WORD, E = end WORD
+                KeyCode::Char('W') => { crate::copy_mode::move_word_forward_big(app); }
+                KeyCode::Char('B') => { crate::copy_mode::move_word_backward_big(app); }
+                KeyCode::Char('E') => { crate::copy_mode::move_word_end_big(app); }
+                // Screen position: H = top, M = middle, L = bottom
+                KeyCode::Char('H') => { crate::copy_mode::move_to_screen_top(app); }
+                KeyCode::Char('M') => { crate::copy_mode::move_to_screen_middle(app); }
+                KeyCode::Char('L') => { crate::copy_mode::move_to_screen_bottom(app); }
+                // Find char: f/F/t/T — sets pending state for next char
+                KeyCode::Char('f') => { app.copy_find_char_pending = Some(0); }
+                KeyCode::Char('F') => { app.copy_find_char_pending = Some(1); }
+                KeyCode::Char('t') => { app.copy_find_char_pending = Some(2); }
+                KeyCode::Char('T') => { app.copy_find_char_pending = Some(3); }
+                // D = copy from cursor to end of line
+                KeyCode::Char('D') => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
                 KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
                 KeyCode::Char('$') => { crate::copy_mode::move_to_line_end(app); }
                 KeyCode::Char('^') => { crate::copy_mode::move_to_first_nonblank(app); }
                 KeyCode::Home => { crate::copy_mode::move_to_line_start(app); }
                 KeyCode::End => { crate::copy_mode::move_to_line_end(app); }
-                KeyCode::Char('v') => { if let Some((r,c)) = current_prompt_pos(app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
-                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // vi: toggle rectangle selection, emacs: page down
+                    if app.mode_keys == "emacs" {
+                        scroll_copy_down(app, 10);
+                    } else {
+                        app.copy_selection_mode = crate::types::SelectionMode::Rect;
+                    }
+                }
+                KeyCode::Char('v') => {
+                    // Start char-wise selection (vi visual mode)
+                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r,c));
+                        app.copy_pos = Some((r,c));
+                        app.copy_selection_mode = crate::types::SelectionMode::Char;
+                    }
+                }
+                KeyCode::Char('V') => {
+                    // Start line-wise selection (vi visual-line mode)
+                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r,c));
+                        app.copy_pos = Some((r,c));
+                        app.copy_selection_mode = crate::types::SelectionMode::Line;
+                    }
+                }
+                KeyCode::Char('o') => {
+                    // Swap cursor and anchor
+                    if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                        app.copy_anchor = Some(p);
+                        app.copy_pos = Some(a);
+                    }
+                }
+                KeyCode::Char('A') => {
+                    // Append to buffer (yank + append to buffer 0)
+                    if let (Some(_), Some(_)) = (app.copy_anchor, app.copy_pos) {
+                        // Save current buffer 0
+                        let prev = app.paste_buffers.first().cloned().unwrap_or_default();
+                        yank_selection(app)?;
+                        // buffer 0 is now the new yank; prepend old text
+                        if let Some(buf) = app.paste_buffers.first_mut() {
+                            let new_text = buf.clone();
+                            *buf = format!("{}{}", prev, new_text);
+                        }
+                        app.mode = Mode::Passthrough;
+                        app.copy_scroll_offset = 0;
+                        app.copy_pos = None;
+                    }
+                }
+                // Space = begin selection (vi mode), Enter = copy-selection-and-cancel
+                KeyCode::Char(' ') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                        app.copy_anchor = Some((r,c));
+                        app.copy_pos = Some((r,c));
+                        app.copy_selection_mode = crate::types::SelectionMode::Char;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Copy selection and exit copy mode (vi Enter)
+                    if app.copy_anchor.is_some() {
+                        yank_selection(app)?;
+                    }
+                    app.mode = Mode::Passthrough;
+                    app.copy_scroll_offset = 0;
+                    app.copy_pos = None;
+                }
+                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
                 // --- copy-mode search ---
                 KeyCode::Char('/') => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: true };
@@ -387,11 +483,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 1); }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_start(app); }
                 KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_end(app); }
-                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 10); }
+                // C-v handled above (mode-keys aware)
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: true };
                 }
@@ -412,7 +508,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Set mark (anchor)
-                    if let Some((r, c)) = current_prompt_pos(app) {
+                    if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                         app.copy_anchor = Some((r, c));
                         app.copy_pos = Some((r, c));
                     }
@@ -582,6 +678,47 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         Mode::ClockMode => {
             // Any key exits clock mode
             app.mode = Mode::Passthrough;
+            Ok(false)
+        }
+        Mode::BufferChooser { selected } => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::Passthrough; }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if selected > 0 {
+                        if let Mode::BufferChooser { selected: s } = &mut app.mode { *s -= 1; }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = app.paste_buffers.len().saturating_sub(1);
+                    if selected < max {
+                        if let Mode::BufferChooser { selected: s } = &mut app.mode { *s += 1; }
+                    }
+                }
+                KeyCode::Enter => {
+                    // Paste selected buffer
+                    if selected < app.paste_buffers.len() {
+                        let text = app.paste_buffers[selected].clone();
+                        app.mode = Mode::Passthrough;
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                            let _ = write!(p.master, "{}", text);
+                        }
+                    } else {
+                        app.mode = Mode::Passthrough;
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    // Delete selected buffer
+                    if selected < app.paste_buffers.len() {
+                        app.paste_buffers.remove(selected);
+                        if let Mode::BufferChooser { selected: s } = &mut app.mode {
+                            if *s >= app.paste_buffers.len() && *s > 0 { *s -= 1; }
+                        }
+                        if app.paste_buffers.is_empty() { app.mode = Mode::Passthrough; }
+                    }
+                }
+                _ => {}
+            }
             Ok(false)
         }
     }
@@ -905,6 +1042,17 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
 
 /// Dispatch a single character as a copy-mode action.
 fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
+    // Handle find-char pending state (waiting for char after f/F/t/T)
+    if let Some(pending) = app.copy_find_char_pending.take() {
+        match pending {
+            0 => crate::copy_mode::find_char_forward(app, c),
+            1 => crate::copy_mode::find_char_backward(app, c),
+            2 => crate::copy_mode::find_char_to_forward(app, c),
+            3 => crate::copy_mode::find_char_to_backward(app, c),
+            _ => {}
+        }
+        return Ok(());
+    }
     match c {
         'q' | ']' | '\x1b' => {
             app.mode = Mode::Passthrough;
@@ -920,23 +1068,68 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         }
         'h' => { move_copy_cursor(app, -1, 0); }
         'l' => { move_copy_cursor(app, 1, 0); }
-        'k' => { scroll_copy_up(app, 1); }
-        'j' => { scroll_copy_down(app, 1); }
+        'k' => { move_copy_cursor(app, 0, -1); }
+        'j' => { move_copy_cursor(app, 0, 1); }
         'g' => { scroll_to_top(app); }
         'G' => { scroll_to_bottom(app); }
         'w' => { crate::copy_mode::move_word_forward(app); }
         'b' => { crate::copy_mode::move_word_backward(app); }
         'e' => { crate::copy_mode::move_word_end(app); }
+        'W' => { crate::copy_mode::move_word_forward_big(app); }
+        'B' => { crate::copy_mode::move_word_backward_big(app); }
+        'E' => { crate::copy_mode::move_word_end_big(app); }
+        'H' => { crate::copy_mode::move_to_screen_top(app); }
+        'M' => { crate::copy_mode::move_to_screen_middle(app); }
+        'L' => { crate::copy_mode::move_to_screen_bottom(app); }
+        'f' => { app.copy_find_char_pending = Some(0); }
+        'F' => { app.copy_find_char_pending = Some(1); }
+        't' => { app.copy_find_char_pending = Some(2); }
+        'T' => { app.copy_find_char_pending = Some(3); }
+        'D' => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
         '0' => { crate::copy_mode::move_to_line_start(app); }
         '$' => { crate::copy_mode::move_to_line_end(app); }
         '^' => { crate::copy_mode::move_to_first_nonblank(app); }
-        'v' => {
-            if let Some((r, c)) = current_prompt_pos(app) {
+        ' ' => {
+            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                 app.copy_anchor = Some((r, c));
                 app.copy_pos = Some((r, c));
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
         }
-        'y' => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+        'v' => {
+            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r, c));
+                app.copy_pos = Some((r, c));
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
+            }
+        }
+        'V' => {
+            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r, c));
+                app.copy_pos = Some((r, c));
+                app.copy_selection_mode = crate::types::SelectionMode::Line;
+            }
+        }
+        'o' => {
+            if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                app.copy_anchor = Some(p);
+                app.copy_pos = Some(a);
+            }
+        }
+        'A' => {
+            if let (Some(_), Some(_)) = (app.copy_anchor, app.copy_pos) {
+                let prev = app.paste_buffers.first().cloned().unwrap_or_default();
+                yank_selection(app)?;
+                if let Some(buf) = app.paste_buffers.first_mut() {
+                    let new_text = buf.clone();
+                    *buf = format!("{}{}", prev, new_text);
+                }
+                app.mode = Mode::Passthrough;
+                app.copy_scroll_offset = 0;
+                app.copy_pos = None;
+            }
+        }
+        'y' => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
         '/' => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
         '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
         'n' => { search_next(app); }
@@ -993,8 +1186,25 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     }
                 }
             }
-            "up" => { scroll_copy_up(app, 1); }
-            "down" => { scroll_copy_down(app, 1); }
+            "enter" => {
+                // Copy selection and exit copy mode (vi Enter)
+                if app.copy_anchor.is_some() {
+                    yank_selection(app)?;
+                }
+                app.mode = Mode::Passthrough;
+                app.copy_scroll_offset = 0;
+                app.copy_pos = None;
+            }
+            "space" => {
+                // Begin selection (like v in vi mode)
+                if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
+                    app.copy_anchor = Some((r, c));
+                    app.copy_pos = Some((r, c));
+                    app.copy_selection_mode = crate::types::SelectionMode::Char;
+                }
+            }
+            "up" => { move_copy_cursor(app, 0, -1); }
+            "down" => { move_copy_cursor(app, 0, 1); }
             "pageup" => { scroll_copy_up(app, 10); }
             "pagedown" => { scroll_copy_down(app, 10); }
             "left" => { move_copy_cursor(app, -1, 0); }
@@ -1009,15 +1219,15 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 if app.mode_keys == "emacs" { move_copy_cursor(app, 1, 0); }
                 else { scroll_copy_down(app, 10); }
             }
-            "C-n" | "c-n" => { scroll_copy_down(app, 1); }
-            "C-p" | "c-p" => { scroll_copy_up(app, 1); }
+            "C-n" | "c-n" => { move_copy_cursor(app, 0, 1); }
+            "C-p" | "c-p" => { move_copy_cursor(app, 0, -1); }
             "C-a" | "c-a" => { crate::copy_mode::move_to_line_start(app); }
             "C-e" | "c-e" => { crate::copy_mode::move_to_line_end(app); }
             "C-v" | "c-v" => { scroll_copy_down(app, 10); }
             "M-v" | "m-v" => { scroll_copy_up(app, 10); }
             "M-f" | "m-f" => { crate::copy_mode::move_word_forward(app); }
             "M-b" | "m-b" => { crate::copy_mode::move_word_backward(app); }
-            "M-w" | "m-w" => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+            "M-w" | "m-w" => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
             "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
             "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
             "C-g" | "c-g" => {
@@ -1034,7 +1244,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             }
             "c-space" | "C-space" => {
                 // Set mark (anchor) at current position
-                if let Some((r, c)) = current_prompt_pos(app) {
+                if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                     app.copy_anchor = Some((r, c));
                     app.copy_pos = Some((r, c));
                 }

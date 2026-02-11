@@ -286,14 +286,25 @@ fn main() -> io::Result<()> {
                 }
             }
             "new-window" | "neww" => {
-                // Parse command after flags (first non-flag argument, skipping command name at cmd_args[0])
-                let cmd_arg = cmd_args.iter().skip(1).find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("");
-                if cmd_arg.is_empty() {
-                    send_control("new-window\n".to_string())?;
-                } else {
-                    // Quote the command argument to preserve spaces
-                    send_control(format!("new-window \"{}\"\n", cmd_arg.replace("\"", "\\\"")))?;
+                // Parse -n name flag
+                let name_arg: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
+                // Parse command — first non-flag argument, excluding -n/-t values
+                let cmd_arg = cmd_args.iter().skip(1)
+                    .filter(|a| !a.starts_with('-'))
+                    .find(|a| {
+                        // Exclude values of -n and -t flags
+                        !cmd_args.windows(2).any(|w| (w[0] == "-n" || w[0] == "-t") && w[1] == **a)
+                    })
+                    .map(|s| s.as_str()).unwrap_or("");
+                let mut cmd_line = "new-window".to_string();
+                if let Some(name) = &name_arg {
+                    cmd_line.push_str(&format!(" -n \"{}\"", name.replace("\"", "\\\"")));
                 }
+                if !cmd_arg.is_empty() {
+                    cmd_line.push_str(&format!(" \"{}\"", cmd_arg.replace("\"", "\\\"")));
+                }
+                cmd_line.push('\n');
+                send_control(cmd_line)?;
                 return Ok(());
             }
             "split-window" | "splitw" => {
@@ -459,6 +470,7 @@ fn main() -> io::Result<()> {
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
                         "-a" => { cmd.push_str(" -a"); }
+                        "-J" => { cmd.push_str(" -J"); }
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -t {}", t));

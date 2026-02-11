@@ -485,6 +485,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     cmd_batch.push("list-keys\n".into());
                                 }
                                 KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
+                                KeyCode::Char('=') => { cmd_batch.push("choose-buffer\n".into()); }
                                 KeyCode::Char(':') => { command_input = true; command_buf.clear(); }
                                 KeyCode::Char('w') => {
                                     tree_chooser = true;

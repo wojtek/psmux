@@ -245,10 +245,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 match cmd {
                     "new-window" | "neww" => {
+                        let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
                         let cmd_str: Option<String> = args.iter()
-                            .find(|a| !a.starts_with('-'))
+                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::NewWindow(cmd_str));
+                        let _ = tx.send(CtrlReq::NewWindow(cmd_str, name));
                     }
                     "split-window" | "splitw" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
@@ -386,7 +387,20 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "next-window" | "next" => { let _ = tx.send(CtrlReq::NextWindow); }
                     "previous-window" | "prev" => { let _ = tx.send(CtrlReq::PrevWindow); }
                     "rename-window" | "renamew" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
-                    "list-windows" | "lsw" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } if !persistent { break; } }
+                    "list-windows" | "lsw" => {
+                        if args.iter().any(|a| *a == "-J") {
+                            // JSON output for programmatic use
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::ListWindows(rtx));
+                            if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        } else {
+                            // tmux-compatible text output (default)
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::ListWindowsTmux(rtx));
+                            if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+                        }
+                        if !persistent { break; }
+                    }
                     "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } if !persistent { break; } }
                     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
                     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
@@ -457,8 +471,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         let _ = tx.send(CtrlReq::SetBuffer(content));
                     }
                     "paste-buffer" | "pasteb" => {
+                        let buf_idx: Option<usize> = args.windows(2).find(|w| w[0] == "-b").and_then(|w| w[1].parse().ok());
                         let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ShowBuffer(rtx));
+                        if let Some(idx) = buf_idx {
+                            let _ = tx.send(CtrlReq::ShowBufferAt(rtx, idx));
+                        } else {
+                            let _ = tx.send(CtrlReq::ShowBuffer(rtx));
+                        }
                         if let Ok(text) = rrx.recv() {
                             let _ = tx.send(CtrlReq::SendText(text));
                         }
@@ -768,7 +787,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                         if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
                         if !persistent { break; }
                     }
-                    "copy-mode" => { let _ = tx.send(CtrlReq::CopyEnter); }
+                    "copy-mode" => {
+                        if args.iter().any(|a| *a == "-u") {
+                            let _ = tx.send(CtrlReq::CopyEnterPageUp);
+                        } else {
+                            let _ = tx.send(CtrlReq::CopyEnter);
+                        }
+                    }
                     "clock-mode" => { let _ = tx.send(CtrlReq::ClockMode); }
                     "show-messages" | "showmsgs" => {} // not implemented but accepted
                     "command-prompt" => {} // accepted (client handles internally)
@@ -1076,7 +1101,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
                     let mut hook_event: Option<&str> = None;
                     match req {
-                CtrlReq::NewWindow(cmd) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window"); }
+                CtrlReq::NewWindow(cmd, name) => { let _ = create_window(&*pty_system, &mut app, cmd.as_deref()); if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); } resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window"); }
                 CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window"); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("pane-exited"); }
                 CtrlReq::CapturePane(resp) => {
@@ -1163,6 +1188,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::SendPaste(s) => { send_text_to_active(&mut app, &s)?; sent_pty_input = true; }
                 CtrlReq::ZoomPane => { toggle_zoom(&mut app); }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); }
+                CtrlReq::CopyEnterPageUp => {
+                    enter_copy_mode(&mut app);
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| active_pane(&w.root, &w.active_path))
+                        .map(|p| p.last_rows as usize).unwrap_or(20);
+                    scroll_copy_up(&mut app, half);
+                }
                 CtrlReq::ClockMode => { app.mode = Mode::ClockMode; }
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
@@ -1187,6 +1219,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; meta_dirty = true; hook_event = Some("after-rename-window"); }
                 CtrlReq::ListWindows(resp) => { let json = list_windows_json(&app)?; let _ = resp.send(json); }
+                CtrlReq::ListWindowsTmux(resp) => { let text = list_windows_tmux(&app); let _ = resp.send(text); }
                 CtrlReq::ListTree(resp) => { let json = list_tree_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ToggleSync => { app.sync_input = !app.sync_input; }
                 CtrlReq::SetPaneTitle(title) => {
@@ -1224,7 +1257,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 };
                                 if !normalized.is_empty() {
                                     send_key_to_active(&mut app, normalized)?;
-                                } else if key_upper.starts_with("C-") || key_upper.starts_with("M-") || key_upper.starts_with("F") {
+                                } else if key_upper.starts_with("C-") || key_upper.starts_with("M-") || (key_upper.starts_with("F") && key_upper.len() >= 2 && key_upper[1..].chars().all(|c| c.is_ascii_digit())) {
                                     send_key_to_active(&mut app, &key.to_lowercase())?;
                                 } else {
                                     // Plain text char — route through send_text_to_active (handles copy mode chars)
@@ -1425,6 +1458,10 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let content = app.paste_buffers.first().cloned().unwrap_or_default();
                     let _ = resp.send(content);
                 }
+                CtrlReq::ShowBufferAt(resp, idx) => {
+                    let content = app.paste_buffers.get(idx).cloned().unwrap_or_default();
+                    let _ = resp.send(content);
+                }
                 CtrlReq::DeleteBuffer => {
                     if !app.paste_buffers.is_empty() { app.paste_buffers.remove(0); }
                 }
@@ -1462,8 +1499,42 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     break_pane_to_window(&mut app);
                 }
                 CtrlReq::JoinPane(target_win) => {
-                    if target_win < app.windows.len() {
-                        app.active_idx = target_win;
+                    // Real join-pane: extract active pane from current window and
+                    // graft it as a vertical split into the target window.
+                    let src_idx = app.active_idx;
+                    if target_win < app.windows.len() && target_win != src_idx {
+                        let src_path = app.windows[src_idx].active_path.clone();
+                        let src_root = std::mem::replace(&mut app.windows[src_idx].root,
+                            Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
+                        let (remaining, extracted) = tree::extract_node(src_root, &src_path);
+                        if let Some(pane_node) = extracted {
+                            let src_empty = remaining.is_none();
+                            if let Some(rem) = remaining {
+                                app.windows[src_idx].root = rem;
+                                app.windows[src_idx].active_path = tree::first_leaf_path(&app.windows[src_idx].root);
+                            }
+                            // Adjust target index if source window will be removed
+                            let tgt = if src_empty && target_win > src_idx { target_win - 1 } else { target_win };
+                            if src_empty {
+                                app.windows.remove(src_idx);
+                                if app.active_idx >= app.windows.len() {
+                                    app.active_idx = app.windows.len().saturating_sub(1);
+                                }
+                            }
+                            // Graft pane into target window
+                            if tgt < app.windows.len() {
+                                let tgt_path = app.windows[tgt].active_path.clone();
+                                tree::replace_leaf_with_split(&mut app.windows[tgt].root, &tgt_path, LayoutKind::Vertical, pane_node);
+                                app.active_idx = tgt;
+                            }
+                            resize_all_panes(&mut app);
+                            meta_dirty = true;
+                        } else {
+                            // Extraction failed — restore
+                            if let Some(rem) = remaining {
+                                app.windows[src_idx].root = rem;
+                            }
+                        }
                     }
                 }
                 CtrlReq::RespawnPane => {
@@ -1516,7 +1587,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                          bind-key -T prefix Left select-pane -L\n\
                          bind-key -T prefix Right select-pane -R\n\
                          bind-key -T prefix ? list-keys\n\
-                         bind-key -T prefix t clock-mode\n"
+                         bind-key -T prefix t clock-mode\n\
+                         bind-key -T prefix = choose-buffer\n"
                     );
                     for (table_name, binds) in &app.key_tables {
                         for bind in binds {
@@ -1687,8 +1759,38 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::MovePane(target_win) => {
-                    if target_win < app.windows.len() && target_win != app.active_idx {
-                        app.active_idx = target_win;
+                    // move-pane is an alias for join-pane
+                    let src_idx = app.active_idx;
+                    if target_win < app.windows.len() && target_win != src_idx {
+                        let src_path = app.windows[src_idx].active_path.clone();
+                        let src_root = std::mem::replace(&mut app.windows[src_idx].root,
+                            Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
+                        let (remaining, extracted) = tree::extract_node(src_root, &src_path);
+                        if let Some(pane_node) = extracted {
+                            let src_empty = remaining.is_none();
+                            if let Some(rem) = remaining {
+                                app.windows[src_idx].root = rem;
+                                app.windows[src_idx].active_path = tree::first_leaf_path(&app.windows[src_idx].root);
+                            }
+                            let tgt = if src_empty && target_win > src_idx { target_win - 1 } else { target_win };
+                            if src_empty {
+                                app.windows.remove(src_idx);
+                                if app.active_idx >= app.windows.len() {
+                                    app.active_idx = app.windows.len().saturating_sub(1);
+                                }
+                            }
+                            if tgt < app.windows.len() {
+                                let tgt_path = app.windows[tgt].active_path.clone();
+                                tree::replace_leaf_with_split(&mut app.windows[tgt].root, &tgt_path, LayoutKind::Vertical, pane_node);
+                                app.active_idx = tgt;
+                            }
+                            resize_all_panes(&mut app);
+                            meta_dirty = true;
+                        } else {
+                            if let Some(rem) = remaining {
+                                app.windows[src_idx].root = rem;
+                            }
+                        }
                     }
                 }
                 CtrlReq::PipePane(cmd, stdin, stdout) => {

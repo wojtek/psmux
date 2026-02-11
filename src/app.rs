@@ -115,11 +115,11 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 }
                 match cmd {
                     "new-window" => {
-                        // Parse optional command - find first non-flag argument after command
+                        let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
                         let cmd_str: Option<String> = args.iter()
-                            .find(|a| !a.starts_with('-'))
+                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::NewWindow(cmd_str));
+                        let _ = tx.send(CtrlReq::NewWindow(cmd_str, name));
                     }
                     "split-window" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
@@ -176,6 +176,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 Mode::PopupMode { .. } => "POPUP",
                 Mode::ConfirmMode { .. } => "CONFIRM",
                 Mode::ClockMode => "CLOCK",
+                Mode::BufferChooser { .. } => "BUF",
             };
             let time_str = Local::now().format("%H:%M").to_string();
             let status_spans = parse_status(&app.status_left, &app, &time_str);
@@ -230,6 +231,24 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 }
                 let overlay = Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title("windows"));
                 let oa = centered_rect(60, (app.windows.len() as u16 + 2).min(10), area);
+                f.render_widget(Clear, oa);
+                f.render_widget(overlay, oa);
+            }
+
+            if let Mode::BufferChooser { selected } = app.mode {
+                let mut lines: Vec<Line> = Vec::new();
+                if app.paste_buffers.is_empty() {
+                    lines.push(Line::from("  (no buffers)"));
+                } else {
+                    for (i, buf) in app.paste_buffers.iter().enumerate() {
+                        let marker = if i == selected { ">" } else { " " };
+                        let preview: String = buf.chars().take(40).map(|c| if c == '\n' { '↵' } else { c }).collect();
+                        lines.push(Line::from(format!("{} {:>2}: {:>5} bytes  {}", marker, i, buf.len(), preview)));
+                    }
+                }
+                let height = (lines.len() as u16 + 2).min(15);
+                let overlay = Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title("choose-buffer (enter=paste, d=delete, esc=close)"));
+                let oa = centered_rect(70, height, area);
                 f.render_widget(Clear, oa);
                 f.render_widget(overlay, oa);
             }
@@ -409,9 +428,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let req = if let Some(rx) = app.control_rx.as_ref() { rx.try_recv().ok() } else { None };
             let Some(req) = req else { break; };
             match req {
-                CtrlReq::NewWindow(cmd) => {
+                CtrlReq::NewWindow(cmd, name) => {
                     let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
                     create_window(&*pty_system, &mut app, cmd.as_deref())?;
+                    if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     resize_all_panes(&mut app);
                 }
                 CtrlReq::SplitWindow(k, cmd) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }

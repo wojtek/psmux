@@ -62,6 +62,28 @@ pub fn list_windows_json(app: &AppState) -> io::Result<String> {
     Ok(s)
 }
 
+/// tmux-compatible list-windows output: one line per window
+/// Format: `<index>: <name><flag> (<pane_count> panes) [<width>x<height>]`
+pub fn list_windows_tmux(app: &AppState) -> String {
+    use crate::tree::*;
+    fn count_panes(node: &Node) -> usize {
+        match node {
+            Node::Leaf(_) => 1,
+            Node::Split { children, .. } => children.iter().map(|c| count_panes(c)).sum(),
+        }
+    }
+    let mut lines = Vec::new();
+    for (i, w) in app.windows.iter().enumerate() {
+        let flag = if i == app.active_idx { "*" } else if w.activity_flag { "#" } else { "-" };
+        let pane_count = count_panes(&w.root);
+        let (width, height) = if let Some(p) = active_pane(&w.root, &w.active_path) {
+            (p.last_cols, p.last_rows)
+        } else { (120, 30) };
+        lines.push(format!("{}: {}{} ({} panes) [{}x{}]", i, w.name, flag, pane_count, width, height));
+    }
+    lines.join("\n")
+}
+
 pub fn list_tree_json(app: &AppState) -> io::Result<String> {
     fn collect_panes(node: &Node, out: &mut Vec<PaneInfo>) {
         match node {

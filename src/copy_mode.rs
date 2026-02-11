@@ -16,6 +16,10 @@ use crate::tree::*;
 pub fn enter_copy_mode(app: &mut AppState) { 
     app.mode = Mode::CopyMode; 
     app.copy_scroll_offset = 0;
+    app.copy_selection_mode = crate::types::SelectionMode::Char;
+    app.copy_anchor = None;
+    app.copy_pos = None;
+    app.copy_find_char_pending = None;
 }
 
 #[cfg(windows)]
@@ -116,10 +120,13 @@ pub fn move_copy_cursor(app: &mut AppState, dx: i16, dy: i16) {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
-    let (r,c) = parser.screen().cursor_position();
-    let nr = (r as i16 + dy).max(0) as u16;
-    let nc = (c as i16 + dx).max(0) as u16;
-    app.copy_pos = Some((nr,nc));
+    // Use tracked copy_pos if available, otherwise fall back to terminal cursor
+    let (r, c) = app.copy_pos.unwrap_or_else(|| parser.screen().cursor_position());
+    let rows = p.last_rows;
+    let cols = p.last_cols;
+    let nr = (r as i16 + dy).max(0).min(rows as i16 - 1) as u16;
+    let nc = (c as i16 + dx).max(0).min(cols as i16 - 1) as u16;
+    app.copy_pos = Some((nr, nc));
 }
 
 /// Helper: read a full row of text from the active pane's screen.
@@ -142,7 +149,7 @@ fn read_row_text(app: &mut AppState, row: u16) -> Option<(String, u16)> {
 }
 
 /// Get the current copy-mode cursor position (from copy_pos or screen cursor).
-fn get_copy_pos(app: &mut AppState) -> Option<(u16, u16)> {
+pub fn get_copy_pos(app: &mut AppState) -> Option<(u16, u16)> {
     if let Some(pos) = app.copy_pos { return Some(pos); }
     current_prompt_pos(app)
 }
@@ -334,26 +341,77 @@ pub fn scroll_to_bottom(app: &mut AppState) {
 
 pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
     let (anchor, pos) = match (app.copy_anchor, app.copy_pos) { (Some(a), Some(p)) => (a,p), _ => return Ok(()) };
+    let sel_mode = app.copy_selection_mode;
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
     let screen = parser.screen();
     let r0 = anchor.0.min(pos.0); let r1 = anchor.0.max(pos.0);
-    let c0 = anchor.1.min(pos.1); let c1 = anchor.1.max(pos.1);
     let mut text = String::new();
-    for r in r0..=r1 {
-        for c in c0..=c1 {
-            if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
+    match sel_mode {
+        crate::types::SelectionMode::Rect => {
+            // Rectangle selection: fixed column range on every row
+            let c0 = anchor.1.min(pos.1); let c1 = anchor.1.max(pos.1);
+            for r in r0..=r1 {
+                let mut line = String::new();
+                for c in c0..=c1 {
+                    if let Some(cell) = screen.cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
+                }
+                text.push_str(line.trim_end());
+                if r < r1 { text.push('\n'); }
+            }
         }
-        if r < r1 { text.push('\n'); }
+        crate::types::SelectionMode::Line => {
+            // Line selection: full rows from r0 to r1
+            let cols = p.last_cols;
+            for r in r0..=r1 {
+                let mut line = String::new();
+                for c in 0..cols {
+                    if let Some(cell) = screen.cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
+                }
+                text.push_str(line.trim_end());
+                text.push('\n');
+            }
+        }
+        crate::types::SelectionMode::Char => {
+            // Character-wise (linewise spanning): first line from anchor col,
+            // middle lines full width, last line to cursor col
+            let cols = p.last_cols;
+            let ac = anchor.1.min(pos.1); let pc = anchor.1.max(pos.1);
+            // Single-line selection
+            if r0 == r1 {
+                let c0 = ac; let c1 = pc;
+                for c in c0..=c1 {
+                    if let Some(cell) = screen.cell(r0, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
+                }
+            } else {
+                // Determine which endpoint is anchor vs cursor
+                let (start_r, start_c, end_r, end_c) = if (anchor.0, anchor.1) <= (pos.0, pos.1) {
+                    (anchor.0, anchor.1, pos.0, pos.1)
+                } else {
+                    (pos.0, pos.1, anchor.0, anchor.1)
+                };
+                for r in r0..=r1 {
+                    let line_start = if r == start_r { start_c } else { 0 };
+                    let line_end = if r == end_r { end_c } else { cols.saturating_sub(1) };
+                    let mut line = String::new();
+                    for c in line_start..=line_end {
+                        if let Some(cell) = screen.cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
+                    }
+                    text.push_str(line.trim_end());
+                    if r < r1 { text.push('\n'); }
+                }
+            }
+        }
     }
-    app.paste_buffers.push(text.clone());
+    app.paste_buffers.insert(0, text.clone());
+    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
     copy_to_system_clipboard(&text);
     Ok(())
 }
 
 pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
-    if let Some(buf) = app.paste_buffers.last() {
+    if let Some(buf) = app.paste_buffers.first() {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", buf); }
     }
@@ -367,7 +425,8 @@ pub fn capture_active_pane(app: &mut AppState) -> io::Result<()> {
     let screen = parser.screen();
     let mut text = String::new();
     for r in 0..p.last_rows { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
-    app.paste_buffers.push(text);
+    app.paste_buffers.insert(0, text);
+    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
     Ok(())
 }
 
@@ -382,7 +441,7 @@ pub fn capture_active_pane_text(app: &mut AppState) -> io::Result<Option<String>
 }
 
 pub fn save_latest_buffer(app: &mut AppState, file: &str) -> io::Result<()> {
-    if let Some(buf) = app.paste_buffers.last() { std::fs::write(file, buf)?; }
+    if let Some(buf) = app.paste_buffers.first() { std::fs::write(file, buf)?; }
     Ok(())
 }
 
@@ -435,6 +494,169 @@ pub fn search_next(app: &mut AppState) {
     app.copy_search_idx = (app.copy_search_idx + 1) % app.copy_search_matches.len();
     let (r, c, _) = app.copy_search_matches[app.copy_search_idx];
     app.copy_pos = Some((r, c));
+}
+
+/// Move by WORD (whitespace-delimited) forward — W key
+pub fn move_word_forward_big(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let (text, cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = c as usize;
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+    // Skip non-whitespace
+    while col < bytes.len() && !bytes[col].is_whitespace() { col += 1; }
+    // Skip whitespace
+    while col < bytes.len() && bytes[col].is_whitespace() { col += 1; }
+    if col < cols as usize {
+        app.copy_pos = Some((r, col as u16));
+    } else {
+        let nr = (r + 1).min(rows.saturating_sub(1));
+        if nr != r {
+            if let Some((next_text, _)) = read_row_text(app, nr) {
+                let next_bytes: Vec<char> = next_text.chars().collect();
+                let mut nc = 0usize;
+                while nc < next_bytes.len() && next_bytes[nc].is_whitespace() { nc += 1; }
+                app.copy_pos = Some((nr, nc as u16));
+            } else { app.copy_pos = Some((nr, 0)); }
+        }
+    }
+}
+
+/// Move by WORD backward — B key
+pub fn move_word_backward_big(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let (text, _prev_cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = c as usize;
+    if col == 0 {
+        if r > 0 {
+            let nr = r - 1;
+            if let Some((prev_text, prev_cols)) = read_row_text(app, nr) {
+                let prev_bytes: Vec<char> = prev_text.chars().collect();
+                let mut nc = (prev_cols as usize).min(prev_bytes.len()).saturating_sub(1);
+                while nc > 0 && prev_bytes[nc].is_whitespace() { nc -= 1; }
+                while nc > 0 && !prev_bytes[nc - 1].is_whitespace() { nc -= 1; }
+                app.copy_pos = Some((nr, nc as u16));
+            } else { app.copy_pos = Some((r - 1, 0)); }
+        }
+        return;
+    }
+    while col > 0 && bytes[col - 1].is_whitespace() { col -= 1; }
+    while col > 0 && !bytes[col - 1].is_whitespace() { col -= 1; }
+    app.copy_pos = Some((r, col as u16));
+}
+
+/// Move to WORD end — E key
+pub fn move_word_end_big(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let (text, cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let mut col = (c as usize) + 1;
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+    while col < bytes.len() && bytes[col].is_whitespace() { col += 1; }
+    while col + 1 < bytes.len() && !bytes[col + 1].is_whitespace() { col += 1; }
+    if col < cols as usize {
+        app.copy_pos = Some((r, col as u16));
+    } else {
+        let nr = (r + 1).min(rows.saturating_sub(1));
+        if nr != r {
+            if let Some((next_text, _)) = read_row_text(app, nr) {
+                let next_bytes: Vec<char> = next_text.chars().collect();
+                let mut nc = 0usize;
+                while nc < next_bytes.len() && next_bytes[nc].is_whitespace() { nc += 1; }
+                while nc + 1 < next_bytes.len() && !next_bytes[nc + 1].is_whitespace() { nc += 1; }
+                app.copy_pos = Some((nr, nc as u16));
+            } else { app.copy_pos = Some((nr, 0)); }
+        }
+    }
+}
+
+/// Move to top of visible screen — H key
+pub fn move_to_screen_top(app: &mut AppState) {
+    app.copy_pos = Some((0, 0));
+}
+
+/// Move to middle of visible screen — M key
+pub fn move_to_screen_middle(app: &mut AppState) {
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+    app.copy_pos = Some((rows / 2, 0));
+}
+
+/// Move to bottom of visible screen — L key
+pub fn move_to_screen_bottom(app: &mut AppState) {
+    let rows = app.windows.get(app.active_idx)
+        .and_then(|w| active_pane(&w.root, &w.active_path))
+        .map(|p| p.last_rows).unwrap_or(24);
+    app.copy_pos = Some((rows.saturating_sub(1), 0));
+}
+
+/// Find character forward on current line — f key
+pub fn find_char_forward(app: &mut AppState, ch: char) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    if let Some((text, _)) = read_row_text(app, r) {
+        let bytes: Vec<char> = text.chars().collect();
+        for i in (c as usize + 1)..bytes.len() {
+            if bytes[i] == ch { app.copy_pos = Some((r, i as u16)); return; }
+        }
+    }
+}
+
+/// Find character backward on current line — F key
+pub fn find_char_backward(app: &mut AppState, ch: char) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    if let Some((text, _)) = read_row_text(app, r) {
+        let bytes: Vec<char> = text.chars().collect();
+        for i in (0..(c as usize)).rev() {
+            if bytes[i] == ch { app.copy_pos = Some((r, i as u16)); return; }
+        }
+    }
+}
+
+/// Find char up to (not including) forward — t key
+pub fn find_char_to_forward(app: &mut AppState, ch: char) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    if let Some((text, _)) = read_row_text(app, r) {
+        let bytes: Vec<char> = text.chars().collect();
+        for i in (c as usize + 1)..bytes.len() {
+            if bytes[i] == ch { app.copy_pos = Some((r, (i as u16).saturating_sub(1))); return; }
+        }
+    }
+}
+
+/// Find char up to (not including) backward — T key
+pub fn find_char_to_backward(app: &mut AppState, ch: char) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    if let Some((text, _)) = read_row_text(app, r) {
+        let bytes: Vec<char> = text.chars().collect();
+        for i in (0..(c as usize)).rev() {
+            if bytes[i] == ch { app.copy_pos = Some((r, (i as u16) + 1)); return; }
+        }
+    }
+}
+
+/// Yank from cursor to end of line — D key
+pub fn copy_end_of_line(app: &mut AppState) -> io::Result<()> {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return Ok(()) };
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
+    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
+    let screen = parser.screen();
+    let cols = p.last_cols;
+    let mut text = String::new();
+    for col in c..cols {
+        if let Some(cell) = screen.cell(r, col) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
+    }
+    let text = text.trim_end().to_string();
+    app.paste_buffers.insert(0, text.clone());
+    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
+    copy_to_system_clipboard(&text);
+    Ok(())
 }
 
 /// Jump to the previous search match in copy mode.

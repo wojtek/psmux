@@ -72,8 +72,10 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
         result.push(bytes[i] as char);
         i += 1;
     }
-    // Expand strftime %-sequences (e.g. %H:%M, %d-%b-%y) via chrono
-    if result.contains('%') {
+    // Expand strftime %-sequences (e.g. %H:%M, %d-%b-%y) via chrono.
+    // Only apply if the ORIGINAL format string contained '%' — avoids corrupting
+    // expanded variables like pane_id (%3) that happen to contain '%'.
+    if fmt.contains('%') && result.contains('%') {
         result = chrono::Local::now().format(&result).to_string();
     }
     result
@@ -196,7 +198,7 @@ fn expand_format_var_for_window(var: &str, app: &AppState, win_idx: usize) -> St
         "copy_cursor_y" => app.copy_pos.map(|(r, _)| r.to_string()).unwrap_or("0".into()),
         "selection_present" => if app.copy_anchor.is_some() { "1".into() } else { "0".into() },
         "search_present" => if !app.copy_search_query.is_empty() { "1".into() } else { "0".into() },
-        "buffer_size" => app.paste_buffers.last().map(|b| b.len().to_string()).unwrap_or("0".into()),
+        "buffer_size" => app.paste_buffers.first().map(|b| b.len().to_string()).unwrap_or("0".into()),
         "buffer_sample" => {
             app.paste_buffers.last().map(|b| {
                 let sample: String = b.chars().take(50).collect();
