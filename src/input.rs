@@ -810,6 +810,23 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 }
 
 pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
+    // In copy mode, interpret characters as copy-mode actions (never send to PTY)
+    if matches!(app.mode, Mode::CopyMode) {
+        for c in text.chars() {
+            handle_copy_mode_char(app, c)?;
+        }
+        return Ok(());
+    }
+    // In copy-search mode, append characters to the search input
+    if matches!(app.mode, Mode::CopySearch { .. }) {
+        if let Mode::CopySearch { ref mut input, .. } = app.mode {
+            for c in text.chars() {
+                input.push(c);
+            }
+        }
+        return Ok(());
+    }
+
     if app.sync_input {
         // Fan out to ALL panes in the current window
         let win = &mut app.windows[app.active_idx];
@@ -830,7 +847,77 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Dispatch a single character as a copy-mode action.
+fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
+    match c {
+        'q' | ']' | '\x1b' => {
+            app.mode = Mode::Passthrough;
+            app.copy_anchor = None;
+            app.copy_pos = None;
+            app.copy_scroll_offset = 0;
+            let win = &mut app.windows[app.active_idx];
+            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                if let Ok(mut parser) = p.term.lock() {
+                    parser.screen_mut().set_scrollback(0);
+                }
+            }
+        }
+        'h' => { move_copy_cursor(app, -1, 0); }
+        'l' => { move_copy_cursor(app, 1, 0); }
+        'k' => { scroll_copy_up(app, 1); }
+        'j' => { scroll_copy_down(app, 1); }
+        'g' => { scroll_to_top(app); }
+        'G' => { scroll_to_bottom(app); }
+        'w' => { crate::copy_mode::move_word_forward(app); }
+        'b' => { crate::copy_mode::move_word_backward(app); }
+        'e' => { crate::copy_mode::move_word_end(app); }
+        '0' => { crate::copy_mode::move_to_line_start(app); }
+        '$' => { crate::copy_mode::move_to_line_end(app); }
+        '^' => { crate::copy_mode::move_to_first_nonblank(app); }
+        'v' => {
+            if let Some((r, c)) = current_prompt_pos(app) {
+                app.copy_anchor = Some((r, c));
+                app.copy_pos = Some((r, c));
+            }
+        }
+        'y' => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+        '/' => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
+        '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+        'n' => { search_next(app); }
+        'N' => { search_prev(app); }
+        _ => {} // Swallow unrecognized characters in copy mode
+    }
+    Ok(())
+}
+
 pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
+    // --- Copy-search mode: handle esc/enter/backspace ---
+    if matches!(app.mode, Mode::CopySearch { .. }) {
+        match k {
+            "esc" => { app.mode = Mode::CopyMode; }
+            "enter" => {
+                if let Mode::CopySearch { ref input, forward } = app.mode {
+                    let query = input.clone();
+                    let fwd = forward;
+                    app.copy_search_query = query.clone();
+                    app.copy_search_forward = fwd;
+                    search_copy_mode(app, &query, fwd);
+                    if !app.copy_search_matches.is_empty() {
+                        let (r, c, _) = app.copy_search_matches[0];
+                        app.copy_pos = Some((r, c));
+                    }
+                }
+                app.mode = Mode::CopyMode;
+            }
+            "backspace" => {
+                if let Mode::CopySearch { ref mut input, .. } = app.mode { input.pop(); }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // --- Copy mode: full vi-style key table ---
     if matches!(app.mode, Mode::CopyMode) {
         match k {
             "esc" | "q" => {
@@ -851,6 +938,22 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "pagedown" => { scroll_copy_down(app, 10); }
             "left" => { move_copy_cursor(app, -1, 0); }
             "right" => { move_copy_cursor(app, 1, 0); }
+            "home" => { crate::copy_mode::move_to_line_start(app); }
+            "end" => { crate::copy_mode::move_to_line_end(app); }
+            "C-b" | "c-b" => { scroll_copy_up(app, 10); }
+            "C-f" | "c-f" => { scroll_copy_down(app, 10); }
+            "C-u" | "c-u" => {
+                let half = app.windows.get(app.active_idx)
+                    .and_then(|w| active_pane(&w.root, &w.active_path))
+                    .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                scroll_copy_up(app, half);
+            }
+            "C-d" | "c-d" => {
+                let half = app.windows.get(app.active_idx)
+                    .and_then(|w| active_pane(&w.root, &w.active_path))
+                    .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
+                scroll_copy_down(app, half);
+            }
             _ => {}
         }
         return Ok(());

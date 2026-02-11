@@ -1097,7 +1097,44 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 CtrlReq::SendKeys(keys, literal) => {
                     sent_pty_input = true;
-                    if literal {
+                    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+                    if in_copy {
+                        // In copy/search mode — route through mode-aware handlers
+                        if literal {
+                            send_text_to_active(&mut app, &keys)?;
+                        } else {
+                            let parts: Vec<&str> = keys.split_whitespace().collect();
+                            for key in parts.iter() {
+                                let key_upper = key.to_uppercase();
+                                let normalized = match key_upper.as_str() {
+                                    "ENTER" => "enter",
+                                    "TAB" => "tab",
+                                    "ESCAPE" | "ESC" => "esc",
+                                    "SPACE" => "space",
+                                    "BSPACE" | "BACKSPACE" => "backspace",
+                                    "UP" => "up",
+                                    "DOWN" => "down",
+                                    "RIGHT" => "right",
+                                    "LEFT" => "left",
+                                    "HOME" => "home",
+                                    "END" => "end",
+                                    "PAGEUP" | "PPAGE" => "pageup",
+                                    "PAGEDOWN" | "NPAGE" => "pagedown",
+                                    "DELETE" | "DC" => "delete",
+                                    "INSERT" | "IC" => "insert",
+                                    _ => "",
+                                };
+                                if !normalized.is_empty() {
+                                    send_key_to_active(&mut app, normalized)?;
+                                } else if key_upper.starts_with("C-") || key_upper.starts_with("M-") || key_upper.starts_with("F") {
+                                    send_key_to_active(&mut app, &key.to_lowercase())?;
+                                } else {
+                                    // Plain text char — route through send_text_to_active (handles copy mode chars)
+                                    send_text_to_active(&mut app, key)?;
+                                }
+                            }
+                        }
+                    } else if literal {
                         send_text_to_active(&mut app, &keys)?;
                     } else {
                         let parts: Vec<&str> = keys.split_whitespace().collect();
