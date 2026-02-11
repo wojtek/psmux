@@ -1245,41 +1245,6 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
         let mut sent_pty_input = false;
         let mut did_work = false;
 
-        // ── Automatic rename: resolve foreground process name (like tmux) ──
-        // Runs every loop iteration but throttled per-pane to ~1s.
-        {
-            let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
-            if app.automatic_rename && !in_copy {
-                for win in app.windows.iter_mut() {
-                    if win.manual_rename { continue; }
-                    if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                        if p.dead { continue; }
-                        if p.last_title_check.elapsed() < std::time::Duration::from_millis(1000) {
-                            continue;
-                        }
-                        p.last_title_check = std::time::Instant::now();
-                        if p.child_pid.is_none() {
-                            p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
-                        }
-                        let new_name = if let Some(pid) = p.child_pid {
-                            crate::platform::process_info::get_foreground_process_name(pid)
-                                .unwrap_or_else(|| "shell".into())
-                        } else if !p.title.is_empty() {
-                            p.title.clone()
-                        } else {
-                            continue;
-                        };
-                        if !new_name.is_empty() && win.name != new_name {
-                            win.name = new_name;
-                            meta_dirty = true;
-                            state_dirty = true;
-                            cached_dump_state.clear();
-                        }
-                    }
-                }
-            }
-        }
-
         // ── Check if deferred dump-state can be served ──────────────────
         if let Some(ref resp) = deferred_dump {
             let now_ver = combined_data_version(&app);
@@ -1437,8 +1402,43 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let _ = resp.send(json);
                 }
                 CtrlReq::DumpState(resp) => {
+                    // ── Automatic rename: resolve foreground process ──
+                    // Runs on every DumpState request (~50ms idle) but
+                    // throttled per-pane to 1s.  Placed BEFORE the cache
+                    // check so that a name change sets state_dirty and
+                    // the stale cache is bypassed this same request.
+                    {
+                        let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+                        if app.automatic_rename && !in_copy {
+                            for win in app.windows.iter_mut() {
+                                if win.manual_rename { continue; }
+                                if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                                    if p.dead { continue; }
+                                    if p.last_title_check.elapsed() < std::time::Duration::from_millis(1000) {
+                                        continue;
+                                    }
+                                    p.last_title_check = std::time::Instant::now();
+                                    if p.child_pid.is_none() {
+                                        p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
+                                    }
+                                    let new_name = if let Some(pid) = p.child_pid {
+                                        crate::platform::process_info::get_foreground_process_name(pid)
+                                            .unwrap_or_else(|| "shell".into())
+                                    } else if !p.title.is_empty() {
+                                        p.title.clone()
+                                    } else {
+                                        continue;
+                                    };
+                                    if !new_name.is_empty() && win.name != new_name {
+                                        win.name = new_name;
+                                        meta_dirty = true;
+                                        state_dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !state_dirty
-                        && !meta_dirty
                         && !cached_dump_state.is_empty()
                         && cached_data_version == combined_data_version(&app)
                     {
