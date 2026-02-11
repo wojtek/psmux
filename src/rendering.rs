@@ -9,7 +9,7 @@ use crossterm::execute;
 use portable_pty::PtySize;
 
 use crate::types::*;
-use crate::tree::active_pane_mut;
+use crate::tree::{active_pane_mut, split_with_gaps};
 
 pub fn vt_to_color(c: vt100::Color) -> Color {
     match c {
@@ -72,12 +72,9 @@ pub fn render_node(
     match node {
         Node::Leaf(pane) => {
             let is_active = *cur_path == *active_path;
-            let title = if is_active { "* pane" } else { " pane" };
-            let pane_block = Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(if is_active { active_border_style } else { border_style });
-            let inner = pane_block.inner(area);
+            // No borders on individual panes — separators are drawn by the
+            // parent Split node with tmux-style split coloring.
+            let inner = area;
             let target_rows = inner.height.max(1);
             let target_cols = inner.width.max(1);
             if pane.last_rows != target_rows || pane.last_cols != target_cols {
@@ -128,7 +125,6 @@ pub fn render_node(
                 }
                 lines.push(Line::from(spans));
             }
-            f.render_widget(pane_block, area);
             f.render_widget(Clear, inner);
             let para = Paragraph::new(Text::from(lines));
             f.render_widget(para, inner);
@@ -142,20 +138,67 @@ pub fn render_node(
             }
         }
         Node::Split { kind, sizes, children } => {
-            let constraints: Vec<Constraint> = if sizes.len() == children.len() {
-                sizes.iter().map(|p| Constraint::Percentage(*p)).collect()
-            } else { vec![Constraint::Percentage((100 / children.len() as u16) as u16); children.len()] };
-            let rects = match *kind {
-                LayoutKind::Horizontal => Layout::default().direction(Direction::Horizontal).constraints(constraints).split(area),
-                LayoutKind::Vertical => Layout::default().direction(Direction::Vertical).constraints(constraints).split(area),
-            };
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else { vec![(100 / children.len().max(1) as u16); children.len()] };
+            let is_horizontal = *kind == LayoutKind::Horizontal;
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
             for (i, child) in children.iter_mut().enumerate() {
                 cur_path.push(i);
-                render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style);
+                if i < rects.len() {
+                    render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style);
+                }
                 cur_path.pop();
+            }
+            // Draw separator lines with tmux-style split coloring
+            let buf = f.buffer_mut();
+            for i in 0..children.len().saturating_sub(1) {
+                if i >= rects.len() { break; }
+                let left_active = subtree_has_active(&children[i], active_path, cur_path, i);
+                let right_active = children.get(i + 1).map_or(false, |c| subtree_has_active(c, active_path, cur_path, i + 1));
+                let left_sty = if left_active { active_border_style } else { border_style };
+                let right_sty = if right_active { active_border_style } else { border_style };
+                if is_horizontal {
+                    let sep_x = rects[i].x + rects[i].width;
+                    if sep_x < buf.area.x + buf.area.width {
+                        let mid_y = area.y + area.height / 2;
+                        for y in area.y..area.y + area.height {
+                            let sty = if y < mid_y { left_sty } else { right_sty };
+                            let idx = (y - buf.area.y) as usize * buf.area.width as usize + (sep_x - buf.area.x) as usize;
+                            if idx < buf.content.len() {
+                                buf.content[idx].set_char('│');
+                                buf.content[idx].set_style(sty);
+                            }
+                        }
+                    }
+                } else {
+                    let sep_y = rects[i].y + rects[i].height;
+                    if sep_y < buf.area.y + buf.area.height {
+                        let mid_x = area.x + area.width / 2;
+                        for x in area.x..area.x + area.width {
+                            let sty = if x < mid_x { left_sty } else { right_sty };
+                            let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize + (x - buf.area.x) as usize;
+                            if idx < buf.content.len() {
+                                buf.content[idx].set_char('─');
+                                buf.content[idx].set_style(sty);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+/// Check whether the active pane lives inside a given subtree.
+/// `child_idx` is the index of this child within its parent Split.
+fn subtree_has_active(node: &Node, active_path: &[usize], parent_path: &[usize], child_idx: usize) -> bool {
+    // The active_path must start with parent_path ++ [child_idx] for this subtree to contain the active pane.
+    if active_path.len() <= parent_path.len() { return false; }
+    for (a, b) in active_path.iter().zip(parent_path.iter()) {
+        if a != b { return false; }
+    }
+    active_path[parent_path.len()] == child_idx
 }
 
 pub fn expand_status(fmt: &str, app: &AppState, time_str: &str) -> String {

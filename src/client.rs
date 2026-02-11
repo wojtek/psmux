@@ -1310,36 +1310,46 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode); }
                         }
 
-                        // Draw separator lines between children using direct buffer access
+                        // Draw separator lines between children using direct buffer access.
+                        // tmux-style split coloring: each half of the separator is
+                        // colored according to the adjacent pane on that side.
                         let buf = f.buffer_mut();
                         for i in 0..children.len().saturating_sub(1) {
                             if i >= rects.len() { break; }
                             let left_active = has_active_leaf(&children[i]);
                             let right_active = children.get(i + 1).map_or(false, |c| has_active_leaf(c));
-                            let sep_fg = if left_active || right_active { active_border_fg } else { border_fg };
-                            let sep_style = Style::default().fg(sep_fg);
+                            let left_style = Style::default().fg(if left_active { active_border_fg } else { border_fg });
+                            let right_style = Style::default().fg(if right_active { active_border_fg } else { border_fg });
 
                             if is_horizontal {
+                                // Vertical separator line between left/right children.
+                                // Top half colored by left child, bottom half by right child.
                                 let sep_x = rects[i].x + rects[i].width;
                                 if sep_x < buf.area.x + buf.area.width {
+                                    let mid_y = area.y + area.height / 2;
                                     for y in area.y..area.y + area.height {
+                                        let style = if y < mid_y { left_style } else { right_style };
                                         let idx = (y - buf.area.y) as usize * buf.area.width as usize
                                             + (sep_x - buf.area.x) as usize;
                                         if idx < buf.content.len() {
                                             buf.content[idx].set_char('│');
-                                            buf.content[idx].set_style(sep_style);
+                                            buf.content[idx].set_style(style);
                                         }
                                     }
                                 }
                             } else {
+                                // Horizontal separator line between top/bottom children.
+                                // Left half colored by top child, right half by bottom child.
                                 let sep_y = rects[i].y + rects[i].height;
                                 if sep_y < buf.area.y + buf.area.height {
+                                    let mid_x = area.x + area.width / 2;
                                     for x in area.x..area.x + area.width {
+                                        let style = if x < mid_x { left_style } else { right_style };
                                         let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize
                                             + (x - buf.area.x) as usize;
                                         if idx < buf.content.len() {
                                             buf.content[idx].set_char('─');
-                                            buf.content[idx].set_style(sep_style);
+                                            buf.content[idx].set_style(style);
                                         }
                                     }
                                 }
