@@ -6,15 +6,31 @@ use serde::{Serialize, Deserialize};
 use crate::types::*;
 
 pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> Option<String> {
-    let mut last: Option<String> = None;
-    for r in (0..rows).rev() {
+    // Scan from cursor row (most likely prompt location) then fall back to last non-empty row
+    let cursor_row = screen.cursor_position().0;
+    let mut candidate_row: Option<u16> = None;
+    // Try cursor row first, then scan downward, then scan upward
+    for &r in [cursor_row].iter().chain((cursor_row + 1..rows).collect::<Vec<_>>().iter()).chain((0..cursor_row).rev().collect::<Vec<_>>().iter()) {
         let mut s = String::new();
         for c in 0..cols { if let Some(cell) = screen.cell(r, c) { s.push_str(cell.contents()); } else { s.push(' '); } }
         let t = s.trim_end();
-        if !t.is_empty() { last = Some(t.to_string()); break; }
+        if !t.is_empty() && (t.contains('>') || t.contains('$') || t.contains('#') || t.contains(':')) {
+            candidate_row = Some(r);
+            break;
+        }
     }
-    let Some(line) = last else { return None };
-    let trimmed = line.trim().to_string();
+    // Fall back: use the row the cursor is on even if no prompt marker
+    let row = candidate_row.unwrap_or(cursor_row);
+    let mut s = String::new();
+    for c in 0..cols { if let Some(cell) = screen.cell(row, c) { s.push_str(cell.contents()); } else { s.push(' '); } }
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() { return None; }
+    // Only infer title from lines that look like prompts (contain a prompt marker)
+    let has_prompt_marker = trimmed.contains('>') || trimmed.ends_with('$') || trimmed.ends_with('#');
+    if !has_prompt_marker {
+        // If no prompt marker, don't change the title — this is likely command output
+        return None;
+    }
     if let Some(pos) = trimmed.rfind('>') {
         let before = trimmed[..pos].trim().to_string();
         if before.contains("\\") || before.contains("/") {

@@ -891,10 +891,12 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 let layout_json = dump_layout_json_fast(&mut app)?;
                 // automatic-rename: copy active pane's inferred title to window name
-                if app.automatic_rename {
+                // Skip when in copy mode — the pane screen isn't showing a prompt
+                let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+                if app.automatic_rename && !in_copy {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane(&win.root, &win.active_path) {
-                        if !p.title.is_empty() && win.name != p.title {
+                        if !p.dead && !p.title.is_empty() && win.name != p.title {
                             win.name = p.title.clone();
                             meta_dirty = true; // window list changed
                         }
