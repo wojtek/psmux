@@ -33,6 +33,24 @@ fn json_escape_string(s: &str) -> String {
     }
     out
 }
+/// Build windows JSON with pre-expanded tab_text for each window.
+/// The tab_text is the fully expanded window-status-format / window-status-current-format.
+fn list_windows_json_with_tabs(app: &AppState) -> std::io::Result<String> {
+    let mut v: Vec<WinInfo> = Vec::new();
+    for (i, w) in app.windows.iter().enumerate() {
+        let is_active = i == app.active_idx;
+        let fmt = if is_active { &app.window_status_current_format } else { &app.window_status_format };
+        let tab = expand_format_for_window(fmt, app, i);
+        v.push(WinInfo {
+            id: w.id,
+            name: w.name.clone(),
+            active: is_active,
+            activity: w.activity_flag,
+            tab_text: tab,
+        });
+    }
+    serde_json::to_string(&v).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("json error: {e}")))
+}
 use crate::input::*;
 use crate::copy_mode::*;
 use crate::layout::*;
@@ -1237,7 +1255,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 state_dirty = true;
                 // Rebuild metadata cache if structural changes happened.
                 if meta_dirty {
-                    cached_windows_json = list_windows_json(&app)?;
+                    cached_windows_json = list_windows_json_with_tabs(&app)?;
                     cached_tree_json = list_tree_json(&app)?;
                     cached_prefix_str = format_key_binding(&app.prefix_key);
                     cached_base_index = app.window_base_index;
@@ -1430,7 +1448,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     // Rebuild metadata cache if structural changes happened.
                     if meta_dirty {
-                        cached_windows_json = list_windows_json(&app)?;
+                        cached_windows_json = list_windows_json_with_tabs(&app)?;
                         cached_tree_json = list_tree_json(&app)?;
                         cached_prefix_str = format_key_binding(&app.prefix_key);
                         cached_base_index = app.window_base_index;

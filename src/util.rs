@@ -47,7 +47,7 @@ pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> 
 // resolve_last_session_name and resolve_default_session_name are in session.rs
 
 #[derive(Serialize, Deserialize)]
-pub struct WinInfo { pub id: usize, pub name: String, pub active: bool, #[serde(default)] pub activity: bool }
+pub struct WinInfo { pub id: usize, pub name: String, pub active: bool, #[serde(default)] pub activity: bool, #[serde(default)] pub tab_text: String }
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneInfo { pub id: usize, pub title: String }
@@ -57,7 +57,7 @@ pub struct WinTree { pub id: usize, pub name: String, pub active: bool, pub pane
 
 pub fn list_windows_json(app: &AppState) -> io::Result<String> {
     let mut v: Vec<WinInfo> = Vec::new();
-    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag }); }
+    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, tab_text: String::new() }); }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
 }

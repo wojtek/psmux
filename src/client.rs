@@ -286,7 +286,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut chooser = false;
     let mut choices: Vec<(usize, usize)> = Vec::new();
     let mut tree_chooser = false;
-    let mut tree_entries: Vec<(bool, usize, usize, String)> = Vec::new();
+    let mut tree_entries: Vec<(bool, usize, usize, String, String)> = Vec::new();  // (is_win, id, sub_id, label, session_name)
     let mut tree_selected: usize = 0;
     let mut session_chooser = false;
     let mut session_entries: Vec<(String, String)> = Vec::new();
@@ -314,7 +314,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut win_status_sep: String = " ".to_string();
 
     #[derive(serde::Deserialize, Default)]
-    struct WinStatus { id: usize, name: String, active: bool, #[serde(default)] activity: bool }
+    struct WinStatus { id: usize, name: String, active: bool, #[serde(default)] activity: bool, #[serde(default)] tab_text: String }
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
@@ -539,7 +539,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                             else { a.0.cmp(&b.0) }
                                         });
                                         // Build tree entries: session > window > pane
-                                        // tree_entries format: (is_session_header: bool, id: usize, sub_id: usize, label: String)
+                                        // tree_entries format: (is_win, id, sub_id, label, session_name)
                                         // For session headers: is_win=true with id=usize::MAX as sentinel
                                         // For windows: is_win=true
                                         // For panes: is_win=false
@@ -549,22 +549,27 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                             let nw = wins.len();
                                             // Session header line
                                             tree_entries.push((true, usize::MAX, 0,
-                                                format!("{}:{} {} windows{}", sess_name, "", nw, attached)));
+                                                format!("{}: {} windows{}", sess_name, nw, attached),
+                                                sess_name.clone()));
                                             if is_current {
                                                 // Show windows and panes for current session
-                                                for (wid, wname, panes) in wins {
+                                                for (wi, (wid, wname, panes)) in wins.iter().enumerate() {
+                                                    let flag = if panes.len() > 0 { "" } else { "" };
                                                     tree_entries.push((true, *wid, 0,
-                                                        format!("  {}:{} ({} panes)", wid, wname, panes.len())));
+                                                        format!("  {}: {}{} ({} panes)", wi, wname, flag, panes.len()),
+                                                        sess_name.clone()));
                                                     for (pid, ptitle) in panes {
                                                         tree_entries.push((false, *wid, *pid,
-                                                            format!("    %{}: {}", pid, ptitle)));
+                                                            format!("    {}", ptitle),
+                                                            sess_name.clone()));
                                                     }
                                                 }
                                             } else {
                                                 // Show windows for other sessions (collapsed)
-                                                for (wid, wname, panes) in wins {
+                                                for (wi, (wid, wname, panes)) in wins.iter().enumerate() {
                                                     tree_entries.push((true, *wid, 0,
-                                                        format!("  {}:{} ({} panes)", wid, wname, panes.len())));
+                                                        format!("  {}: {} ({} panes)", wi, wname, panes.len()),
+                                                        sess_name.clone()));
                                                 }
                                             }
                                         }
@@ -572,9 +577,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     // Fallback: if no sessions found, use current session data
                                     if tree_entries.is_empty() {
                                         for wi in &last_tree {
-                                            tree_entries.push((true, wi.id, 0, wi.name.clone()));
+                                            tree_entries.push((true, wi.id, 0, wi.name.clone(), current_session.clone()));
                                             for pi in &wi.panes {
-                                                tree_entries.push((false, wi.id, pi.id, pi.title.clone()));
+                                                tree_entries.push((false, wi.id, pi.id, pi.title.clone(), current_session.clone()));
                                             }
                                         }
                                     }
@@ -736,16 +741,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 KeyCode::Enter if tree_chooser => {
-                                    if let Some((is_win, wid, pid, label)) = tree_entries.get(tree_selected) {
+                                    if let Some((is_win, wid, pid, _label, sess_name)) = tree_entries.get(tree_selected) {
                                         if *wid == usize::MAX {
                                             // Session header — switch to that session
-                                            if let Some(sname) = label.split(':').next() {
-                                                let sname = sname.trim().to_string();
-                                                if sname != current_session {
-                                                    env::set_var("PSMUX_SWITCH_TO", &sname);
-                                                    quit = true;
-                                                }
+                                            if *sess_name != current_session {
+                                                cmd_batch.push("client-detach\n".into());
+                                                env::set_var("PSMUX_SWITCH_TO", sess_name);
+                                                quit = true;
                                             }
+                                            tree_chooser = false;
+                                        } else if *sess_name != current_session {
+                                            // Window/pane in another session — switch to that session
+                                            cmd_batch.push("client-detach\n".into());
+                                            env::set_var("PSMUX_SWITCH_TO", sess_name);
+                                            quit = true;
                                             tree_chooser = false;
                                         } else if *is_win {
                                             cmd_batch.push(format!("focus-window {}\n", wid));
@@ -1391,13 +1400,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (is_win, wid, pid, name)) in tree_entries.iter().enumerate() {
-                    let marker = if *is_win { format!("@{}", wid) } else { format!("%{}", pid) };
-                    let prefix = if *is_win { "".to_string() } else { "  ".to_string() };
+                for (i, (is_win, wid, _pid, label, _sess)) in tree_entries.iter().enumerate() {
                     let line = if i == tree_selected {
-                        Line::from(Span::styled(format!("{}{} {}", prefix, marker, name), Style::default().bg(Color::Yellow).fg(Color::Black)))
+                        Line::from(Span::styled(label.clone(), Style::default().bg(Color::Yellow).fg(Color::Black)))
+                    } else if *is_win && *wid == usize::MAX {
+                        // Session header — bold
+                        Line::from(Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)))
                     } else {
-                        Line::from(format!("{}{} {}", prefix, marker, name))
+                        Line::from(label.clone())
                     };
                     lines.push(line);
                 }
@@ -1461,16 +1471,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 Span::styled(left_prefix, sb_base),
             ];
             for (i, w) in windows.iter().enumerate() {
-                let display_idx = i + base_index;
-                // Expand window-status-format: #I=index, #W=name, #F=flags
-                let fmt = if w.active { &win_status_current_fmt } else { &win_status_fmt };
-                let flags = if w.active { "*" }
-                    else if w.activity { "#" }
-                    else { "" };
-                let tab_text = fmt
-                    .replace("#I", &display_idx.to_string())
-                    .replace("#W", &w.name)
-                    .replace("#F", flags);
+                // Use pre-expanded tab_text from server (full format expansion)
+                let tab_text = if !w.tab_text.is_empty() {
+                    w.tab_text.clone()
+                } else {
+                    // Fallback for old server: naive expansion
+                    let display_idx = i + base_index;
+                    let fmt = if w.active { &win_status_current_fmt } else { &win_status_fmt };
+                    fmt.replace("#I", &display_idx.to_string())
+                       .replace("#W", &w.name)
+                       .replace("#F", if w.active { "*" } else { "" })
+                };
                 if i > 0 {
                     status_spans.push(Span::styled(win_status_sep.clone(), sb_base));
                 }
