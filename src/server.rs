@@ -92,7 +92,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
     std::panic::set_hook(Box::new(|info| {
         let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
         let path = format!("{}\\.psmux\\crash.log", home);
-        let _ = std::fs::write(&path, format!("{info}"));
+        let bt = std::backtrace::Backtrace::force_capture();
+        let _ = std::fs::write(&path, format!("{info}\n\nBacktrace:\n{bt}"));
     }));
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();

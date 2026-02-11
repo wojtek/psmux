@@ -141,7 +141,16 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     }
     // Expand strftime %-sequences only if the ORIGINAL format contained '%'
     if fmt.contains('%') && result.contains('%') {
-        result = chrono::Local::now().format(&result).to_string();
+        // Use write! to catch chrono format errors instead of panicking.
+        // The result string may contain user content (e.g. pane titles) with stray
+        // '%' characters that chrono can't parse as strftime specifiers.
+        use std::fmt::Write;
+        let formatted = chrono::Local::now().format(&result);
+        let mut buf = String::with_capacity(result.len() + 32);
+        if write!(buf, "{}", formatted).is_ok() {
+            result = buf;
+        }
+        // On error, keep the pre-strftime result as-is
     }
     result
 }
@@ -458,7 +467,10 @@ fn apply_modifier(m: &Modifier, value: &str, app: &AppState, win_idx: usize) -> 
         Modifier::ExpandTime => {
             let expanded = expand_format_for_window(value, app, win_idx);
             if expanded.contains('%') {
-                chrono::Local::now().format(&expanded).to_string()
+                use std::fmt::Write;
+                let formatted = chrono::Local::now().format(&expanded);
+                let mut buf = String::with_capacity(expanded.len() + 32);
+                if write!(buf, "{}", formatted).is_ok() { buf } else { expanded }
             } else {
                 expanded
             }
