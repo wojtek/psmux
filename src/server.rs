@@ -1246,15 +1246,29 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     meta_dirty = false;
                 }
                 let layout_json = dump_layout_json_fast(&mut app)?;
-                // automatic-rename: copy active pane's inferred title to window name
+                // automatic-rename: use the actual foreground process name (like tmux)
                 // Skip when in copy mode — the pane screen isn't showing a prompt
                 let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
                 if app.automatic_rename && !in_copy {
-                    let win = &mut app.windows[app.active_idx];
-                    if let Some(p) = active_pane(&win.root, &win.active_path) {
-                        if !p.dead && !p.title.is_empty() && win.name != p.title {
-                            win.name = p.title.clone();
-                            meta_dirty = true; // window list changed
+                    for win in app.windows.iter_mut() {
+                        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                            if p.dead { continue; }
+                            // Lazily resolve child PID if not yet known
+                            if p.child_pid.is_none() {
+                                p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
+                            }
+                            let new_name = if let Some(pid) = p.child_pid {
+                                crate::platform::process_info::get_foreground_process_name(pid)
+                                    .unwrap_or_else(|| "shell".into())
+                            } else if !p.title.is_empty() {
+                                p.title.clone()
+                            } else {
+                                continue;
+                            };
+                            if !new_name.is_empty() && win.name != new_name {
+                                win.name = new_name;
+                                meta_dirty = true;
+                            }
                         }
                     }
                 }

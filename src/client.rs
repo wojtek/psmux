@@ -491,11 +491,91 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     tree_chooser = true;
                                     tree_entries.clear();
                                     tree_selected = 0;
-                                    // Build tree entries from the last dump-state (no separate TCP needed)
-                                    for wi in &last_tree {
-                                        tree_entries.push((true, wi.id, 0, wi.name.clone()));
-                                        for pi in &wi.panes {
-                                            tree_entries.push((false, wi.id, pi.id, pi.title.clone()));
+                                    // Query ALL sessions (like tmux choose-tree)
+                                    let dir = format!("{}\\.psmux", home);
+                                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                                        let mut sessions: Vec<(String, Vec<(usize, String, Vec<(usize, String)>)>)> = Vec::new();
+                                        for e in entries.flatten() {
+                                            if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
+                                                if let Some((base, ext)) = fname.rsplit_once('.') {
+                                                    if ext == "port" {
+                                                        if let Ok(port_str) = std::fs::read_to_string(e.path()) {
+                                                            if let Ok(p) = port_str.trim().parse::<u16>() {
+                                                                let sess_addr = format!("127.0.0.1:{}", p);
+                                                                let sess_key = read_session_key(base).unwrap_or_default();
+                                                                if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
+                                                                    &sess_addr.parse().unwrap(), Duration::from_millis(50)
+                                                                ) {
+                                                                    let _ = ss.set_read_timeout(Some(Duration::from_millis(100)));
+                                                                    let _ = write!(ss, "AUTH {}\n", sess_key);
+                                                                    let _ = ss.write_all(b"list-tree\n");
+                                                                    let _ = ss.flush();
+                                                                    let mut br = BufReader::new(ss);
+                                                                    let mut al = String::new();
+                                                                    let _ = br.read_line(&mut al); // AUTH OK
+                                                                    let mut tree_line = String::new();
+                                                                    if br.read_line(&mut tree_line).is_ok() {
+                                                                        // Parse JSON array of WinTree
+                                                                        if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(&tree_line.trim()) {
+                                                                            let mut win_data = Vec::new();
+                                                                            for w in &wins {
+                                                                                let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
+                                                                                win_data.push((w.id, w.name.clone(), panes));
+                                                                            }
+                                                                            sessions.push((base.to_string(), win_data));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Sort sessions: current session first, then alphabetical
+                                        sessions.sort_by(|a, b| {
+                                            if a.0 == current_session { std::cmp::Ordering::Less }
+                                            else if b.0 == current_session { std::cmp::Ordering::Greater }
+                                            else { a.0.cmp(&b.0) }
+                                        });
+                                        // Build tree entries: session > window > pane
+                                        // tree_entries format: (is_session_header: bool, id: usize, sub_id: usize, label: String)
+                                        // For session headers: is_win=true with id=usize::MAX as sentinel
+                                        // For windows: is_win=true
+                                        // For panes: is_win=false
+                                        for (sess_name, wins) in &sessions {
+                                            let is_current = sess_name == &current_session;
+                                            let attached = if is_current { " (attached)" } else { "" };
+                                            let nw = wins.len();
+                                            // Session header line
+                                            tree_entries.push((true, usize::MAX, 0,
+                                                format!("{}:{} {} windows{}", sess_name, "", nw, attached)));
+                                            if is_current {
+                                                // Show windows and panes for current session
+                                                for (wid, wname, panes) in wins {
+                                                    tree_entries.push((true, *wid, 0,
+                                                        format!("  {}:{} ({} panes)", wid, wname, panes.len())));
+                                                    for (pid, ptitle) in panes {
+                                                        tree_entries.push((false, *wid, *pid,
+                                                            format!("    %{}: {}", pid, ptitle)));
+                                                    }
+                                                }
+                                            } else {
+                                                // Show windows for other sessions (collapsed)
+                                                for (wid, wname, panes) in wins {
+                                                    tree_entries.push((true, *wid, 0,
+                                                        format!("  {}:{} ({} panes)", wid, wname, panes.len())));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Fallback: if no sessions found, use current session data
+                                    if tree_entries.is_empty() {
+                                        for wi in &last_tree {
+                                            tree_entries.push((true, wi.id, 0, wi.name.clone()));
+                                            for pi in &wi.panes {
+                                                tree_entries.push((false, wi.id, pi.id, pi.title.clone()));
+                                            }
                                         }
                                     }
                                 }
@@ -656,10 +736,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 KeyCode::Enter if tree_chooser => {
-                                    if let Some((is_win, wid, pid, _)) = tree_entries.get(tree_selected) {
-                                        if *is_win { cmd_batch.push(format!("focus-window {}\n", wid)); }
-                                        else { cmd_batch.push(format!("focus-pane {}\n", pid)); }
-                                        tree_chooser = false;
+                                    if let Some((is_win, wid, pid, label)) = tree_entries.get(tree_selected) {
+                                        if *wid == usize::MAX {
+                                            // Session header — switch to that session
+                                            if let Some(sname) = label.split(':').next() {
+                                                let sname = sname.trim().to_string();
+                                                if sname != current_session {
+                                                    env::set_var("PSMUX_SWITCH_TO", &sname);
+                                                    quit = true;
+                                                }
+                                            }
+                                            tree_chooser = false;
+                                        } else if *is_win {
+                                            cmd_batch.push(format!("focus-window {}\n", wid));
+                                            tree_chooser = false;
+                                        } else {
+                                            cmd_batch.push(format!("focus-pane {}\n", pid));
+                                            tree_chooser = false;
+                                        }
                                     }
                                 }
                                 KeyCode::Esc if tree_chooser => { tree_chooser = false; }
@@ -1036,7 +1130,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     &["###", "# #", "###", "  #", "###"],  // 9
                 ];
                 const COLON: [&str; 5] = [" ", "#", " ", "#", " "];
-                let now = chrono::Local::now();
+                let now = Local::now();
                 let time_str = now.format("%H:%M:%S").to_string();
                 // Each char is 3 wide + 1 gap, colon is 1 wide + 1 gap
                 let total_w: u16 = time_str.chars().map(|c| if c == ':' { 2 } else { 4 }).sum::<u16>() - 1;
