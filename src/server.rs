@@ -1273,6 +1273,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             win.name = new_name;
                             meta_dirty = true;
                             state_dirty = true;
+                            cached_dump_state.clear();
                         }
                     }
                 }
@@ -1437,6 +1438,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 CtrlReq::DumpState(resp) => {
                     if !state_dirty
+                        && !meta_dirty
                         && !cached_dump_state.is_empty()
                         && cached_data_version == combined_data_version(&app)
                     {
