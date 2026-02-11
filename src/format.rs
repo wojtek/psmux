@@ -184,6 +184,32 @@ fn expand_format_var_for_window(var: &str, app: &AppState, win_idx: usize) -> St
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
         "prefix" => format_key_binding(&app.prefix_key),
         "status" => if app.status_visible { "on".into() } else { "off".into() },
+        "session_id" => format!("${}", app.session_name),
+        "window_id" => format!("@{}", win_idx),
+        "pane_id" => {
+            let pid = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
+            format!("%{}", pid)
+        }
+        "window_zoomed_flag" => if app.zoom_saved.is_some() { "1".into() } else { "0".into() },
+        "scroll_position" | "scroll_region_upper" => app.copy_scroll_offset.to_string(),
+        "copy_cursor_x" => app.copy_pos.map(|(_, c)| c.to_string()).unwrap_or("0".into()),
+        "copy_cursor_y" => app.copy_pos.map(|(r, _)| r.to_string()).unwrap_or("0".into()),
+        "selection_present" => if app.copy_anchor.is_some() { "1".into() } else { "0".into() },
+        "search_present" => if !app.copy_search_query.is_empty() { "1".into() } else { "0".into() },
+        "buffer_size" => app.paste_buffers.last().map(|b| b.len().to_string()).unwrap_or("0".into()),
+        "buffer_sample" => {
+            app.paste_buffers.last().map(|b| {
+                let sample: String = b.chars().take(50).collect();
+                sample
+            }).unwrap_or_default()
+        }
+        "client_session" => app.session_name.clone(),
+        "client_name" | "client_tty" => "/dev/pts/0".to_string(),
+        "window_layout" => format!("{}panes", count_panes(&win.root)),
+        "session_created" => app.created_at.timestamp().to_string(),
+        "session_created_string" => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
+        "start_time" => app.created_at.timestamp().to_string(),
+        "mode_keys" => app.mode_keys.clone(),
         _ => String::new(),
     }
 }

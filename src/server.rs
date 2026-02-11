@@ -1515,7 +1515,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                          bind-key -T prefix Down select-pane -D\n\
                          bind-key -T prefix Left select-pane -L\n\
                          bind-key -T prefix Right select-pane -R\n\
-                         bind-key -T prefix ? list-keys\n"
+                         bind-key -T prefix ? list-keys\n\
+                         bind-key -T prefix t clock-mode\n"
                     );
                     for (table_name, binds) in &app.key_tables {
                         for bind in binds {
@@ -1739,7 +1740,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 CtrlReq::SwitchClient(_target) => {}
                 CtrlReq::LockClient => {}
-                CtrlReq::RefreshClient => {}
+                CtrlReq::RefreshClient => { state_dirty = true; meta_dirty = true; }
                 CtrlReq::SuspendClient => {}
                 CtrlReq::CopyModePageUp => {
                     enter_copy_mode(&mut app);

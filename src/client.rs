@@ -484,7 +484,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     // List keys — send to server and display result
                                     cmd_batch.push("list-keys\n".into());
                                 }
-                                KeyCode::Char('t') => { pane_renaming = true; pane_title_buf.clear(); }
+                                KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
                                 KeyCode::Char(':') => { command_input = true; command_buf.clear(); }
                                 KeyCode::Char('w') => {
                                     tree_chooser = true;

@@ -252,6 +252,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     );
                     true
                 }
+                // --- clock mode (t) ---
+                KeyCode::Char('t') => {
+                    app.mode = Mode::ClockMode;
+                    true
+                }
                 _ => false,
             };
 
@@ -333,8 +338,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 // Page scroll: C-b / PageUp = page up, C-f / PageDown = page down
                 KeyCode::PageUp => { scroll_copy_up(app, 10); }
                 KeyCode::PageDown => { scroll_copy_down(app, 10); }
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 10); }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 10); }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.mode_keys == "emacs" { move_copy_cursor(app, -1, 0); }
+                    else { scroll_copy_up(app, 10); }
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.mode_keys == "emacs" { move_copy_cursor(app, 1, 0); }
+                    else { scroll_copy_down(app, 10); }
+                }
                 // Half-page scroll: C-u / C-d
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let half = app.windows.get(app.active_idx)
@@ -371,6 +382,41 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('n') => { search_next(app); }
                 KeyCode::Char('N') => { search_prev(app); }
+                // Emacs copy-mode keys
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 1); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 1); }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_end(app); }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 10); }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Passthrough;
+                    app.copy_anchor = None;
+                    app.copy_pos = None;
+                    app.copy_scroll_offset = 0;
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if let Ok(mut parser) = p.term.lock() {
+                            parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                }
+                KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Set mark (anchor)
+                    if let Some((r, c)) = current_prompt_pos(app) {
+                        app.copy_anchor = Some((r, c));
+                        app.copy_pos = Some((r, c));
+                    }
+                }
                 _ => {}
             }
             Ok(false)
@@ -955,8 +1001,44 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "right" => { move_copy_cursor(app, 1, 0); }
             "home" => { crate::copy_mode::move_to_line_start(app); }
             "end" => { crate::copy_mode::move_to_line_end(app); }
-            "C-b" | "c-b" => { scroll_copy_up(app, 10); }
-            "C-f" | "c-f" => { scroll_copy_down(app, 10); }
+            "C-b" | "c-b" => {
+                if app.mode_keys == "emacs" { move_copy_cursor(app, -1, 0); }
+                else { scroll_copy_up(app, 10); }
+            }
+            "C-f" | "c-f" => {
+                if app.mode_keys == "emacs" { move_copy_cursor(app, 1, 0); }
+                else { scroll_copy_down(app, 10); }
+            }
+            "C-n" | "c-n" => { scroll_copy_down(app, 1); }
+            "C-p" | "c-p" => { scroll_copy_up(app, 1); }
+            "C-a" | "c-a" => { crate::copy_mode::move_to_line_start(app); }
+            "C-e" | "c-e" => { crate::copy_mode::move_to_line_end(app); }
+            "C-v" | "c-v" => { scroll_copy_down(app, 10); }
+            "M-v" | "m-v" => { scroll_copy_up(app, 10); }
+            "M-f" | "m-f" => { crate::copy_mode::move_word_forward(app); }
+            "M-b" | "m-b" => { crate::copy_mode::move_word_backward(app); }
+            "M-w" | "m-w" => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; }
+            "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
+            "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+            "C-g" | "c-g" => {
+                app.mode = Mode::Passthrough;
+                app.copy_anchor = None;
+                app.copy_pos = None;
+                app.copy_scroll_offset = 0;
+                let win = &mut app.windows[app.active_idx];
+                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                    if let Ok(mut parser) = p.term.lock() {
+                        parser.screen_mut().set_scrollback(0);
+                    }
+                }
+            }
+            "c-space" | "C-space" => {
+                // Set mark (anchor) at current position
+                if let Some((r, c)) = current_prompt_pos(app) {
+                    app.copy_anchor = Some((r, c));
+                    app.copy_pos = Some((r, c));
+                }
+            }
             "C-u" | "c-u" => {
                 let half = app.windows.get(app.active_idx)
                     .and_then(|w| active_pane(&w.root, &w.active_path))
