@@ -536,6 +536,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             }
                         }
                         else if prefix_armed {
+                            // Check user-defined synced bindings FIRST (like server-side input.rs).
+                            // This lets users override any default hardcoded key binding.
+                            let key_tuple = (key.code, key.modifiers);
+                            let user_binding = synced_bindings.iter().find(|b| {
+                                b.t == "prefix" && parse_key_string(&b.k).map_or(false, |k| k == key_tuple)
+                            });
+                            if let Some(entry) = user_binding {
+                                // User-defined binding takes priority
+                                if entry.c == "detach-client" || entry.c == "detach" {
+                                    quit = true;
+                                } else if entry.c.starts_with("confirm-before") || entry.c == "kill-pane" {
+                                    confirm_cmd = Some(entry.c.clone());
+                                } else {
+                                    cmd_batch.push(format!("{}\n", entry.c));
+                                }
+                            } else {
+                            // Default hardcoded bindings (only reached if no user override)
                             match key.code {
                                 KeyCode::Char('c') => { cmd_batch.push("new-window\n".into()); }
                                 KeyCode::Char('%') => { cmd_batch.push("split-window -h\n".into()); }
@@ -787,15 +804,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 // Display pane info
                                 KeyCode::Char('i') => { cmd_batch.push("display-message\n".into()); }
                                 _ => {
-                                    // Look up key in synced prefix bindings from server
-                                    let key_tuple = (key.code, key.modifiers);
-                                    if let Some(entry) = synced_bindings.iter().find(|b| {
-                                        b.t == "prefix" && parse_key_string(&b.k).map_or(false, |k| k == key_tuple)
-                                    }) {
-                                        cmd_batch.push(format!("{}\n", entry.c));
-                                    }
+                                    // No default binding for this key (user bindings already checked above)
                                 }
                             }
+                            } // end of else (no user binding override)
                             prefix_armed = false;
                         } else {
                             match key.code {

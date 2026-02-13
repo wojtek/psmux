@@ -2113,38 +2113,56 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     state_dirty = true;
                 }
                 CtrlReq::ListKeys(resp) => {
-                    let mut output = String::from(
-                        "bind-key -T prefix c new-window\n\
-                         bind-key -T prefix n next-window\n\
-                         bind-key -T prefix p previous-window\n\
-                         bind-key -T prefix % split-window -h\n\
-                         bind-key -T prefix \" split-window -v\n\
-                         bind-key -T prefix x kill-pane\n\
-                         bind-key -T prefix d detach-client\n\
-                         bind-key -T prefix w choose-window\n\
-                         bind-key -T prefix , rename-window\n\
-                         bind-key -T prefix $ rename-session\n\
-                         bind-key -T prefix space next-layout\n\
-                         bind-key -T prefix [ copy-mode\n\
-                         bind-key -T prefix ] paste-buffer\n\
-                         bind-key -T prefix : command-prompt\n\
-                         bind-key -T prefix q display-panes\n\
-                         bind-key -T prefix z resize-pane -Z\n\
-                         bind-key -T prefix o select-pane -t +\n\
-                         bind-key -T prefix ; last-pane\n\
-                         bind-key -T prefix l last-window\n\
-                         bind-key -T prefix { swap-pane -U\n\
-                         bind-key -T prefix } swap-pane -D\n\
-                         bind-key -T prefix ! break-pane\n\
-                         bind-key -T prefix & kill-window\n\
-                         bind-key -T prefix Up select-pane -U\n\
-                         bind-key -T prefix Down select-pane -D\n\
-                         bind-key -T prefix Left select-pane -L\n\
-                         bind-key -T prefix Right select-pane -R\n\
-                         bind-key -T prefix ? list-keys\n\
-                         bind-key -T prefix t clock-mode\n\
-                         bind-key -T prefix = choose-buffer\n"
-                    );
+                    // Build a list of default bindings as (key, command) pairs
+                    let defaults: Vec<(&str, &str)> = vec![
+                        ("c", "new-window"),
+                        ("n", "next-window"),
+                        ("p", "previous-window"),
+                        ("%", "split-window -h"),
+                        ("\"", "split-window -v"),
+                        ("x", "kill-pane"),
+                        ("d", "detach-client"),
+                        ("w", "choose-window"),
+                        (",", "rename-window"),
+                        ("$", "rename-session"),
+                        ("space", "next-layout"),
+                        ("[", "copy-mode"),
+                        ("]", "paste-buffer"),
+                        (":", "command-prompt"),
+                        ("q", "display-panes"),
+                        ("z", "resize-pane -Z"),
+                        ("o", "select-pane -t +"),
+                        (";", "last-pane"),
+                        ("l", "last-window"),
+                        ("{", "swap-pane -U"),
+                        ("}", "swap-pane -D"),
+                        ("!", "break-pane"),
+                        ("&", "kill-window"),
+                        ("Up", "select-pane -U"),
+                        ("Down", "select-pane -D"),
+                        ("Left", "select-pane -L"),
+                        ("Right", "select-pane -R"),
+                        ("?", "list-keys"),
+                        ("t", "clock-mode"),
+                        ("=", "choose-buffer"),
+                    ];
+
+                    // Collect user-overridden key strings for the prefix table
+                    let mut overridden_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    if let Some(prefix_binds) = app.key_tables.get("prefix") {
+                        for bind in prefix_binds {
+                            overridden_keys.insert(format_key_binding(&bind.key));
+                        }
+                    }
+
+                    let mut output = String::new();
+                    // Print defaults, excluding any that have been overridden by user
+                    for (k, cmd) in &defaults {
+                        if !overridden_keys.contains(*k) {
+                            output.push_str(&format!("bind-key -T prefix {} {}\n", k, cmd));
+                        }
+                    }
+                    // Print all user bindings from key_tables
                     for (table_name, binds) in &app.key_tables {
                         for bind in binds {
                             let key_str = format_key_binding(&bind.key);

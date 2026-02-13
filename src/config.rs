@@ -297,7 +297,9 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
     
     while i < parts.len() {
         let p = parts[i];
-        if p.starts_with('-') {
+        // A flag must start with '-' AND be longer than 1 char (e.g. "-r", "-n", "-T").
+        // A bare "-" is a valid key name, not a flag.
+        if p.starts_with('-') && p.len() > 1 {
             if p.contains('r') { _repeatable = true; }
             if p.contains('n') { _key_table = "root".to_string(); }
             if p.contains('T') {

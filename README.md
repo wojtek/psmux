@@ -59,24 +59,13 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 
 ## Installation
 
-### Quick Install (Recommended)
-
-```powershell
-irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/install.ps1 | iex
-```
-
-This downloads the latest release and adds it to your PATH. After installation, `psmux`, `pmux`, and `tmux` commands are all available.
-
-To uninstall:
-```powershell
-irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/uninstall.ps1 | iex
-```
-
-### Using Cargo
+### Using Cargo (Recommended)
 
 ```powershell
 cargo install psmux
 ```
+
+This installs `psmux`, `pmux`, and `tmux` binaries to your Cargo bin directory.
 
 ### Using Scoop
 
@@ -88,12 +77,6 @@ scoop install https://raw.githubusercontent.com/marlocarlo/psmux/master/scoop/ps
 
 ```powershell
 choco install psmux
-```
-
-### Using Cargo
-
-```powershell
-cargo install psmux
 ```
 
 ### From GitHub Releases
@@ -166,12 +149,12 @@ Default prefix: `Ctrl+b` (same as tmux)
 | `Prefix + 0-9` | Select window by number |
 | `Prefix + d` | Detach from session |
 | `Prefix + ,` | Rename current window |
-| `Prefix + t` | Rename active pane title |
+| `Prefix + t` | Show clock |
 | `Prefix + s` | Session chooser/switcher |
 | `Prefix + o` | Select next pane |
 | `Prefix + w` | Window/pane chooser |
 | `Prefix + [` | Enter copy/scroll mode |
-| `Prefix + {` | Enter copy/scroll mode (alternate) |
+| `Prefix + {` | Swap pane up |
 | `Prefix + ]` | Paste from buffer |
 | `Prefix + q` | Display pane numbers |
 | `Prefix + Arrow` | Navigate between panes |
