@@ -331,6 +331,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut win_status_fmt: String = "#I:#W#F".to_string();
     let mut win_status_current_fmt: String = "#I:#W#F".to_string();
     let mut win_status_sep: String = " ".to_string();
+    let mut win_status_style: Option<(Option<Color>, Option<Color>, bool)> = None;
+    let mut win_status_current_style: Option<(Option<Color>, Option<Color>, bool)> = None;
     // Synced bindings from server (updated each frame from DumpState)
     let mut synced_bindings: Vec<BindingEntry> = Vec::new();
 
@@ -385,6 +387,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         /// window-status-separator
         #[serde(default)]
         wss: Option<String>,
+        /// window-status-style
+        #[serde(default)]
+        ws_style: Option<String>,
+        /// window-status-current-style
+        #[serde(default)]
+        wsc_style: Option<String>,
         /// clock-mode active
         #[serde(default)]
         clock_mode: bool,
@@ -1227,6 +1235,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         if let Some(ref f) = state.wsf { if !f.is_empty() { win_status_fmt = f.clone(); } }
         if let Some(ref f) = state.wscf { if !f.is_empty() { win_status_current_fmt = f.clone(); } }
         if let Some(ref s) = state.wss { win_status_sep = s.clone(); }
+        // Update window-status styles
+        if let Some(ref s) = state.ws_style {
+            if !s.is_empty() {
+                win_status_style = Some(parse_tmux_style(s));
+            }
+        }
+        if let Some(ref s) = state.wsc_style {
+            if !s.is_empty() {
+                win_status_current_style = Some(parse_tmux_style(s));
+            }
+        }
 
         // ── STEP 3: Render ───────────────────────────────────────────────
         let sel_s = rsel_start;
@@ -1652,13 +1671,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     status_spans.push(Span::styled(win_status_sep.clone(), sb_base));
                 }
                 if w.active {
-                    status_spans.push(Span::styled(
-                        tab_text,
+                    let active_style = if let Some((fg, bg, bold)) = win_status_current_style {
+                        let mut s = Style::default();
+                        if let Some(c) = fg { s = s.fg(c); } else { s = s.fg(Color::Black); }
+                        if let Some(c) = bg { s = s.bg(c); } else { s = s.bg(Color::Yellow); }
+                        if bold { s = s.add_modifier(Modifier::BOLD); }
+                        s
+                    } else {
                         Style::default()
                             .fg(Color::Black)
                             .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    status_spans.push(Span::styled(tab_text, active_style));
                 } else if w.activity {
                     // Activity visual notification: reverse video for windows with activity
                     status_spans.push(Span::styled(
@@ -1669,7 +1694,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             .add_modifier(Modifier::BOLD),
                     ));
                 } else {
-                    status_spans.push(Span::styled(tab_text, sb_base));
+                    let inactive_style = if let Some((fg, bg, bold)) = win_status_style {
+                        let mut s = Style::default();
+                        if let Some(c) = fg { s = s.fg(c); }
+                        if let Some(c) = bg { s = s.bg(c); }
+                        if bold { s = s.add_modifier(Modifier::BOLD); }
+                        s
+                    } else {
+                        sb_base
+                    };
+                    status_spans.push(Span::styled(tab_text, inactive_style));
                 }
             }
             // Right portion: custom status_right (already expanded by server)

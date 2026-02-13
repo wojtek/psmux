@@ -718,32 +718,25 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "bind-key" | "bind" => {
                         let mut table = "prefix".to_string();
                         let mut repeatable = false;
+                        // Parse bind-key's own flags first, then extract key + command.
+                        // bind-key flags: -T <table>, -n (root), -r (repeatable)
+                        // Everything after the key is the command string verbatim.
                         let mut i = 0;
                         while i < args.len() {
-                            if args[i] == "-T" && i + 1 < args.len() {
-                                table = args[i + 1].to_string();
-                                i += 2; continue;
-                            } else if args[i] == "-n" {
-                                table = "root".to_string();
-                            } else if args[i] == "-r" {
-                                repeatable = true;
+                            match args[i] {
+                                "-T" if i + 1 < args.len() => {
+                                    table = args[i + 1].to_string();
+                                    i += 2; continue;
+                                }
+                                "-n" => { table = "root".to_string(); i += 1; continue; }
+                                "-r" => { repeatable = true; i += 1; continue; }
+                                _ => break, // First non-flag arg = the key
                             }
-                            i += 1;
                         }
-                        let non_flag_args: Vec<&str> = {
-                            let mut out = Vec::new();
-                            let mut j = 0;
-                            while j < args.len() {
-                                if args[j] == "-T" { j += 2; continue; }
-                                if args[j].starts_with('-') { j += 1; continue; }
-                                out.push(args[j]);
-                                j += 1;
-                            }
-                            out
-                        };
-                        if non_flag_args.len() >= 2 {
-                            let key = non_flag_args[0].to_string();
-                            let command = non_flag_args[1..].join(" ");
+                        // args[i] = the key, args[i+1..] = the command (preserve all flags)
+                        if i < args.len() && i + 1 < args.len() {
+                            let key = args[i].to_string();
+                            let command = args[i + 1..].join(" ");
                             let _ = tx.send(CtrlReq::BindKey(table, key, command, repeatable));
                         }
                     }
@@ -1421,9 +1414,11 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     let wsf_escaped = json_escape_string(&app.window_status_format);
                     let wscf_escaped = json_escape_string(&app.window_status_current_format);
                     let wss_escaped = json_escape_string(&app.window_status_separator);
+                    let ws_style_escaped = json_escape_string(&app.window_status_style);
+                    let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"clock_mode\":{},\"bindings\":{}}}",
-                        layout_json, cached_windows_json, cached_prefix_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, wsf_escaped, wscf_escaped, wss_escaped,
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{}}}",
+                        layout_json, cached_windows_json, cached_prefix_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                     ));
                     cached_dump_state.clear();
@@ -1861,6 +1856,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                             app.active_idx = internal_idx;
                         }
                     }
+                    meta_dirty = true;
                     hook_event = Some("after-select-window");
                 }
                 CtrlReq::ListPanes(resp) => {
@@ -2160,9 +2156,13 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 CtrlReq::SetOption(option, value) => {
                     apply_set_option(&mut app, &option, &value, false);
+                    meta_dirty = true;
+                    state_dirty = true;
                 }
                 CtrlReq::SetOptionQuiet(option, value, quiet) => {
                     apply_set_option(&mut app, &option, &value, quiet);
+                    meta_dirty = true;
+                    state_dirty = true;
                 }
                 CtrlReq::SetOptionUnset(option) => {
                     // Reset option to default or remove @user-option
