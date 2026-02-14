@@ -493,24 +493,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
-                        let is_ctrl_q = (matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL))
-                            || matches!(key.code, KeyCode::Char('\x11'));
                         // Dynamic prefix key check (default: Ctrl+B, configurable via .psmux.conf)
                         let is_prefix = (key.code, key.modifiers) == prefix_key
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
 
-                        if is_ctrl_q {
-                            // Only quit if C-q is still bound in the root table
-                            let cq = (KeyCode::Char('q'), KeyModifiers::CONTROL);
-                            let bound = synced_bindings.iter().any(|b| {
-                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| k == cq)
-                                    && (b.c == "detach-client" || b.c == "detach")
-                            });
-                            if bound { quit = true; }
-                        }
                         // Overlay Esc must be checked BEFORE selection-Esc so that
                         // pressing Esc always closes the active overlay first.
-                        else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some()) {
+                        if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some()) {
                             command_input = false;
                             renaming = false;
                             pane_renaming = false;
