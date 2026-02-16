@@ -242,17 +242,17 @@ fn main() -> io::Result<()> {
                 
                 // Always spawn a background server first
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
-                let mut cmd = std::process::Command::new(&exe);
-                cmd.arg("server").arg("-s").arg(&name);
+                let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), name.clone()];
                 // Pass initial command if provided
                 if let Some(ref init_cmd) = initial_cmd {
-                    cmd.arg("-c").arg(init_cmd);
+                    server_args.push("-c".into());
+                    server_args.push(init_cmd.clone());
                 }
                 // Pass raw command args (direct execution) if -- was used
                 if let Some(ref raw_args) = raw_cmd_args {
-                    cmd.arg("--");
+                    server_args.push("--".into());
                     for a in raw_args {
-                        cmd.arg(a);
+                        server_args.push(a.clone());
                     }
                 }
                 // On Windows, mark parent's stdout/stderr as non-inheritable before
@@ -277,17 +277,19 @@ fn main() -> io::Result<()> {
                         SetHandleInformation(stderr, HANDLE_FLAG_INHERIT, 0);
                     }
                 }
-                // On Windows, use DETACHED_PROCESS to completely detach from parent console.
-                // This ensures the server survives when the parent SSH/console dies.
-                // CREATE_NEW_PROCESS_GROUP prevents Ctrl+C signals from propagating.
+                // Spawn server with a hidden console window via CreateProcessW.
+                // This gives ConPTY a real console while keeping the window invisible.
                 #[cfg(windows)]
+                crate::platform::spawn_server_hidden(&exe, &server_args)?;
+                #[cfg(not(windows))]
                 {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                    const DETACHED_PROCESS: u32 = 0x00000008;
-                    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+                    let mut cmd = std::process::Command::new(&exe);
+                    for a in &server_args { cmd.arg(a); }
+                    cmd.stdin(std::process::Stdio::null());
+                    cmd.stdout(std::process::Stdio::null());
+                    cmd.stderr(std::process::Stdio::null());
+                    let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 }
-                let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 
                 // Wait for server to create port file (up to 2 seconds)
                 for _ in 0..20 {
@@ -339,15 +341,22 @@ fn main() -> io::Result<()> {
             "split-window" | "splitw" => {
                 let flag = if cmd_args.iter().any(|a| *a == "-h") { "-h" } else { "-v" };
                 let detached = cmd_args.iter().any(|a| *a == "-d");
+                let print_info = cmd_args.iter().any(|a| *a == "-P");
+                // Parse -F format string
+                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
                 // Parse -c start_dir, -p percentage, -l percentage flags
                 let start_dir: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
                 let size_pct: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-p" || w[0] == "-l").map(|w| w[1].to_string());
                 // Parse command after flags (first non-flag argument, skipping command name at cmd_args[0])
                 let cmd_arg = cmd_args.iter().skip(1)
-                    .find(|a| !a.starts_with('-') && !cmd_args.windows(2).any(|w| (w[0] == "-c" || w[0] == "-p" || w[0] == "-l") && w[1] == **a))
+                    .find(|a| !a.starts_with('-') && !cmd_args.windows(2).any(|w| (w[0] == "-c" || w[0] == "-p" || w[0] == "-l" || w[0] == "-F") && w[1] == **a))
                     .map(|s| s.as_str()).unwrap_or("");
                 let mut cmd_line = format!("split-window {}", flag);
                 if detached { cmd_line.push_str(" -d"); }
+                if print_info { cmd_line.push_str(" -P"); }
+                if let Some(ref fmt) = format_str {
+                    cmd_line.push_str(&format!(" -F \"{}\"", fmt.replace("\"", "\\\"")));
+                }
                 if let Some(dir) = &start_dir {
                     cmd_line.push_str(&format!(" -c \"{}\"", dir.replace("\"", "\\\"")));
                 }
@@ -358,7 +367,12 @@ fn main() -> io::Result<()> {
                     cmd_line.push_str(&format!(" \"{}\"", cmd_arg.replace("\"", "\\\"")));
                 }
                 cmd_line.push('\n');
-                send_control(cmd_line)?;
+                if print_info {
+                    let resp = send_control_with_response(cmd_line)?;
+                    print!("{}", resp);
+                } else {
+                    send_control(cmd_line)?;
+                }
                 return Ok(());
             }
             "kill-pane" | "killp" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
@@ -496,6 +510,12 @@ fn main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        "-F" => {
+                            if let Some(f) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -F \"{}\"", f.trim_matches('"').replace("\"", "\\\"")));
+                                i += 1;
+                            }
+                        }
                         _ => {}
                     }
                     i += 1;
@@ -604,7 +624,26 @@ fn main() -> io::Result<()> {
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect(&addr).is_ok() {
+                        // Actually authenticate and query the server to ensure it's healthy
+                        let session_key = read_session_key(&target).unwrap_or_default();
+                        if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                            &addr.parse().unwrap(),
+                            Duration::from_millis(500)
+                        ) {
+                            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                            let _ = write!(s, "AUTH {}\n", session_key);
+                            let _ = write!(s, "session-info\n");
+                            let _ = s.flush();
+                            let mut buf = [0u8; 256];
+                            if let Ok(n) = std::io::Read::read(&mut s, &mut buf) {
+                                if n > 0 {
+                                    let resp = String::from_utf8_lossy(&buf[..n]);
+                                    if resp.contains("OK") {
+                                        std::process::exit(0);
+                                    }
+                                }
+                            }
+                            // Fallback: connection succeeded so session likely exists
                             std::process::exit(0);
                         } else {
                             // Stale port file - clean it up
@@ -1622,16 +1661,18 @@ fn main() -> io::Result<()> {
             let _ = std::fs::remove_file(&port_path);
             // No existing session - create one in background
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("server").arg("-s").arg(&session_name);
+            let server_args: Vec<String> = vec!["server".into(), "-s".into(), session_name.clone()];
             #[cfg(windows)]
+            crate::platform::spawn_server_hidden(&exe, &server_args)?;
+            #[cfg(not(windows))]
             {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-                const DETACHED_PROCESS: u32 = 0x00000008;
-                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+                let mut cmd = std::process::Command::new(&exe);
+                for a in &server_args { cmd.arg(a); }
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             }
-            let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             
             // Wait for server to start
             for _ in 0..20 {

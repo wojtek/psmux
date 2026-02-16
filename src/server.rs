@@ -368,6 +368,8 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     "split-window" | "splitw" => {
                         let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
                         let detached = args.iter().any(|a| *a == "-d");
+                        let print_info = args.iter().any(|a| *a == "-P");
+                        let format_str: Option<String> = args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
                         let start_dir: Option<String> = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
                         let size_pct: Option<u16> = args.windows(2).find(|w| w[0] == "-p").and_then(|w| w[1].parse().ok())
                             .or_else(|| args.windows(2).find(|w| w[0] == "-l").and_then(|w| {
@@ -375,9 +377,19 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                                 s.parse().ok()
                             }));
                         let cmd_str: Option<String> = args.iter()
-                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)))
+                            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, size_pct));
+                        if print_info {
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, size_pct, format_str, rtx));
+                            if let Ok(text) = rrx.recv_timeout(Duration::from_millis(2000)) {
+                                let _ = write!(write_stream, "{}\n", text);
+                                let _ = write_stream.flush();
+                            }
+                            if !persistent { break; }
+                        } else {
+                            let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, size_pct));
+                        }
                     }
                     "kill-pane" | "killp" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" | "capturep" => {
@@ -1319,6 +1331,41 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                     }
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
                 }
+                CtrlReq::SplitWindowPrint(k, cmd, detached, start_dir, size_pct, format_str, resp) => {
+                    if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
+                    let prev_path = app.windows[app.active_idx].active_path.clone();
+                    let _ = split_active_with_command(&mut app, k, cmd.as_deref());
+                    if let Some(_pct) = size_pct { }
+                    // Get pane info from the newly created pane (it's now the active pane)
+                    let pane_info = {
+                        let win = &app.windows[app.active_idx];
+                        if let Some(p) = crate::tree::active_pane(&win.root, &win.active_path) {
+                            let pane_id = p.id;
+                            let session = &app.session_name;
+                            let win_idx = app.active_idx + app.window_base_index;
+                            let pane_idx = crate::tree::pane_index_in_window(&win.root, &win.active_path).unwrap_or(0) + app.pane_base_index;
+                            // Apply format string or use default format
+                            if let Some(ref fmt) = format_str {
+                                fmt.replace("#{pane_id}", &format!("%{}", pane_id))
+                                   .replace("#{session_name}", session)
+                                   .replace("#{window_index}", &win_idx.to_string())
+                                   .replace("#{pane_index}", &pane_idx.to_string())
+                                   .replace("#{pane_title}", &p.title)
+                            } else {
+                                format!("{}:{}.{}", session, win_idx, pane_idx)
+                            }
+                        } else {
+                            String::new()
+                        }
+                    };
+                    if detached {
+                        let mut revert_path = prev_path;
+                        revert_path.push(0);
+                        app.windows[app.active_idx].active_path = revert_path;
+                    }
+                    let _ = resp.send(pane_info);
+                    resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
+                }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-kill-pane"); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
@@ -2087,6 +2134,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 CtrlReq::BindKey(table_name, key, command, repeat) => {
                     if let Some(kc) = parse_key_string(&key) {
+                        let kc = normalize_key_for_binding(kc);
                         // Support `\;` chaining in server-side bind-key
                         let sub_cmds = crate::config::split_chained_commands_pub(&command);
                         let action = if sub_cmds.len() > 1 {
@@ -2105,6 +2153,7 @@ pub fn run_server(session_name: String, initial_command: Option<String>, raw_com
                 }
                 CtrlReq::UnbindKey(key) => {
                     if let Some(kc) = parse_key_string(&key) {
+                        let kc = normalize_key_for_binding(kc);
                         for table in app.key_tables.values_mut() {
                             table.retain(|b| b.key != kc);
                         }

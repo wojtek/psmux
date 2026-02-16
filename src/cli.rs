@@ -452,6 +452,18 @@ pub fn parse_target(target: &str) -> ParsedTarget {
         (session, Some(&target[colon_pos + 1..]))
     } else if target.starts_with('.') {
         (None, Some(target))
+    } else if let Some(dot_pos) = target.find('.') {
+        // Handle tmux-style session.pane syntax (e.g., "default.1")
+        // Only treat as session.pane if the part after the dot is numeric
+        let after_dot = &target[dot_pos + 1..];
+        if after_dot.parse::<usize>().is_ok() {
+            let session = target[..dot_pos].to_string();
+            // Construct ".pane" so the window_pane_part parser handles it
+            (Some(session), Some(&target[dot_pos..]))
+        } else {
+            // Dot is part of the session name (e.g., "my.session")
+            (Some(target.to_string()), None)
+        }
     } else {
         // A bare string without ':' or '.' is always a session name, even if numeric.
         // Window/pane specifiers require explicit syntax like ":0" or ".1"

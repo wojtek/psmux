@@ -489,6 +489,30 @@ pub fn active_pane<'a>(node: &'a Node, path: &[usize]) -> Option<&'a Pane> {
     }
 }
 
+/// Get the index of the pane at `path` among all leaf panes in the window tree (DFS order).
+pub fn pane_index_in_window(node: &Node, path: &[usize]) -> Option<usize> {
+    // Find the pane ID at the path, then count its position
+    let target = active_pane(node, path)?;
+    let target_id = target.id;
+    let mut idx = 0usize;
+    fn walk(n: &Node, target_id: usize, idx: &mut usize) -> bool {
+        match n {
+            Node::Leaf(p) => {
+                if p.id == target_id { return true; }
+                *idx += 1;
+                false
+            }
+            Node::Split { children, .. } => {
+                for c in children {
+                    if walk(c, target_id, idx) { return true; }
+                }
+                false
+            }
+        }
+    }
+    if walk(node, target_id, &mut idx) { Some(idx) } else { None }
+}
+
 /// Reap exited children from the app. Returns (all_empty, any_pruned).
 pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
     let remain = app.remain_on_exit;

@@ -1,3 +1,115 @@
+/// Spawn a server process with a hidden console window on Windows.
+///
+/// Uses raw `CreateProcessW` with `STARTF_USESHOWWINDOW` + `SW_HIDE` and
+/// `CREATE_NEW_CONSOLE` so that ConPTY has a real console session while the
+/// window remains invisible.  This replicates the behaviour of
+/// `Start-Process -WindowStyle Hidden` in PowerShell.
+#[cfg(windows)]
+pub fn spawn_server_hidden(exe: &std::path::Path, args: &[String]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct STARTUPINFOW {
+        cb: u32,
+        lpReserved: *mut u16,
+        lpDesktop: *mut u16,
+        lpTitle: *mut u16,
+        dwX: u32,
+        dwY: u32,
+        dwXSize: u32,
+        dwYSize: u32,
+        dwXCountChars: u32,
+        dwYCountChars: u32,
+        dwFillAttribute: u32,
+        dwFlags: u32,
+        wShowWindow: u16,
+        cbReserved2: u16,
+        lpReserved2: *mut u8,
+        hStdInput: isize,
+        hStdOutput: isize,
+        hStdError: isize,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESS_INFORMATION {
+        hProcess: isize,
+        hThread: isize,
+        dwProcessId: u32,
+        dwThreadId: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateProcessW(
+            lpApplicationName: *const u16,
+            lpCommandLine: *mut u16,
+            lpProcessAttributes: *const std::ffi::c_void,
+            lpThreadAttributes: *const std::ffi::c_void,
+            bInheritHandles: i32,
+            dwCreationFlags: u32,
+            lpEnvironment: *const std::ffi::c_void,
+            lpCurrentDirectory: *const u16,
+            lpStartupInfo: *const STARTUPINFOW,
+            lpProcessInformation: *mut PROCESS_INFORMATION,
+        ) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+
+    const STARTF_USESHOWWINDOW: u32 = 0x00000001;
+    const SW_HIDE: u16 = 0;
+    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+    // Build command line: "exe" arg1 arg2 ...
+    // Each argument is quoted to handle spaces.
+    let mut cmdline = format!("\"{}\"", exe.display());
+    for arg in args {
+        if arg.contains(' ') || arg.contains('"') {
+            cmdline.push_str(&format!(" \"{}\"", arg.replace('"', "\\\"")));
+        } else {
+            cmdline.push(' ');
+            cmdline.push_str(arg);
+        }
+    }
+    let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline_wide.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // don't inherit handles
+            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Close handles – we don't need to wait for the child.
+    unsafe {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+
+    Ok(())
+}
+
 /// Enable virtual terminal processing on Windows Console Host.
 /// This is required for ANSI color codes to work in conhost.exe (legacy console).
 #[cfg(windows)]

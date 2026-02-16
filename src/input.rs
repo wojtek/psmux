@@ -9,6 +9,7 @@ use crate::types::*;
 use crate::tree::*;
 use crate::pane::*;
 use crate::commands::*;
+use crate::config::normalize_key_for_binding;
 use crate::copy_mode::*;
 use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
@@ -46,7 +47,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 return Ok(false);
             }
             // Check root key table for bindings (bind-key -n / bind-key -T root)
-            let key_tuple = (key.code, key.modifiers);
+            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get("root").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
                 return execute_action(app, &bind.action);
             }
@@ -56,7 +57,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         Mode::Prefix { armed_at } => {
             let elapsed = armed_at.elapsed().as_millis() as u64;
             
-            let key_tuple = (key.code, key.modifiers);
+            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get("prefix").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
                 if bind.repeat {
                     // Stay in prefix mode for repeat-time window
@@ -467,7 +468,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
         Mode::CopyMode => {
             // Check copy-mode key table for user bindings first (used by plugins like tmux-yank)
             let table_name = if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" };
-            let key_tuple = (key.code, key.modifiers);
+            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get(table_name)
                 .and_then(|t| t.iter().find(|b| b.key == key_tuple))
                 .cloned()

@@ -42,7 +42,7 @@ Write-Host ("=" * 60)
 
 Write-Test "set -g with no session (should warn, not crash)"
 $output = & $PSMUX set -g default-shell pwsh 2>&1 | Out-String
-if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session") {
+if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session" -or "$output" -match "no server running") {
     Write-Pass "set -g without session: graceful ($($output.Trim()))"
 } else {
     Write-Fail "set -g without session: unexpected error: $output"
@@ -50,7 +50,7 @@ if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session") {
 
 Write-Test "bind-key with no session (should warn, not crash)"
 $output = & $PSMUX bind-key - split-window -v 2>&1 | Out-String
-if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session") {
+if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session" -or "$output" -match "no server running") {
     Write-Pass "bind-key without session: graceful ($($output.Trim()))"
 } else {
     Write-Fail "bind-key without session: unexpected error: $output"
@@ -58,7 +58,7 @@ if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session") {
 
 Write-Test "unbind-key with no session (should warn, not crash)"
 $output = & $PSMUX unbind-key x 2>&1 | Out-String
-if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session") {
+if ($LASTEXITCODE -eq 0 -or "$output" -match "warning.*no active session" -or "$output" -match "no server running") {
     Write-Pass "unbind-key without session: graceful ($($output.Trim()))"
 } else {
     Write-Fail "unbind-key without session: unexpected error: $output"

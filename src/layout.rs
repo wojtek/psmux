@@ -60,6 +60,10 @@ pub enum LayoutJson {
         sel_end_row: Option<u16>,
         sel_end_col: Option<u16>,
         #[serde(default)]
+        copy_cursor_row: Option<u16>,
+        #[serde(default)]
+        copy_cursor_col: Option<u16>,
+        #[serde(default)]
         content: Vec<Vec<CellJson>>,
         #[serde(default)]
         rows_v2: Vec<RowRunsJson>,
@@ -242,6 +246,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     sel_start_col: None,
                     sel_end_row: None,
                     sel_end_col: None,
+                    copy_cursor_row: None,
+                    copy_cursor_col: None,
                     content: lines,
                     rows_v2,
                 }
@@ -270,6 +276,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                 sel_start_col,
                 sel_end_row,
                 sel_end_col,
+                copy_cursor_row,
+                copy_cursor_col,
                 ..
             } => {
                 let is_active = idx >= path.len();
@@ -278,6 +286,13 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     *copy_mode = in_copy_mode;
                     *so = scroll_offset;
                     if in_copy_mode {
+                        if let Some((pr, pc)) = copy_pos {
+                            *copy_cursor_row = Some(pr);
+                            *copy_cursor_col = Some(pc);
+                        } else {
+                            *copy_cursor_row = None;
+                            *copy_cursor_col = None;
+                        }
                         if let (Some((ar, ac)), Some((pr, pc))) = (copy_anchor, copy_pos) {
                             *sel_start_row = Some(ar.min(pr));
                             *sel_start_col = Some(ac.min(pc));
@@ -294,6 +309,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                         *sel_start_col = None;
                         *sel_end_row = None;
                         *sel_end_col = None;
+                        *copy_cursor_row = None;
+                        *copy_cursor_col = None;
                     }
                 }
             }
@@ -561,7 +578,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     snap.cr, snap.cc, snap.alt, is_active, need_content, so,
                 ));
 
-                // selection bounds
+                // selection bounds + copy cursor position
                 if is_active && in_copy {
                     if let (Some((ar, ac)), Some((pr, pc))) = (anchor, cpos) {
                         let _ = std::fmt::Write::write_fmt(out, format_args!(
@@ -571,8 +588,17 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     } else {
                         out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
                     }
+                    if let Some((pr, pc)) = cpos {
+                        let _ = std::fmt::Write::write_fmt(out, format_args!(
+                            "\"copy_cursor_row\":{},\"copy_cursor_col\":{},",
+                            pr, pc,
+                        ));
+                    } else {
+                        out.push_str("\"copy_cursor_row\":null,\"copy_cursor_col\":null,");
+                    }
                 } else {
                     out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
+                    out.push_str("\"copy_cursor_row\":null,\"copy_cursor_col\":null,");
                 }
 
                 // ── content (per-cell, only in copy-mode active pane) ──

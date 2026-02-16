@@ -69,7 +69,7 @@ pub fn send_control(line: String) -> io::Result<()> {
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(addr)?;
@@ -93,7 +93,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;

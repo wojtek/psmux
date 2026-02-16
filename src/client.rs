@@ -11,7 +11,7 @@ use crate::layout::LayoutJson;
 use crate::util::*;
 use crate::session::*;
 use crate::rendering::*;
-use crate::config::parse_key_string;
+use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
@@ -522,12 +522,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         // Check root-table bindings (bind-key -n / bind-key -T root)
                         // These fire without prefix, before keys are forwarded to PTY
                         else if !command_input && !renaming && !pane_renaming && !chooser && !tree_chooser && !session_chooser && confirm_cmd.is_none() && {
-                            let key_tuple = (key.code, key.modifiers);
-                            synced_bindings.iter().any(|b| b.t == "root" && parse_key_string(&b.k).map_or(false, |k| k == key_tuple))
+                            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
+                            synced_bindings.iter().any(|b| b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple))
                         } {
-                            let key_tuple = (key.code, key.modifiers);
+                            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             if let Some(entry) = synced_bindings.iter().find(|b| {
-                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| k == key_tuple)
+                                b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                             }) {
                                 if entry.c == "detach-client" || entry.c == "detach" {
                                     quit = true;
@@ -539,9 +539,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         else if prefix_armed {
                             // Check user-defined synced bindings FIRST (like server-side input.rs).
                             // This lets users override any default hardcoded key binding.
-                            let key_tuple = (key.code, key.modifiers);
+                            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             let user_binding = synced_bindings.iter().find(|b| {
-                                b.t == "prefix" && parse_key_string(&b.k).map_or(false, |k| k == key_tuple)
+                                b.t == "prefix" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple)
                             });
                             if let Some(entry) = user_binding {
                                 // User-defined binding takes priority
@@ -1330,6 +1330,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         sel_start_col,
                         sel_end_row,
                         sel_end_col,
+                        copy_cursor_row,
+                        copy_cursor_col,
                         content,
                         rows_v2,
                     } => {
@@ -1439,6 +1441,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                             let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
                             let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
                             f.set_cursor(cx, cy);
+                        }
+
+                        // In copy mode, show cursor at copy_pos with a
+                        // highlighted (reverse-video) cell so the user can see
+                        // where the cursor is before starting selection.
+                        if *copy_mode && *active {
+                            if let (Some(cr), Some(cc)) = (copy_cursor_row, copy_cursor_col) {
+                                let cr = (*cr).min(inner.height.saturating_sub(1));
+                                let cc = (*cc).min(inner.width.saturating_sub(1));
+                                let cy = inner.y + cr;
+                                let cx = inner.x + cc;
+                                f.set_cursor(cx, cy);
+                                // Highlight the cursor cell with reverse video
+                                let buf = f.buffer_mut();
+                                let buf_area = buf.area;
+                                if cy >= buf_area.y && cy < buf_area.y + buf_area.height
+                                    && cx >= buf_area.x && cx < buf_area.x + buf_area.width
+                                {
+                                    let idx = (cy - buf_area.y) as usize * buf_area.width as usize
+                                        + (cx - buf_area.x) as usize;
+                                    if idx < buf.content.len() {
+                                        let cell = &mut buf.content[idx];
+                                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                                    }
+                                }
+                            }
                         }
                     }
                     LayoutJson::Split { kind, sizes, children } => {

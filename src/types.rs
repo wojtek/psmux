@@ -440,6 +440,7 @@ pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repe
 pub enum CtrlReq {
     NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
     SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>),  // kind, cmd, detached, start_dir, size_percent
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<u16>, Option<String>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size_percent, format, resp
     KillPane,
     CapturePane(mpsc::Sender<String>),
     CapturePaneStyled(mpsc::Sender<String>),

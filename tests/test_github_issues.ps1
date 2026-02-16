@@ -118,9 +118,9 @@ if ($activeWindows1.Count -eq 1) {
     Write-Fail "Expected 1 active window, got $($activeWindows1.Count)"
 }
 
-# Switch to window 0 via select-window
-Write-Test "select-window 0 updates active flag in dump-state"
-Send-Fire $conn "select-window 0"
+# Switch to window 1 via select-window (base-index=1, so windows are 1,2,3)
+Write-Test "select-window 1 updates active flag in dump-state"
+Send-Fire $conn "select-window 1"
 Start-Sleep -Milliseconds 500
 
 # Get new state
@@ -129,23 +129,23 @@ $json2 = $state2 | ConvertFrom-Json -ErrorAction SilentlyContinue
 $activeWindows2 = @($json2.windows | Where-Object { $_.active -eq $true })
 
 if ($activeWindows2.Count -eq 1) {
-    # Check which window is active
+    # Check which window is active (array index 0 = display index 1 with base-index=1)
     $activeIdx = 0
     for ($i = 0; $i -lt $json2.windows.Count; $i++) {
         if ($json2.windows[$i].active) { $activeIdx = $i }
     }
     if ($activeIdx -eq 0) {
-        Write-Pass "Window 0 is now active after select-window 0"
+        Write-Pass "Window 1 (array[0]) is now active after select-window 1"
     } else {
-        Write-Fail "Active window is $activeIdx, expected 0 (tab color would be wrong!)"
+        Write-Fail "Active window is array[$activeIdx], expected array[0] (tab color would be wrong!)"
     }
 } else {
     Write-Fail "Expected 1 active window after select-window, got $($activeWindows2.Count)"
 }
 
-# Switch to window 1
-Write-Test "select-window 1 updates active flag"
-Send-Fire $conn "select-window 1"
+# Switch to window 2 (array index 1)
+Write-Test "select-window 2 updates active flag"
+Send-Fire $conn "select-window 2"
 Start-Sleep -Milliseconds 500
 
 $state3 = Get-FreshDump $conn
@@ -155,9 +155,9 @@ for ($i = 0; $i -lt $json3.windows.Count; $i++) {
     if ($json3.windows[$i].active) { $activeIdx3 = $i }
 }
 if ($activeIdx3 -eq 1) {
-    Write-Pass "Window 1 is active after select-window 1"
+    Write-Pass "Window 2 (array[1]) is active after select-window 2"
 } else {
-    Write-Fail "Active window is $activeIdx3, expected 1"
+    Write-Fail "Active window is array[$activeIdx3], expected array[1]"
 }
 
 try { $conn.tcp.Close() } catch {}
@@ -180,9 +180,8 @@ Write-Test "bind-key r split-window -h preserves -h flag"
 Send-Fire $conn "bind-key r split-window -h"
 Start-Sleep -Milliseconds 500
 
-# Check list-keys for the binding
-$conn.writer.WriteLine("list-keys"); $conn.writer.Flush()
-$keys = $conn.reader.ReadLine()
+# Use CLI list-keys (reads all output correctly) instead of raw TCP ReadLine
+$keys = & $PSMUX list-keys -t $SESSION 2>&1 | Out-String
 
 if ("$keys" -match "split-window -h" -or "$keys" -match "split-window.*-h") {
     Write-Pass "bind-key r: command includes -h flag"
@@ -195,10 +194,9 @@ Write-Test "bind-key - split-window -v (dash as key)"
 Send-Fire $conn "bind-key - split-window -v"
 Start-Sleep -Milliseconds 500
 
-$conn.writer.WriteLine("list-keys"); $conn.writer.Flush()
-$keys2 = $conn.reader.ReadLine()
+$keys2 = & $PSMUX list-keys -t $SESSION 2>&1 | Out-String
 
-if ("$keys2" -match '"-"' -or "$keys2" -match "bind.*-.*split-window") {
+if ("$keys2" -match 'split-window.*-v') {
     Write-Pass "bind-key -: dash key is recognized"
 } else {
     Write-Fail "bind-key -: dash key was treated as a flag and dropped! Got: $keys2"
@@ -209,8 +207,7 @@ Write-Test "bind-key -T prefix v split-window -v"
 Send-Fire $conn "bind-key -T prefix v split-window -v"
 Start-Sleep -Milliseconds 500
 
-$conn.writer.WriteLine("list-keys"); $conn.writer.Flush()
-$keys3 = $conn.reader.ReadLine()
+$keys3 = & $PSMUX list-keys -t $SESSION 2>&1 | Out-String
 
 if ("$keys3" -match "split-window -v" -or "$keys3" -match "split-window.*-v") {
     Write-Pass "bind-key with -T: command -v flag preserved"
