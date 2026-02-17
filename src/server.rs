@@ -2573,6 +2573,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.hooks.remove(&hook);
                 }
                 CtrlReq::KillServer => {
+                    // Kill all child processes in all windows before exiting
+                    for win in app.windows.iter_mut() {
+                        kill_all_children(&mut win.root);
+                    }
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());

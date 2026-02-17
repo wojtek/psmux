@@ -152,19 +152,27 @@ fn main() -> io::Result<()> {
         "kill-server" => {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
             let psmux_dir = format!("{}\\.psmux", home);
+            // Compute namespace prefix for -L filtering (matches list-sessions behavior)
+            let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
             let mut sessions_killed = 0;
             if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().map(|e| e == "port").unwrap_or(false) {
                         if let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            // Apply -L namespace filtering:
+                            // With -L: only kill sessions under that namespace
+                            // Without -L: kill ALL sessions (tmux behavior)
+                            if let Some(ref pfx) = ns_prefix {
+                                if !session_name.starts_with(pfx.as_str()) { continue; }
+                            }
                             if let Ok(port_str) = std::fs::read_to_string(&path) {
                                 if let Ok(port) = port_str.trim().parse::<u16>() {
                                     let addr = format!("127.0.0.1:{}", port);
                                     let sess_key = read_session_key(session_name).unwrap_or_default();
                                     if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
                                         let _ = write!(stream, "AUTH {}\n", sess_key);
-                                        let _ = std::io::Write::write_all(&mut stream, b"kill-session\n");
+                                        let _ = std::io::Write::write_all(&mut stream, b"kill-server\n");
                                         sessions_killed += 1;
                                     } else {
                                         let _ = std::fs::remove_file(&path);
@@ -178,7 +186,7 @@ fn main() -> io::Result<()> {
                 }
             }
             if sessions_killed > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             return Ok(());
         }
