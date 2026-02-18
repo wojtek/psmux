@@ -59,6 +59,12 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 
 ## Installation
 
+### Using WinGet
+
+```powershell
+winget install marlocarlo.psmux
+```
+
 ### Using Cargo (Recommended)
 
 ```powershell
