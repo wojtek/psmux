@@ -15,8 +15,7 @@ target/
 # Trae workspace
 .trae/
 
-# Cargo lock for binaries (keep for libraries)
-Cargo.lock
+# Note: Cargo.lock is committed (recommended for binaries)
 
 # OS files
 .DS_Store
