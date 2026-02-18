@@ -501,6 +501,8 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "cmd" } else { "sh" });
                         if cfg!(windows) { cmd_builder.args(["/C", &rest]); } else { cmd_builder.args(["-c", &rest]); }
                         let child = pair.slave.spawn_command(cmd_builder).ok()?;
+                        // Close the slave handle immediately – required for ConPTY.
+                        drop(pair.slave);
                         let term = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(pty_size.rows, pty_size.cols, 0)));
                         let term_reader = term.clone();
                         if let Ok(mut reader) = pair.master.try_clone_reader() {

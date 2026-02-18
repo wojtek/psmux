@@ -682,6 +682,8 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     };
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref());
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    // Close the slave handle immediately – required for ConPTY.
+    drop(pair.slave);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;

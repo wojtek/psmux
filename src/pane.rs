@@ -55,6 +55,10 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         .slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    // On Windows ConPTY the slave handle MUST be closed after spawning so the
+    // child owns the sole reference to the console input pipe.  Leaving it open
+    // causes "The handle is invalid" IOExceptions inside the child process.
+    drop(pair.slave);
 
     let scrollback = app.history_limit as u32;
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, scrollback as usize)));
@@ -110,6 +114,8 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    // Close the slave handle immediately – see create_window() comment.
+    drop(pair.slave);
 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
@@ -160,6 +166,8 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     };
     set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    // Close the slave handle immediately – see create_window() comment.
+    drop(pair.slave);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
