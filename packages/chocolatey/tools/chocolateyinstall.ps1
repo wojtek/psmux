@@ -1,13 +1,24 @@
+# ============================================================================
+# TEMPLATE ONLY - DO NOT PUSH THIS FILE DIRECTLY TO CHOCOLATEY
+# ============================================================================
+# The real chocolateyinstall.ps1 is generated at publish time with the correct
+# SHA256 checksum by either:
+#   - GitHub Actions:  .github/workflows/release.yml (publish-chocolatey job)
+#   - Local publish:   scripts/publish-choco.ps1
+#
+# Both download the release zip, compute the hash, and generate this file.
+# ============================================================================
+
 $ErrorActionPreference = 'Stop'
 
 $toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
-$url64 = 'https://github.com/marlocarlo/psmux/releases/download/v0.3.5/psmux-v0.3.5-windows-x64.zip'
+$url64 = 'https://github.com/marlocarlo/psmux/releases/download/v__VERSION__/psmux-v__VERSION__-windows-x64.zip'
 
 $packageArgs = @{
   packageName    = $env:ChocolateyPackageName
   unzipLocation  = $toolsDir
   url64bit       = $url64
-  checksum64     = 'PLACEHOLDER_WILL_BE_COMPUTED_BY_CI'
+  checksum64     = '__SHA256_COMPUTED_AT_PUBLISH_TIME__'
   checksumType64 = 'sha256'
 }
 

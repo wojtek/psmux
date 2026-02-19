@@ -2035,7 +2035,7 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     
     // Loop to handle session switching without spawning new processes
-    loop {
+    let result = loop {
         let result = run_remote(&mut terminal);
         
         // Check if we should switch to another session
@@ -2050,10 +2050,22 @@ fn main() -> io::Result<()> {
             continue;
         }
         
-        // Normal exit
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), DisableBlinking, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
-        return result;
-    }
+        break result;
+    };
+
+    // Terminal cleanup — always runs, even on error, to prevent leaked
+    // SGR attributes (invisible text), stuck raw mode, or stale cursor style.
+    let _ = disable_raw_mode();
+    let out = terminal.backend_mut();
+    // Reset all SGR attributes (fg/bg color, bold, hidden, etc.) BEFORE
+    // leaving the alternate screen.  SGR state is global and NOT restored
+    // by the alternate-screen save/restore mechanism (\x1b[?1049l).
+    // Without this, the last ratatui frame's foreground color can persist
+    // into the main screen, making typed text invisible.
+    let _ = execute!(out, crossterm::style::Print("\x1b[0m"));
+    // Reset cursor style to terminal default (\x1b[0 q)
+    let _ = execute!(out, crossterm::style::Print("\x1b[0 q"));
+    let _ = execute!(out, DisableBlinking, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    result
 }
