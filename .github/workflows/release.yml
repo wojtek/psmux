@@ -464,26 +464,13 @@ jobs:
             Write-Output ""
           }
 
-      - name: Validate manifests
-        shell: pwsh
-        run: |
-          $proc = Start-Process -FilePath $env:WGC_PATH `
-            -ArgumentList @("validate", "winget-manifests") `
-            -NoNewWindow -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "wingetcreate validate failed (exit $($proc.ExitCode)). Check manifest files."
-            exit 1
-          }
-          Write-Output "Validation passed!"
-
       - name: Submit manifests to WinGet (PR to microsoft/winget-pkgs)
         shell: pwsh
         run: |
-          $proc = Start-Process -FilePath $env:WGC_PATH `
-            -ArgumentList @("submit", "winget-manifests", "--token", "${{ secrets.WINGET_PAT }}") `
-            -NoNewWindow -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "wingetcreate submit failed (exit $($proc.ExitCode))."
+          # submit validates manifests internally before creating the PR
+          & $env:WGC_PATH submit "winget-manifests" --token "${{ secrets.WINGET_PAT }}" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "wingetcreate submit failed (exit $LASTEXITCODE)."
             exit 1
           }
           Write-Output "PR submitted to microsoft/winget-pkgs!"
