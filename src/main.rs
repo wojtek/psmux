@@ -132,8 +132,13 @@ fn main() -> io::Result<()> {
                 if (args[i] == "-t" || args[i] == "-L") && i + 1 < args.len() {
                     i += 2; // skip flag and its value
                     continue;
+                } else if args[i] == "-h" || args[i] == "--help"
+                       || args[i] == "-V" || args[i] == "--version" {
+                    // Treat help/version flags as the subcommand itself
+                    found_subcommand = true;
+                    // fall through to push
                 } else if args[i].starts_with('-') {
-                    i += 1; // skip single global flags (e.g. -v, -V)
+                    i += 1; // skip single global flags (e.g. -v)
                     continue;
                 } else {
                     found_subcommand = true;
