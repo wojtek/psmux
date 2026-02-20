@@ -808,6 +808,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     KeyCode::Enter => { let _ = pty.master.write_all(b"\r"); }
                     KeyCode::Backspace => { let _ = pty.master.write_all(b"\x7f"); }
                     KeyCode::Tab => { let _ = pty.master.write_all(b"\t"); }
+                    KeyCode::BackTab => { let _ = pty.master.write_all(b"\x1b[Z"); }
                     KeyCode::Up => { let _ = pty.master.write_all(b"\x1b[A"); }
                     KeyCode::Down => { let _ = pty.master.write_all(b"\x1b[B"); }
                     KeyCode::Right => { let _ = pty.master.write_all(b"\x1b[C"); }
@@ -1057,6 +1058,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         }
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => b"\x08".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
         KeyCode::Left => b"\x1b[D".to_vec(),
@@ -1615,6 +1617,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         match k {
             "enter" => { let _ = write!(p.master, "\r"); }
             "tab" => { let _ = write!(p.master, "\t"); }
+            "btab" | "backtab" => { let _ = write!(p.master, "\x1b[Z"); }
             "backspace" => { let _ = p.master.write_all(&[0x7F]); }
             "delete" => { let _ = write!(p.master, "\x1b[3~"); }
             "esc" => { let _ = write!(p.master, "\x1b"); }

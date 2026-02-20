@@ -403,8 +403,14 @@ pub fn parse_key_name(name: &str) -> Option<(KeyCode, KeyModifiers)> {
     }
     
     if name.starts_with("S-") {
-        if let Some(c) = name.chars().nth(2) {
-            return Some((KeyCode::Char(c.to_ascii_uppercase()), KeyModifiers::SHIFT));
+        let rest = &name[2..];
+        if rest.eq_ignore_ascii_case("Tab") {
+            return Some((KeyCode::BackTab, KeyModifiers::NONE));
+        }
+        if let Some(c) = rest.chars().next() {
+            if rest.len() == 1 {
+                return Some((KeyCode::Char(c.to_ascii_uppercase()), KeyModifiers::SHIFT));
+            }
         }
     }
     
@@ -524,6 +530,7 @@ pub fn parse_key_string(key: &str) -> Option<(KeyCode, KeyModifiers)> {
         "space" => KeyCode::Char(' '),
         "enter" | "return" => KeyCode::Enter,
         "tab" => KeyCode::Tab,
+        "btab" | "backtab" => KeyCode::BackTab,
         "escape" | "esc" => KeyCode::Esc,
         "backspace" | "bspace" => KeyCode::Backspace,
         "up" => KeyCode::Up,
@@ -589,6 +596,7 @@ pub fn format_key_binding(key: &(KeyCode, KeyModifiers)) -> String {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".to_string(),
         KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "BTab".to_string(),
         KeyCode::Esc => "Escape".to_string(),
         KeyCode::Backspace => "BSpace".to_string(),
         KeyCode::Up => "Up".to_string(),

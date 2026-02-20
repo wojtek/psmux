@@ -958,6 +958,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                 }
                                 KeyCode::Enter => { cmd_batch.push("send-key enter\n".into()); }
                                 KeyCode::Tab => { cmd_batch.push("send-key tab\n".into()); }
+                                KeyCode::BackTab => { cmd_batch.push("send-key btab\n".into()); }
                                 KeyCode::Backspace => { cmd_batch.push("send-key backspace\n".into()); }
                                 KeyCode::Delete => { cmd_batch.push("send-key delete\n".into()); }
                                 KeyCode::Esc => { cmd_batch.push("send-key esc\n".into()); }
