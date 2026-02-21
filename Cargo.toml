@@ -1,6 +1,6 @@
 [package]
 name = "psmux"
-version = "0.3.9"
+version = "0.4.0"
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"
@@ -8,6 +8,18 @@ repository = "https://github.com/marlocarlo/psmux"
 readme = "README.md"
 keywords = ["terminal", "multiplexer", "tmux", "windows", "powershell"]
 categories = ["command-line-utilities"]
+exclude = [
+    "target/",
+    "release/",
+    "tests/",
+    "packages/",
+    "psmux-windows-x86_64/",
+    ".github/",
+    "scripts/",
+    "scoop/",
+    "examples/",
+    "*.txt",
+]
 
 # Windows only
 [target.'cfg(not(windows))'.dependencies]

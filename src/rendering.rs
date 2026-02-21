@@ -35,7 +35,7 @@ pub fn dim_color(c: Color) -> Color {
 }
 
 pub fn dim_predictions_enabled() -> bool {
-    std::env::var("PSMUX_DIM_PREDICTIONS").map(|v| v != "0" && v.to_lowercase() != "false").unwrap_or(true)
+    std::env::var("PSMUX_DIM_PREDICTIONS").map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false)
 }
 
 pub fn apply_cursor_style<W: Write>(out: &mut W) -> io::Result<()> {

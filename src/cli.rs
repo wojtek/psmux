@@ -318,7 +318,7 @@ ENVIRONMENT VARIABLES:
     PSMUX_DEFAULT_SESSION    Fallback default session name
     PSMUX_CURSOR_STYLE       Cursor style (block, underline, bar)
     PSMUX_CURSOR_BLINK       Cursor blinking (1/0)
-    PSMUX_DIM_PREDICTIONS    Prediction dimming (0 to disable)
+    PSMUX_DIM_PREDICTIONS    Prediction dimming (1 to enable)
     TMUX                     Set inside psmux panes (tmux-compatible)
     TMUX_PANE                Current pane ID (e.g. %1)
 

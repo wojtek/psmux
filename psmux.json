@@ -1,12 +1,18 @@
 {
-    "version": "0.3.5",
+    "version": "0.4.0",
     "description": "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal",
     "homepage": "https://github.com/marlocarlo/psmux",
     "license": "MIT",
+    "notes": "For automatic updates, add the bucket: scoop bucket add psmux https://github.com/marlocarlo/scoop-psmux",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/marlocarlo/psmux/releases/download/v0.3.5/psmux-v0.3.5-windows-x64.zip",
-            "hash": "PLACEHOLDER_WILL_BE_COMPUTED_AFTER_RELEASE"
+            "url": "https://github.com/marlocarlo/psmux/releases/download/v0.4.0/psmux-v0.4.0-windows-x64.zip"
+        },
+        "32bit": {
+            "url": "https://github.com/marlocarlo/psmux/releases/download/v0.4.0/psmux-v0.4.0-windows-x86.zip"
+        },
+        "arm64": {
+            "url": "https://github.com/marlocarlo/psmux/releases/download/v0.4.0/psmux-v0.4.0-windows-arm64.zip"
         }
     },
     "bin": [
@@ -21,6 +27,12 @@
         "architecture": {
             "64bit": {
                 "url": "https://github.com/marlocarlo/psmux/releases/download/v$version/psmux-v$version-windows-x64.zip"
+            },
+            "32bit": {
+                "url": "https://github.com/marlocarlo/psmux/releases/download/v$version/psmux-v$version-windows-x86.zip"
+            },
+            "arm64": {
+                "url": "https://github.com/marlocarlo/psmux/releases/download/v$version/psmux-v$version-windows-arm64.zip"
             }
         }
     }

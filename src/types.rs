@@ -310,8 +310,8 @@ impl AppState {
             repeat_time_ms: 500,
             prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
             prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
-                .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(true),
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false),
             drag: None,
             last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
             mouse_enabled: true,

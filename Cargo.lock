@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "psmux"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",

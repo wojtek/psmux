@@ -76,7 +76,8 @@ This installs `psmux`, `pmux`, and `tmux` binaries to your Cargo bin directory.
 ### Using Scoop
 
 ```powershell
-scoop install https://raw.githubusercontent.com/marlocarlo/psmux/master/scoop/psmux.json
+scoop bucket add psmux https://github.com/marlocarlo/scoop-psmux
+scoop install psmux
 ```
 
 ### Using Chocolatey
@@ -472,7 +473,7 @@ psmux split-window -- "C:/Program Files/Git/bin/bash.exe"
 | `default-shell` | Str | `pwsh` | Shell to launch |
 | `default-command` | Str | | Alias for default-shell |
 | `word-separators` | Str | `" -_@"` | Copy-mode word delimiters |
-| `prediction-dimming` | Bool | `on` | Dim predictive text |
+| `prediction-dimming` | Bool | `off` | Dim predictive text |
 | `cursor-style` | Str | | `block`, `underline`, or `bar` |
 | `cursor-blink` | Bool | `off` | Cursor blinking |
 | `bell-action` | Str | `any` | `any`, `none`, `current`, `other` |
@@ -507,33 +508,33 @@ Colours: `default`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`
 # Default session name used when not explicitly provided
 $env:PSMUX_DEFAULT_SESSION = "work"
 
-# Disable prediction dimming (useful for apps like Neovim)
-$env:PSMUX_DIM_PREDICTIONS = "0"
+# Enable prediction dimming (off by default; dims predictive/speculative text)
+$env:PSMUX_DIM_PREDICTIONS = "1"
 
 # These are set INSIDE psmux panes (tmux-compatible):
 # TMUX       — socket path and server info
 # TMUX_PANE  — current pane ID (%0, %1, etc.)
 ```
 
-### Neovim Rendering Workaround
+### Prediction Dimming
 
-If Neovim looks slow inside psmux or shows a "shadow" effect until you move the cursor, disable psmux prediction dimming in `~/.psmux.conf`:
+Prediction dimming is off by default. If you want psmux to dim predictive/speculative text (e.g. shell autosuggestions), you can enable it in `~/.psmux.conf`:
 
 ```tmux
-set -g prediction-dimming off
+set -g prediction-dimming on
 ```
 
-You can also disable it for the current shell only:
+You can also enable it for the current shell only:
 
 ```powershell
-$env:PSMUX_DIM_PREDICTIONS = "0"
+$env:PSMUX_DIM_PREDICTIONS = "1"
 psmux
 ```
 
 To make it persistent for new shells:
 
 ```powershell
-setx PSMUX_DIM_PREDICTIONS 0
+setx PSMUX_DIM_PREDICTIONS 1
 ```
 
 ## License
