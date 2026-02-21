@@ -133,7 +133,7 @@ fn main() -> io::Result<()> {
                     i += 2; // skip flag and its value
                     continue;
                 } else if args[i] == "-h" || args[i] == "--help"
-                       || args[i] == "-V" || args[i] == "--version" {
+                       || args[i] == "-V" || args[i] == "-v" || args[i] == "--version" {
                     // Treat help/version flags as the subcommand itself
                     found_subcommand = true;
                     // fall through to push
@@ -165,7 +165,7 @@ fn main() -> io::Result<()> {
             print_help();
             return Ok(());
         }
-        "-V" | "--version" | "version" => {
+        "-V" | "-v" | "--version" | "version" => {
             print_version();
             return Ok(());
         }

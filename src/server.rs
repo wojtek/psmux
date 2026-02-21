@@ -147,17 +147,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Server starts detached with a reasonable default window size
     app.attached_clients = 0;
     load_config(&mut app);
+    // Bind the control listener BEFORE creating the initial window so that
+    // the first pane's $TMUX env var contains the real port (not 0).
+    let (tx, rx) = mpsc::channel::<CtrlReq>();
+    app.control_rx = Some(rx);
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    app.control_port = Some(port);
     // Create initial window with optional command
     if let Some(ref raw_args) = raw_command {
         create_window_raw(&*pty_system, &mut app, raw_args)?;
     } else {
         create_window(&*pty_system, &mut app, initial_command.as_deref())?;
     }
-    let (tx, rx) = mpsc::channel::<CtrlReq>();
-    app.control_rx = Some(rx);
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    app.control_port = Some(port);
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let dir = format!("{}\\.psmux", home);
     let _ = std::fs::create_dir_all(&dir);
