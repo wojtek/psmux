@@ -100,7 +100,7 @@ else { Write-Fail "show-options -v prefix got: '$val'" }
 Write-Test "show-options -v base-index"
 $val = Psmux show-options -v base-index -t feat3 | Out-String
 $val = $val.Trim()
-if ("$val" -eq "1") { Write-Pass "show-options -v base-index = 1" }
+if ("$val" -eq "0") { Write-Pass "show-options -v base-index = 0" }
 else { Write-Fail "show-options -v base-index got: '$val'" }
 
 Write-Test "show-options -v status"

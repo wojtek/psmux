@@ -118,9 +118,9 @@ if ($activeWindows1.Count -eq 1) {
     Write-Fail "Expected 1 active window, got $($activeWindows1.Count)"
 }
 
-# Switch to window 1 via select-window (base-index=1, so windows are 1,2,3)
-Write-Test "select-window 1 updates active flag in dump-state"
-Send-Fire $conn "select-window 1"
+# Switch to window 0 via select-window (base-index=0, so windows are 0,1,2)
+Write-Test "select-window 0 updates active flag in dump-state"
+Send-Fire $conn "select-window 0"
 Start-Sleep -Milliseconds 500
 
 # Get new state
@@ -135,7 +135,7 @@ if ($activeWindows2.Count -eq 1) {
         if ($json2.windows[$i].active) { $activeIdx = $i }
     }
     if ($activeIdx -eq 0) {
-        Write-Pass "Window 1 (array[0]) is now active after select-window 1"
+        Write-Pass "Window 0 (array[0]) is now active after select-window 0"
     } else {
         Write-Fail "Active window is array[$activeIdx], expected array[0] (tab color would be wrong!)"
     }
@@ -143,9 +143,9 @@ if ($activeWindows2.Count -eq 1) {
     Write-Fail "Expected 1 active window after select-window, got $($activeWindows2.Count)"
 }
 
-# Switch to window 2 (array index 1)
-Write-Test "select-window 2 updates active flag"
-Send-Fire $conn "select-window 2"
+# Switch to window 1 (array index 1)
+Write-Test "select-window 1 updates active flag"
+Send-Fire $conn "select-window 1"
 Start-Sleep -Milliseconds 500
 
 $state3 = Get-FreshDump $conn
@@ -155,7 +155,7 @@ for ($i = 0; $i -lt $json3.windows.Count; $i++) {
     if ($json3.windows[$i].active) { $activeIdx3 = $i }
 }
 if ($activeIdx3 -eq 1) {
-    Write-Pass "Window 2 (array[1]) is active after select-window 2"
+    Write-Pass "Window 1 (array[1]) is active after select-window 1"
 } else {
     Write-Fail "Active window is array[$activeIdx3], expected array[1]"
 }

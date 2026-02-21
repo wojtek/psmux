@@ -73,11 +73,21 @@ Start-Sleep -Milliseconds 500
 Start-Sleep -Milliseconds 500
 Wait-ForWindowCount -Session $SESSION_NAME -Binary $PSMUX -Expected 3 | Out-Null
 
+Write-Test "select-window -t 0"
+& $PSMUX select-window -t "${SESSION_NAME}:0" 2>&1 | Out-Null
+Start-Sleep -Milliseconds 500
+$info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
+if ("$info".Trim() -eq "0") {
+    Write-Pass "select-window -t 0 works"
+} else {
+    Write-Fail "select-window -t 0 -- expected window 0, got: $info"
+}
+
 Write-Test "select-window -t 1"
 & $PSMUX select-window -t "${SESSION_NAME}:1" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
-if ($info -match "1") {
+if ("$info".Trim() -eq "1") {
     Write-Pass "select-window -t 1 works"
 } else {
     Write-Fail "select-window -t 1 -- expected window 1, got: $info"
@@ -87,20 +97,10 @@ Write-Test "select-window -t 2"
 & $PSMUX select-window -t "${SESSION_NAME}:2" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
-if ($info -match "2") {
+if ("$info".Trim() -eq "2") {
     Write-Pass "select-window -t 2 works"
 } else {
     Write-Fail "select-window -t 2 -- expected window 2, got: $info"
-}
-
-Write-Test "select-window -t 3"
-& $PSMUX select-window -t "${SESSION_NAME}:3" 2>&1 | Out-Null
-Start-Sleep -Milliseconds 500
-$info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
-if ($info -match "3") {
-    Write-Pass "select-window -t 3 works"
-} else {
-    Write-Fail "select-window -t 3 -- expected window 3, got: $info"
 }
 
 # ==============================================================
@@ -110,51 +110,51 @@ Write-Host "ISSUE #25: last-window TRACKING"
 Write-Host ("=" * 60)
 
 Write-Test "last-window after select-window"
-# Go to window 1
-& $PSMUX select-window -t "${SESSION_NAME}:1" 2>&1 | Out-Null
+# Go to window 0
+& $PSMUX select-window -t "${SESSION_NAME}:0" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
-# Go to window 3
-& $PSMUX select-window -t "${SESSION_NAME}:3" 2>&1 | Out-Null
+# Go to window 2
+& $PSMUX select-window -t "${SESSION_NAME}:2" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
-# last-window should go back to 1
+# last-window should go back to 0
 & $PSMUX last-window -t $SESSION_NAME 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
-if ($info -match "1") {
+if ("$info".Trim() -eq "0") {
     Write-Pass "last-window returns to previous window after select-window"
 } else {
-    Write-Fail "last-window -- expected window 1, got: $info"
+    Write-Fail "last-window -- expected window 0, got: $info"
 }
 
 Write-Test "last-window after next-window"
-# Currently on window 1, go next
+# Currently on window 0, go next
 & $PSMUX next-window -t $SESSION_NAME 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
-# Should be on window 2, last-window should go to 1
+# Should be on window 1, last-window should go to 0
 & $PSMUX last-window -t $SESSION_NAME 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
-if ($info -match "1") {
+if ("$info".Trim() -eq "0") {
     Write-Pass "last-window returns to previous window after next-window"
 } else {
-    Write-Fail "last-window after next-window -- expected window 1, got: $info"
+    Write-Fail "last-window after next-window -- expected window 0, got: $info"
 }
 
 Write-Test "last-window after previous-window"
-# Go to window 3 first
-& $PSMUX select-window -t "${SESSION_NAME}:3" 2>&1 | Out-Null
+# Go to window 2 first
+& $PSMUX select-window -t "${SESSION_NAME}:2" 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
-# previous-window -> window 2
+# previous-window -> window 1
 & $PSMUX previous-window -t $SESSION_NAME 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
-# last-window should go back to 3
+# last-window should go back to 2
 & $PSMUX last-window -t $SESSION_NAME 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
 $info = & $PSMUX display-message -t $SESSION_NAME -p $WIN_FMT 2>&1
-if ($info -match "3") {
+if ("$info".Trim() -eq "2") {
     Write-Pass "last-window returns to previous window after previous-window"
 } else {
-    Write-Fail "last-window after previous-window -- expected window 3, got: $info"
+    Write-Fail "last-window after previous-window -- expected window 2, got: $info"
 }
 
 # ==============================================================

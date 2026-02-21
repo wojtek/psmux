@@ -194,11 +194,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             .map(|mut f| std::io::Write::write_all(&mut f, session_key.as_bytes()));
     }
     
+    // Shared command aliases map — updated by main loop, read by handler threads
+    let shared_aliases: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(app.command_aliases.clone()));
+    let shared_aliases_main = shared_aliases.clone();
+
     thread::spawn(move || {
         for conn in listener.incoming() {
             if let Ok(stream) = conn {
                 let tx = tx.clone();
                 let session_key_clone = session_key.clone();
+                let aliases = shared_aliases.clone();
                 thread::spawn(move || {
                 // Clone stream for writing, original goes into BufReader for reading
                 let mut write_stream = match stream.try_clone() {
@@ -313,8 +319,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     
                     // Use quote-aware parser to preserve arguments with spaces
                     let parsed = parse_command_line(&line);
-                    let cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
-                    let args: Vec<&str> = parsed.iter().skip(1).map(|s| s.as_str()).collect();
+                    let raw_cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
+                    // Check command aliases before normal dispatch
+                    let alias_expanded = if let Ok(map) = aliases.read() {
+                        map.get(raw_cmd).cloned()
+                    } else { None };
+                    let (cmd, args): (&str, Vec<&str>) = if let Some(ref expanded) = alias_expanded {
+                        // Alias expansion: replace command name, keep original args
+                        let expanded_parts: Vec<&str> = expanded.split_whitespace().collect();
+                        let mut all_args: Vec<&str> = expanded_parts[1..].to_vec();
+                        all_args.extend(parsed.iter().skip(1).map(|s| s.as_str()));
+                        (expanded_parts.first().copied().unwrap_or(raw_cmd), all_args)
+                    } else {
+                        (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
+                    };
                 
                 // Parse -t argument from command line (takes precedence over global TARGET)
                 let mut target_win: Option<usize> = global_target_win;
@@ -418,14 +436,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if escape_seqs {
                             let _ = tx.send(CtrlReq::CapturePaneStyled(rtx));
                         } else if s_arg.is_some() || e_arg.is_some() {
-                            let start: Option<u16> = match s_arg {
+                            let start: Option<i32> = match s_arg {
                                 Some("-") => Some(0), // entire scrollback start
-                                Some(v) => v.parse::<u16>().ok(),
+                                Some(v) => v.parse::<i32>().ok(),
                                 None => None,
                             };
-                            let end: Option<u16> = match e_arg {
+                            let end: Option<i32> = match e_arg {
                                 Some("-") => None, // to end of visible
-                                Some(v) => v.parse::<u16>().ok(),
+                                Some(v) => v.parse::<i32>().ok(),
                                 None => None,
                             };
                             let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end));
@@ -611,8 +629,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
                     }
                     "select-window" | "selectw" => {
-                        if let Some(idx) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
+                        let idx = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok())
+                            .or(target_win);
+                        if let Some(idx) = idx {
                             let _ = tx.send(CtrlReq::SelectWindow(idx));
+                        }
+                        if args.iter().any(|a| *a == "-l") {
+                            let _ = tx.send(CtrlReq::LastWindow);
+                        }
+                        if args.iter().any(|a| *a == "-n") {
+                            let _ = tx.send(CtrlReq::NextWindow);
+                        }
+                        if args.iter().any(|a| *a == "-p") {
+                            let _ = tx.send(CtrlReq::PrevWindow);
                         }
                     }
                     "list-panes" | "lsp" => {
@@ -890,8 +919,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if !persistent { break; }
                     }
                     "switch-client" | "switchc" => {
-                        let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let _ = tx.send(CtrlReq::SwitchClient(target));
+                        let has_t_flag = args.windows(2).any(|w| w[0] == "-T");
+                        if has_t_flag {
+                            let table = args.windows(2).find(|w| w[0] == "-T").map(|w| w[1].to_string()).unwrap_or_default();
+                            let _ = tx.send(CtrlReq::SwitchClientTable(table));
+                        } else {
+                            let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                            let _ = tx.send(CtrlReq::SwitchClient(target));
+                        }
                     }
                     "lock-client" => {
                         let _ = tx.send(CtrlReq::LockClient);
@@ -1035,10 +1070,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let shell_cmd = shell_cmd.trim_matches(|c: char| c == '\'' || c == '"').to_string();
                         if !shell_cmd.is_empty() {
                             if background {
-                                let _ = std::process::Command::new("cmd").args(["/C", &shell_cmd]).spawn();
+                                let _ = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", &shell_cmd]).spawn();
                             } else {
-                                let output = std::process::Command::new("cmd")
-                                    .args(["/C", &shell_cmd]).output();
+                                let output = std::process::Command::new("pwsh")
+                                    .args(["-NoProfile", "-Command", &shell_cmd]).output();
                                 if let Ok(out) = output {
                                     let text = String::from_utf8_lossy(&out.stdout);
                                     if !text.is_empty() {
@@ -1065,8 +1100,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let success = if format_mode {
                                 !condition.is_empty() && condition != "0"
                             } else {
-                                std::process::Command::new("cmd")
-                                    .args(["/C", condition])
+                                std::process::Command::new("pwsh")
+                                    .args(["-NoProfile", "-Command", condition])
                                     .stdout(std::process::Stdio::null())
                                     .stderr(std::process::Stdio::null())
                                     .status()
@@ -1174,6 +1209,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let mut cached_windows_json = String::new();
     let mut cached_tree_json = String::new();
     let mut cached_prefix_str = String::new();
+    let mut cached_prefix2_str = String::new();
     let mut cached_base_index: usize = 0;
     let mut cached_pred_dim: bool = false;
     let mut cached_status_style = String::new();
@@ -1213,11 +1249,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     fn get_option_value(app: &AppState, name: &str) -> String {
         match name {
             "prefix" => format_key_binding(&app.prefix_key),
+            "prefix2" => app.prefix2_key.as_ref().map(|k| format_key_binding(k)).unwrap_or_else(|| "none".to_string()),
             "base-index" => app.window_base_index.to_string(),
             "pane-base-index" => app.pane_base_index.to_string(),
             "escape-time" => app.escape_time_ms.to_string(),
             "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
-            "status" => if app.status_visible { "on".into() } else { "off".into() },
+            "status" => {
+                if !app.status_visible { "off".into() }
+                else if app.status_lines >= 2 { app.status_lines.to_string() }
+                else { "on".into() }
+            }
             "status-position" => app.status_position.clone(),
             "status-left" => app.status_left.clone(),
             "status-right" => app.status_right.clone(),
@@ -1259,6 +1300,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             "bell-action" => app.bell_action.clone(),
             "visual-bell" => if app.visual_bell { "on".into() } else { "off".into() },
             "monitor-silence" => app.monitor_silence.to_string(),
+            "status-left-length" => app.status_left_length.to_string(),
+            "status-right-length" => app.status_right_length.to_string(),
+            "window-size" => app.window_size.clone(),
+            "allow-passthrough" => app.allow_passthrough.clone(),
+            "copy-command" => app.copy_command.clone(),
+            "set-clipboard" => app.set_clipboard.clone(),
+            "main-pane-width" => app.main_pane_width.to_string(),
+            "main-pane-height" => app.main_pane_height.to_string(),
+            "command-alias" => {
+                app.command_aliases.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
             _ => {
                 // Support @user-options (stored in environment)
                 if name.starts_with('@') {
@@ -1401,16 +1456,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
                 CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); meta_dirty = true; }
                 CtrlReq::SessionInfo(resp) => {
-                    let attached = if app.attached_clients > 0 { "(attached)" } else { "(detached)" };
+                    let attached = if app.attached_clients > 0 { " (attached)" } else { "" };
                     let windows = app.windows.len();
-                    let (w,h) = {
-                        let win = &mut app.windows[app.active_idx];
-                        let mut size = (0,0);
-                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { size = (p.last_cols as i32, p.last_rows as i32); }
-                        size
-                    };
                     let created = app.created_at.format("%a %b %e %H:%M:%S %Y");
-                    let line = format!("{}: {} windows (created {}) [{}x{}] {}\n", app.session_name, windows, created, w, h, attached);
+                    let line = format!("{}: {} windows (created {}){}\n", app.session_name, windows, created, attached);
                     let _ = resp.send(line);
                 }
                 CtrlReq::ClientAttach => { app.attached_clients = app.attached_clients.saturating_add(1); hook_event = Some("client-attached"); }
@@ -1464,6 +1513,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         cached_windows_json = list_windows_json_with_tabs(&app)?;
                         cached_tree_json = list_tree_json(&app)?;
                         cached_prefix_str = format_key_binding(&app.prefix_key);
+                        cached_prefix2_str = app.prefix2_key.as_ref().map(|k| format_key_binding(k)).unwrap_or_default();
                         cached_base_index = app.window_base_index;
                         cached_pred_dim = app.prediction_dimming;
                         cached_status_style = app.status_style.clone();
@@ -1484,10 +1534,23 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let wss_escaped = json_escape_string(&app.window_status_separator);
                     let ws_style_escaped = json_escape_string(&app.window_status_style);
                     let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
+                    // Build status_format JSON array for multi-line status bar
+                    let status_format_json = {
+                        let mut sf = String::from("[");
+                        for (i, fmt_str) in app.status_format.iter().enumerate() {
+                            if i > 0 { sf.push(','); }
+                            sf.push('"');
+                            sf.push_str(&json_escape_string(&expand_format(fmt_str, &app)));
+                            sf.push('"');
+                        }
+                        sf.push(']');
+                        sf
+                    };
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{}}}",
-                        layout_json, cached_windows_json, cached_prefix_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{}}}",
+                        layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
+                        app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
                     ));
                     cached_dump_state.clear();
                     cached_dump_state.push_str(&combined_buf);
@@ -1740,8 +1803,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             if !pipe_cmd.is_empty() {
                                 if let Some(text) = app.paste_buffers.first().cloned() {
                                     // Pipe yanked text to the command's stdin
-                                    if let Ok(mut child) = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-                                        .args(if cfg!(windows) { vec!["/C", pipe_cmd] } else { vec!["-c", pipe_cmd] })
+                                    if let Ok(mut child) = std::process::Command::new(if cfg!(windows) { "pwsh" } else { "sh" })
+                                        .args(if cfg!(windows) { vec!["-NoProfile", "-Command", pipe_cmd] } else { vec!["-c", pipe_cmd] })
                                         .stdin(std::process::Stdio::piped())
                                         .stdout(std::process::Stdio::null())
                                         .stderr(std::process::Stdio::null())
@@ -1949,8 +2012,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     let mut panes = Vec::new();
                     collect_panes(&win.root, &mut panes);
-                    for (_i, (id, cols, rows, mode, enc, alt)) in panes.iter().enumerate() {
-                        output.push_str(&format!("%{}: [{}x{}] mouse={:?}/{:?} alt={}\n", id, cols, rows, mode, enc, alt));
+                    let active_pane_id = crate::tree::get_active_pane_id(&win.root, &win.active_path);
+                    for (pos, (id, cols, rows, _mode, _enc, _alt)) in panes.iter().enumerate() {
+                        let idx = pos + app.pane_base_index;
+                        let active_marker = if active_pane_id == Some(*id) { " (active)" } else { "" };
+                        output.push_str(&format!("{}: [{}x{}] [history {}/{}, 0 bytes] %{}{}\n", idx, cols, rows, app.history_limit, app.history_limit, id, active_marker));
                     }
                     let _ = resp.send(output);
                 }
@@ -1998,6 +2064,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     for win in app.windows.iter_mut() {
                         kill_all_children(&mut win.root);
                     }
+                    // Brief delay to let child processes fully terminate
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
@@ -2062,10 +2130,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::ListBuffersFormat(resp, fmt) => {
                     let mut output = Vec::new();
                     for (i, _buf) in app.paste_buffers.iter().enumerate() {
-                        // Each buffer expands using the same format string
-                        // For now, expand with buffer_name/buffer_size from the current app state
-                        let _ = i; // buffer index context
+                        set_buffer_idx_override(Some(i));
                         output.push(expand_format(&fmt, &app));
+                        set_buffer_idx_override(None);
                     }
                     let _ = resp.send(output.join("\n"));
                 }
@@ -2246,18 +2313,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         for bind in binds {
                             let key_str = format_key_binding(&bind.key);
                             let action_str = format_action(&bind.action);
-                            output.push_str(&format!("bind-key -T {} {} {}\n", table_name, key_str, action_str));
+                            let repeat_flag = if bind.repeat { " -r" } else { "" };
+                            output.push_str(&format!("bind-key{} -T {} {} {}\n", repeat_flag, table_name, key_str, action_str));
                         }
                     }
                     let _ = resp.send(output);
                 }
                 CtrlReq::SetOption(option, value) => {
                     apply_set_option(&mut app, &option, &value, false);
+                    // Update shared aliases if command-alias changed
+                    if option == "command-alias" {
+                        if let Ok(mut map) = shared_aliases_main.write() {
+                            *map = app.command_aliases.clone();
+                        }
+                    }
                     meta_dirty = true;
                     state_dirty = true;
                 }
                 CtrlReq::SetOptionQuiet(option, value, quiet) => {
                     apply_set_option(&mut app, &option, &value, quiet);
+                    // Update shared aliases if command-alias changed
+                    if option == "command-alias" {
+                        if let Ok(mut map) = shared_aliases_main.write() {
+                            *map = app.command_aliases.clone();
+                        }
+                    }
                     meta_dirty = true;
                     state_dirty = true;
                 }
@@ -2312,6 +2392,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::ShowOptions(resp) => {
                     let mut output = String::new();
                     output.push_str(&format!("prefix {}\n", format_key_binding(&app.prefix_key)));
+                    if let Some(ref p2) = app.prefix2_key {
+                        output.push_str(&format!("prefix2 {}\n", format_key_binding(p2)));
+                    }
                     output.push_str(&format!("base-index {}\n", app.window_base_index));
                     output.push_str(&format!("pane-base-index {}\n", app.pane_base_index));
                     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
@@ -2386,6 +2469,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if key.starts_with('@') {
                             output.push_str(&format!("{} \"{}\"\n", key, val));
                         }
+                    }
+                    // New options
+                    output.push_str(&format!("main-pane-width {}\n", app.main_pane_width));
+                    output.push_str(&format!("main-pane-height {}\n", app.main_pane_height));
+                    output.push_str(&format!("status-left-length {}\n", app.status_left_length));
+                    output.push_str(&format!("status-right-length {}\n", app.status_right_length));
+                    output.push_str(&format!("window-size {}\n", app.window_size));
+                    output.push_str(&format!("allow-passthrough {}\n", app.allow_passthrough));
+                    output.push_str(&format!("set-clipboard {}\n", app.set_clipboard));
+                    if !app.copy_command.is_empty() {
+                        output.push_str(&format!("copy-command \"{}\"\n", app.copy_command));
+                    }
+                    for (alias, expansion) in &app.command_aliases {
+                        output.push_str(&format!("command-alias \"{}={}\"\n", alias, expansion));
                     }
                     let _ = resp.send(output);
                 }
@@ -2493,8 +2590,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             app.pipe_panes.remove(idx);
                         } else {
                             #[cfg(windows)]
-                            let process = std::process::Command::new("cmd")
-                                .args(["/C", &cmd])
+                            let process = std::process::Command::new("pwsh")
+                                .args(["-NoProfile", "-Command", &cmd])
                                 .stdin(if stdout { std::process::Stdio::piped() } else { std::process::Stdio::null() })
                                 .stdout(if stdin { std::process::Stdio::piped() } else { std::process::Stdio::null() })
                                 .stderr(std::process::Stdio::null())
@@ -2512,9 +2609,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SelectLayout(layout) => {
                     apply_layout(&mut app, &layout);
+                    state_dirty = true;
                 }
                 CtrlReq::NextLayout => {
                     cycle_layout(&mut app);
+                    state_dirty = true;
                 }
                 CtrlReq::ListClients(resp) => {
                     let mut output = String::new();
@@ -2527,6 +2626,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::SwitchClient(_target) => {}
+                CtrlReq::SwitchClientTable(table) => {
+                    app.current_key_table = Some(table);
+                    state_dirty = true;
+                }
+                CtrlReq::ListCommands(resp) => {
+                    let cmds = TMUX_COMMANDS.join("\n");
+                    let _ = resp.send(cmds);
+                }
                 CtrlReq::LockClient => {}
                 CtrlReq::RefreshClient => { state_dirty = true; meta_dirty = true; }
                 CtrlReq::SuspendClient => {}
@@ -2596,6 +2703,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     for win in app.windows.iter_mut() {
                         kill_all_children(&mut win.root);
                     }
+                    // Brief delay to let child processes fully terminate
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
@@ -2650,8 +2759,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             .and_then(|pty_sys| {
                                 let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                                 let pair = pty_sys.openpty(pty_size).ok()?;
-                                let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "cmd" } else { "sh" });
-                                if cfg!(windows) { cmd_builder.args(["/C", &command]); } else { cmd_builder.args(["-c", &command]); }
+                                let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                                if cfg!(windows) { cmd_builder.args(["-NoProfile", "-Command", &command]); } else { cmd_builder.args(["-c", &command]); }
                                 let child = pair.slave.spawn_command(cmd_builder).ok()?;
                                 // Close the slave handle immediately – required for ConPTY.
                                 drop(pair.slave);
@@ -2754,22 +2863,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::PrevLayout => {
-                    // Cycle layouts in reverse using the same logic as cycle_layout/NextLayout
-                    static LAYOUTS: [&str; 5] = ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
-                    let win = &app.windows[app.active_idx];
-                    let current_idx = match &win.root {
-                        Node::Leaf(_) => 0,
-                        Node::Split { kind, sizes, .. } => {
-                            if sizes.is_empty() { 0 }
-                            else if sizes.iter().all(|s| *s == sizes[0]) {
-                                match kind { LayoutKind::Horizontal => 0, LayoutKind::Vertical => 1 }
-                            } else if sizes.len() >= 2 && sizes[0] > sizes[1] {
-                                match kind { LayoutKind::Vertical => 2, LayoutKind::Horizontal => 3 }
-                            } else { 4 }
-                        }
-                    };
-                    let prev_idx = (current_idx + LAYOUTS.len() - 1) % LAYOUTS.len();
-                    apply_layout(&mut app, LAYOUTS[prev_idx]);
+                    cycle_layout_reverse(&mut app);
                     state_dirty = true;
                 }
                 CtrlReq::FocusIn => {
@@ -2856,9 +2950,11 @@ fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) 
     match option {
         "status-left" => { app.status_left = value.to_string(); }
         "status-right" => { app.status_right = value.to_string(); }
-        "status-left-length" | "status-right-length" => {
-            // Store for format truncation (tmux-compatible)
-            app.environment.insert(format!("@{}", option), value.to_string());
+        "status-left-length" => {
+            if let Ok(n) = value.parse::<usize>() { app.status_left_length = n; }
+        }
+        "status-right-length" => {
+            if let Ok(n) = value.parse::<usize>() { app.status_right_length = n; }
         }
         "base-index" => {
             if let Ok(idx) = value.parse::<usize>() {
@@ -2874,6 +2970,13 @@ fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) 
         "prefix" => {
             if let Some(kc) = crate::config::parse_key_string(value) {
                 app.prefix_key = kc;
+            }
+        }
+        "prefix2" => {
+            if value.eq_ignore_ascii_case("none") || value.is_empty() {
+                app.prefix2_key = None;
+            } else if let Some(kc) = crate::config::parse_key_string(value) {
+                app.prefix2_key = Some(kc);
             }
         }
         "escape-time" => {
@@ -2902,7 +3005,24 @@ fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) 
             }
         }
         "mode-keys" => { app.mode_keys = value.to_string(); }
-        "status" => { app.status_visible = matches!(value, "on" | "true" | "1" | "2"); }
+        "status" => {
+            // Handle numeric values for multi-line status bar (tmux 3.2+)
+            if let Ok(n) = value.parse::<usize>() {
+                if n >= 2 {
+                    app.status_visible = true;
+                    app.status_lines = n;
+                } else if n == 1 {
+                    app.status_visible = true;
+                    app.status_lines = 1;
+                } else {
+                    app.status_visible = false;
+                    app.status_lines = 1;
+                }
+            } else {
+                app.status_visible = matches!(value, "on" | "true");
+                app.status_lines = 1;
+            }
+        }
         "status-position" => { app.status_position = value.to_string(); }
         "status-style" => { app.status_style = value.to_string(); }
         // Deprecated but ubiquitous: map status-bg/status-fg to status-style
@@ -2973,10 +3093,35 @@ fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) 
         "status-interval" => {
             if let Ok(n) = value.parse::<u64>() { app.status_interval = n; }
         }
-        "main-pane-width" | "main-pane-height" => {
-            app.environment.insert(format!("@{}", option), value.to_string());
+        "main-pane-width" => {
+            if let Ok(n) = value.parse::<u16>() { app.main_pane_width = n; }
+        }
+        "main-pane-height" => {
+            if let Ok(n) = value.parse::<u16>() { app.main_pane_height = n; }
+        }
+        "window-size" => { app.window_size = value.to_string(); }
+        "allow-passthrough" => { app.allow_passthrough = value.to_string(); }
+        "copy-command" => { app.copy_command = value.to_string(); }
+        "set-clipboard" => { app.set_clipboard = value.to_string(); }
+        "command-alias" => {
+            // Format: "alias=expansion" e.g. "splitp=split-window"
+            if let Some(pos) = value.find('=') {
+                let alias = value[..pos].trim().to_string();
+                let expansion = value[pos+1..].trim().to_string();
+                app.command_aliases.insert(alias, expansion);
+            }
         }
         _ => {
+            // Handle status-format[N] patterns
+            if option.starts_with("status-format[") && option.ends_with(']') {
+                if let Ok(idx) = option["status-format[".len()..option.len()-1].parse::<usize>() {
+                    while app.status_format.len() <= idx {
+                        app.status_format.push(String::new());
+                    }
+                    app.status_format[idx] = value.to_string();
+                    return;
+                }
+            }
             // Store @user-options (used by plugins like tmux-resurrect, tmux-continuum)
             if option.starts_with('@') {
                 app.environment.insert(option.to_string(), value.to_string());

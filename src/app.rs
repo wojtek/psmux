@@ -81,8 +81,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 let mut target_win: Option<usize> = global_target_win;
                 let mut target_pane: Option<usize> = global_target_pane;
                 let mut pane_is_id = global_pane_is_id;
-                let mut start_line: Option<u16> = None;
-                let mut end_line: Option<u16> = None;
+                let mut start_line: Option<i32> = None;
+                let mut end_line: Option<i32> = None;
                 let mut i = 0;
                 while i < args.len() {
                     if args[i] == "-t" {
@@ -97,10 +97,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         }
                         i += 2; continue;
                     } else if args[i] == "-S" {
-                        if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<u16>() { start_line = Some(n); } }
+                        if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<i32>() { start_line = Some(n); } }
                         i += 2; continue;
                     } else if args[i] == "-E" {
-                        if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<u16>() { end_line = Some(n); } }
+                        if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<i32>() { end_line = Some(n); } }
                         i += 2; continue;
                     }
                     i += 1;
@@ -660,6 +660,18 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::SetPaneTitle(title) => {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { p.title = title; }
+                }
+                CtrlReq::KillServer | CtrlReq::KillSession => {
+                    // Kill all child processes and exit
+                    for win in app.windows.iter_mut() {
+                        kill_all_children(&mut win.root);
+                    }
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let regpath = format!("{}/.psmux/{}.port", home, app.port_file_base());
+                    let keypath = format!("{}/.psmux/{}.key", home, app.port_file_base());
+                    let _ = std::fs::remove_file(&regpath);
+                    let _ = std::fs::remove_file(&keypath);
+                    std::process::exit(0);
                 }
                 // For attach mode, we just ignore the new commands - they're handled by the server
                 _ => {}

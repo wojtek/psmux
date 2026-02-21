@@ -183,7 +183,8 @@ fn main() -> io::Result<()> {
             let psmux_dir = format!("{}\\.psmux", home);
             // Compute namespace prefix for -L filtering (matches list-sessions behavior)
             let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
-            let mut sessions_killed = 0;
+            let mut streams: Vec<std::net::TcpStream> = Vec::new();
+            let mut stale_ports: Vec<std::path::PathBuf> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -199,23 +200,57 @@ fn main() -> io::Result<()> {
                                 if let Ok(port) = port_str.trim().parse::<u16>() {
                                     let addr = format!("127.0.0.1:{}", port);
                                     let sess_key = read_session_key(session_name).unwrap_or_default();
-                                    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+                                    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                                        &addr.parse().unwrap(),
+                                        Duration::from_millis(1000),
+                                    ) {
+                                        let _ = stream.set_nodelay(true);
                                         let _ = write!(stream, "AUTH {}\n", sess_key);
+                                        let _ = stream.flush();
                                         let _ = std::io::Write::write_all(&mut stream, b"kill-server\n");
-                                        sessions_killed += 1;
+                                        let _ = stream.flush();
+                                        // Shutdown write half to signal we're done sending.
+                                        // Keep read half open to detect server exit.
+                                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                                        streams.push(stream);
                                     } else {
-                                        let _ = std::fs::remove_file(&path);
+                                        // Server not reachable — stale port file
+                                        stale_ports.push(path.clone());
                                     }
                                 }
                             } else {
-                                let _ = std::fs::remove_file(&path);
+                                stale_ports.push(path.clone());
                             }
                         }
                     }
                 }
             }
-            if sessions_killed > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            // Wait for each server to exit (connection close = server exited)
+            for mut stream in streams {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+                let mut buf = [0u8; 64];
+                // Read until EOF or error — server closing connection means it processed kill-server
+                loop {
+                    match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(0) => break,  // EOF — server closed connection
+                        Err(_) => break, // timeout or error
+                        Ok(_) => continue, // drain any response
+                    }
+                }
+            }
+            // Clean up stale port/key files
+            for path in &stale_ports {
+                let _ = std::fs::remove_file(path);
+                // Also remove the corresponding .key file
+                let key_path = path.with_extension("key");
+                let _ = std::fs::remove_file(&key_path);
+            }
+            // Brief sleep then verify no processes remain; if any do, force-kill them.
+            // Only do the nuclear fallback when not using -L namespace filtering,
+            // because with -L we should only kill sessions in that namespace.
+            std::thread::sleep(Duration::from_millis(300));
+            if ns_prefix.is_none() {
+                kill_remaining_server_processes();
             }
             return Ok(());
         }
@@ -303,36 +338,70 @@ fn main() -> io::Result<()> {
                 return run_server(name, server_socket_name, initial_cmd, raw_cmd);
             }
             "new-session" | "new" => {
-                let name = cmd_args.iter().position(|a| *a == "-s").and_then(|i| cmd_args.get(i+1)).map(|s| s.to_string())
-                    .unwrap_or_else(|| "default".to_string());
+                // Strict getopt-style parsing for new-session flags.
+                // tmux template: "Ac:dDe:EF:f:n:Ps:t:x:Xy:"
+                // Flags that take a value (letter followed by ':'):
+                //   -s (session name), -n (window name), -F (format),
+                //   -c (start dir), -x (width), -y (height), -e (env),
+                //   -f (client flags), -t (target session)
+                // Boolean flags: -A, -d, -D, -E, -P, -X
+                let mut session_name: Option<String> = None;
+                let mut detached = false;
+                let mut print_info = false;
+                let mut format_str: Option<String> = None;
+                let mut _window_name: Option<String> = None;
+                let mut _start_dir: Option<String> = None;
+                let mut _attach_if_exists = false;
+                let mut positional_args: Vec<String> = Vec::new();
+                let mut raw_cmd_after_dd: Option<Vec<String>> = None;
+
+                {
+                    let mut i = 1; // skip command name (cmd_args[0])
+                    while i < cmd_args.len() {
+                        let a = cmd_args[i].as_str();
+                        if a == "--" {
+                            // Everything after -- is raw command
+                            raw_cmd_after_dd = Some(cmd_args[i+1..].iter().map(|s| s.to_string()).collect());
+                            break;
+                        }
+                        match a {
+                            // Flags that consume the next argument (strict getopt:
+                            // always consume, even if it looks like a flag)
+                            "-s" => { i += 1; if i < cmd_args.len() { session_name = Some(cmd_args[i].to_string()); } }
+                            "-n" => { i += 1; if i < cmd_args.len() { _window_name = Some(cmd_args[i].to_string()); } }
+                            "-F" => { i += 1; if i < cmd_args.len() { format_str = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-c" => { i += 1; if i < cmd_args.len() { _start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-x" | "-y" | "-e" | "-f" | "-t" => { i += 1; /* skip value, not used yet */ }
+                            // Boolean flags
+                            "-d" => { detached = true; }
+                            "-P" => { print_info = true; }
+                            "-A" => { _attach_if_exists = true; }
+                            "-D" | "-E" | "-X" => { /* ignored for compatibility */ }
+                            _ if a.starts_with('-') => { /* unknown flag, skip */ }
+                            _ => {
+                                // Positional argument — collect it and everything after
+                                positional_args.extend(cmd_args[i..].iter().map(|s| s.to_string()));
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+
+                let name = session_name.unwrap_or_else(|| "default".to_string());
                 // Compute port file base name: with -L namespace prefix if specified
                 let port_file_base = if let Some(ref l) = l_socket_name {
                     format!("{}__{}", l, name)
                 } else {
                     name.clone()
                 };
-                let detached = cmd_args.iter().any(|a| *a == "-d");
-                let print_info = cmd_args.iter().any(|a| *a == "-P");
-                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
                 // Check for -- separator: everything after it is a raw command (direct execution)
-                let dash_dash_pos = cmd_args.iter().position(|a| *a == "--");
-                let raw_cmd_args: Option<Vec<String>> = dash_dash_pos.map(|pos| {
-                    cmd_args.iter().skip(pos + 1).map(|s| s.to_string()).collect()
-                }).filter(|v: &Vec<String>| !v.is_empty());
-                // Parse initial command - look for trailing arguments after all flags (legacy mode, no --)
-                // cmd_args[0] is the command name, so we skip it
-                let initial_cmd: Option<String> = if raw_cmd_args.is_some() { None } else {
-                    let mut skip_next = false;
-                    let mut cmd_parts: Vec<&str> = Vec::new();
-                    for (i, arg) in cmd_args.iter().enumerate().skip(1) { // Skip command name
-                        if skip_next { skip_next = false; continue; }
-                        if *arg == "-s" || *arg == "-t" || *arg == "-F" { skip_next = true; continue; }
-                        if arg.starts_with('-') { continue; }
-                        // This arg and all following are the command
-                        cmd_parts.extend(cmd_args.iter().skip(i).map(|s| s.as_str()));
-                        break;
-                    }
-                    if cmd_parts.is_empty() { None } else { Some(cmd_parts.join(" ")) }
+                let raw_cmd_args: Option<Vec<String>> = raw_cmd_after_dd.filter(|v| !v.is_empty());
+                // Parse initial command from positional args (legacy mode, no --)
+                let initial_cmd: Option<String> = if raw_cmd_args.is_some() || positional_args.is_empty() {
+                    None
+                } else {
+                    Some(positional_args.join(" "))
                 };
                 
                 // Check if session already exists AND is actually running
@@ -422,6 +491,29 @@ fn main() -> io::Result<()> {
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
+
+                // Verify the server is actually alive (it might have died immediately
+                // if the initial command was invalid)
+                if !std::path::Path::new(&port_path).exists() {
+                    eprintln!("psmux: failed to create session '{}'", name);
+                    std::process::exit(1);
+                }
+                {
+                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
+                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                            let addr = format!("127.0.0.1:{}", port);
+                            std::net::TcpStream::connect_timeout(
+                                &addr.parse().unwrap(),
+                                Duration::from_millis(500)
+                            ).is_ok()
+                        } else { false }
+                    } else { false };
+                    if !server_alive {
+                        let _ = std::fs::remove_file(&port_path);
+                        eprintln!("psmux: session '{}' exited immediately (check shell command)", name);
+                        std::process::exit(1);
+                    }
+                }
                 
                 if detached {
                     // If -P flag, print pane info before returning
@@ -451,22 +543,35 @@ fn main() -> io::Result<()> {
                 }
             }
             "new-window" | "neww" => {
-                // Parse -n name flag
-                let name_arg: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
-                let detached = cmd_args.iter().any(|a| *a == "-d");
-                let print_info = cmd_args.iter().any(|a| *a == "-P");
-                // Parse -F format string
-                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
-                // Parse -c start_dir flag
-                let start_dir: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-                // Parse command — first non-flag argument, excluding -n/-t/-c/-F values
-                let cmd_arg = cmd_args.iter().skip(1)
-                    .filter(|a| !a.starts_with('-'))
-                    .find(|a| {
-                        // Exclude values of -n, -t, -c, -F flags
-                        !cmd_args.windows(2).any(|w| (w[0] == "-n" || w[0] == "-t" || w[0] == "-c" || w[0] == "-F") && w[1] == **a)
-                    })
-                    .map(|s| s.as_str()).unwrap_or("");
+                // Strict getopt-style parsing for new-window flags.
+                // tmux template: "ac:dDe:F:kn:Pt:S:"
+                let mut name_arg: Option<String> = None;
+                let mut detached = false;
+                let mut print_info = false;
+                let mut format_str: Option<String> = None;
+                let mut start_dir: Option<String> = None;
+                let mut nw_positional: Vec<String> = Vec::new();
+                {
+                    let mut i = 1;
+                    while i < cmd_args.len() {
+                        let a = cmd_args[i].as_str();
+                        if a == "--" { nw_positional.extend(cmd_args[i+1..].iter().map(|s| s.to_string())); break; }
+                        match a {
+                            "-n" => { i += 1; if i < cmd_args.len() { name_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-F" => { i += 1; if i < cmd_args.len() { format_str = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-c" => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-t" | "-e" | "-S" => { i += 1; /* skip value */ }
+                            "-d" => { detached = true; }
+                            "-P" => { print_info = true; }
+                            "-a" | "-D" | "-k" => { /* ignored for compatibility */ }
+                            _ if a.starts_with('-') => { /* unknown flag, skip */ }
+                            _ => { nw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
+                        }
+                        i += 1;
+                    }
+                }
+                let cmd_arg = nw_positional.join(" ");
+                let cmd_arg = cmd_arg.as_str();
                 let mut cmd_line = "new-window".to_string();
                 if detached { cmd_line.push_str(" -d"); }
                 if print_info { cmd_line.push_str(" -P"); }
@@ -492,18 +597,38 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "split-window" | "splitw" => {
-                let flag = if cmd_args.iter().any(|a| *a == "-h") { "-h" } else { "-v" };
-                let detached = cmd_args.iter().any(|a| *a == "-d");
-                let print_info = cmd_args.iter().any(|a| *a == "-P");
-                // Parse -F format string
-                let format_str: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-F").map(|w| w[1].trim_matches('"').to_string());
-                // Parse -c start_dir, -p percentage, -l percentage flags
-                let start_dir: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].trim_matches('"').to_string());
-                let size_pct: Option<String> = cmd_args.windows(2).find(|w| w[0] == "-p" || w[0] == "-l").map(|w| w[1].to_string());
-                // Parse command after flags (first non-flag argument, skipping command name at cmd_args[0])
-                let cmd_arg = cmd_args.iter().skip(1)
-                    .find(|a| !a.starts_with('-') && !cmd_args.windows(2).any(|w| (w[0] == "-c" || w[0] == "-p" || w[0] == "-l" || w[0] == "-F") && w[1] == **a))
-                    .map(|s| s.as_str()).unwrap_or("");
+                // Strict getopt-style parsing for split-window flags.
+                // tmux template: "bc:de:F:fhIl:p:Pt:vZ"
+                let mut flag = "-v";
+                let mut detached = false;
+                let mut print_info = false;
+                let mut format_str: Option<String> = None;
+                let mut start_dir: Option<String> = None;
+                let mut size_pct: Option<String> = None;
+                let mut sw_positional: Vec<String> = Vec::new();
+                {
+                    let mut i = 1;
+                    while i < cmd_args.len() {
+                        let a = cmd_args[i].as_str();
+                        if a == "--" { sw_positional.extend(cmd_args[i+1..].iter().map(|s| s.to_string())); break; }
+                        match a {
+                            "-F" => { i += 1; if i < cmd_args.len() { format_str = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-c" => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-p" | "-l" => { i += 1; if i < cmd_args.len() { size_pct = Some(cmd_args[i].to_string()); } }
+                            "-t" | "-e" => { i += 1; /* skip value */ }
+                            "-h" => { flag = "-h"; }
+                            "-v" => { flag = "-v"; }
+                            "-d" => { detached = true; }
+                            "-P" => { print_info = true; }
+                            "-b" | "-f" | "-I" | "-Z" => { /* ignored for compatibility */ }
+                            _ if a.starts_with('-') => { /* unknown flag, skip */ }
+                            _ => { sw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
+                        }
+                        i += 1;
+                    }
+                }
+                let cmd_arg = sw_positional.join(" ");
+                let cmd_arg = cmd_arg.as_str();
                 let mut cmd_line = format!("split-window {}", flag);
                 if detached { cmd_line.push_str(" -d"); }
                 if print_info { cmd_line.push_str(" -P"); }
@@ -575,14 +700,17 @@ fn main() -> io::Result<()> {
             "send-keys" | "send" | "send-key" => {
                 let mut literal = false;
                 let mut keys: Vec<String> = Vec::new();
-                // Skip the command itself (index 0 in cmd_args), start at index 1
-                for i in 1..cmd_args.len() {
+                // Getopt-style parsing: -t consumes next arg, -l/-R are boolean
+                let mut i = 1;
+                while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
                         "-l" => { literal = true; }
                         "-R" => { keys.push("__RESET__".to_string()); }
-                        "-t" => { } // already handled
+                        "-t" => { i += 1; } // consume target value (already handled globally)
+                        "-N" => { i += 1; } // repeat count, consume value
                         _ => { keys.push(cmd_args[i].to_string()); }
                     }
+                    i += 1;
                 }
                 let mut cmd = "send-keys".to_string();
                 if literal { cmd.push_str(" -l"); }
@@ -972,7 +1100,27 @@ fn main() -> io::Result<()> {
             }
             // list-buffers - List paste buffers
             "list-buffers" | "lsb" => {
-                let resp = send_control_with_response("list-buffers\n".to_string())?;
+                let mut format_str: Option<String> = None;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "-F" => {
+                            if let Some(f) = cmd_args.get(i + 1) {
+                                format_str = Some(f.to_string());
+                                i += 1;
+                            }
+                        }
+                        "-t" => { i += 1; } // skip target
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let cmd = if let Some(fmt) = format_str {
+                    format!("list-buffers -F {}\n", fmt)
+                } else {
+                    "list-buffers\n".to_string()
+                };
+                let resp = send_control_with_response(cmd)?;
                 print!("{}", resp);
                 return Ok(());
             }
@@ -1071,15 +1219,15 @@ fn main() -> io::Result<()> {
                 if background {
                     #[cfg(windows)]
                     {
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/C", &shell_cmd])
+                        let _ = std::process::Command::new("pwsh")
+                            .args(["-NoProfile", "-Command", &shell_cmd])
                             .spawn();
                     }
                 } else {
                     #[cfg(windows)]
                     {
-                        let output = std::process::Command::new("cmd")
-                            .args(["/C", &shell_cmd])
+                        let output = std::process::Command::new("pwsh")
+                            .args(["-NoProfile", "-Command", &shell_cmd])
                             .output()?;
                         io::stdout().write_all(&output.stdout)?;
                         io::stderr().write_all(&output.stderr)?;
@@ -1133,8 +1281,8 @@ fn main() -> io::Result<()> {
             "rotate-window" | "rotatew" => {
                 let mut cmd = "rotate-window".to_string();
                 let mut i = 1;
-                while i < args.len() {
-                    match args[i].as_str() {
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
                         "-D" => { cmd.push_str(" -D"); }
                         "-U" => { cmd.push_str(" -U"); }
                         "-t" => {
@@ -1348,8 +1496,8 @@ fn main() -> io::Result<()> {
                         // Run shell command - suppress stdout/stderr so it doesn't leak to terminal
                         #[cfg(windows)]
                         {
-                            std::process::Command::new("cmd")
-                                .args(["/C", &cond])
+                            std::process::Command::new("pwsh")
+                                .args(["-NoProfile", "-Command", &cond])
                                 .stdout(std::process::Stdio::null())
                                 .stderr(std::process::Stdio::null())
                                 .status()

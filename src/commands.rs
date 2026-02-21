@@ -90,6 +90,18 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "set-buffer" | "setb" => Some(Action::Command(cmd.to_string())),
         "delete-buffer" | "deleteb" => Some(Action::Command("delete-buffer".to_string())),
         "display-message" | "display" => Some(Action::Command(cmd.to_string())),
+        "switch-client" | "switchc" => {
+            // Check for -T flag to switch key table
+            if let Some(pos) = parts.iter().position(|p| *p == "-T") {
+                if let Some(table) = parts.get(pos + 1) {
+                    Some(Action::SwitchTable(table.to_string()))
+                } else {
+                    Some(Action::Command(cmd.to_string()))
+                }
+            } else {
+                Some(Action::Command(cmd.to_string()))
+            }
+        }
         _ => Some(Action::Command(cmd.to_string()))
     }
 }
@@ -121,6 +133,7 @@ pub fn format_action(action: &Action) -> String {
         }
         Action::Command(cmd) => cmd.clone(),
         Action::CommandChain(cmds) => cmds.join(" \\; "),
+        Action::SwitchTable(table) => format!("switch-client -T {}", table),
     }
 }
 
@@ -300,6 +313,9 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
             for cmd in cmds {
                 execute_command_string(app, cmd)?;
             }
+        }
+        Action::SwitchTable(table) => {
+            app.current_key_table = Some(table.clone());
         }
     }
     Ok(false)
@@ -498,8 +514,8 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                     .and_then(|pty_sys| {
                         let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                         let pair = pty_sys.openpty(pty_size).ok()?;
-                        let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "cmd" } else { "sh" });
-                        if cfg!(windows) { cmd_builder.args(["/C", &rest]); } else { cmd_builder.args(["-c", &rest]); }
+                        let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                        if cfg!(windows) { cmd_builder.args(["-NoProfile", "-Command", &rest]); } else { cmd_builder.args(["-c", &rest]); }
                         let child = pair.slave.spawn_command(cmd_builder).ok()?;
                         // Close the slave handle immediately – required for ConPTY.
                         drop(pair.slave);

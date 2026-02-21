@@ -79,7 +79,7 @@ pub fn list_windows_tmux(app: &AppState) -> String {
         let (width, height) = if let Some(p) = active_pane(&w.root, &w.active_path) {
             (p.last_cols, p.last_rows)
         } else { (120, 30) };
-        lines.push(format!("{}: {}{} ({} panes) [{}x{}]", i, w.name, flag, pane_count, width, height));
+        lines.push(format!("{}: {}{} ({} panes) [{}x{}]", i + app.window_base_index, w.name, flag, pane_count, width, height));
     }
     lines.join("\n")
 }

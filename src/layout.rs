@@ -672,91 +672,278 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     Ok(out)
 }
 
-/// Apply a named layout to the current window
+/// Apply a named layout to the current window.
+/// Collects ALL leaf panes and rebuilds the tree structure from scratch.
 pub fn apply_layout(app: &mut AppState, layout: &str) {
     let win = &mut app.windows[app.active_idx];
     
-    // Count panes
-    fn count_panes(node: &Node) -> usize {
-        match node {
-            Node::Leaf(_) => 1,
-            Node::Split { children, .. } => children.iter().map(count_panes).sum(),
+    // Collect all leaf panes from the current tree
+    let old_root = std::mem::replace(&mut win.root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
+    let mut leaves = crate::tree::collect_leaves(old_root);
+    let pane_count = leaves.len();
+    if pane_count < 2 {
+        // Put back the single leaf (or empty)
+        if let Some(leaf) = leaves.into_iter().next() {
+            win.root = leaf;
         }
+        return;
     }
-    let pane_count = count_panes(&win.root);
-    if pane_count < 2 { return; }
-    
+
+    // Helper: compute equal sizes summing to 100
+    fn equal_sizes(n: usize) -> Vec<u16> {
+        if n == 0 { return vec![]; }
+        let base = 100 / n as u16;
+        let mut sizes = vec![base; n];
+        let rem = 100 - base * n as u16;
+        if let Some(last) = sizes.last_mut() { *last += rem; }
+        sizes
+    }
+
+    // Determine main-pane percentage
+    let main_h_pct = if app.main_pane_height > 0 { app.main_pane_height.min(95) } else { 60 };
+    let main_v_pct = if app.main_pane_width > 0 { app.main_pane_width.min(95) } else { 60 };
+
     match layout.to_lowercase().as_str() {
         "even-horizontal" | "even-h" => {
-            if let Node::Split { kind, sizes, .. } = &mut win.root {
-                *kind = LayoutKind::Horizontal;
-                let size = 100 / sizes.len().max(1) as u16;
-                for s in sizes.iter_mut() { *s = size; }
-            }
+            // Single horizontal split with N equal children
+            let sizes = equal_sizes(pane_count);
+            win.root = Node::Split { kind: LayoutKind::Horizontal, sizes, children: leaves };
         }
         "even-vertical" | "even-v" => {
-            if let Node::Split { kind, sizes, .. } = &mut win.root {
-                *kind = LayoutKind::Vertical;
-                let size = 100 / sizes.len().max(1) as u16;
-                for s in sizes.iter_mut() { *s = size; }
-            }
+            // Single vertical split with N equal children
+            let sizes = equal_sizes(pane_count);
+            win.root = Node::Split { kind: LayoutKind::Vertical, sizes, children: leaves };
         }
         "main-horizontal" | "main-h" => {
-            if let Node::Split { kind, sizes, .. } = &mut win.root {
-                *kind = LayoutKind::Vertical;
-                if sizes.len() >= 2 {
-                    sizes[0] = 60;
-                    let remaining = 40 / (sizes.len() - 1).max(1) as u16;
-                    for s in sizes.iter_mut().skip(1) { *s = remaining; }
-                }
+            // Vertical split: top pane (main) + bottom horizontal split of remaining
+            let main_pane = leaves.remove(0);
+            if leaves.len() == 1 {
+                let other = leaves.remove(0);
+                win.root = Node::Split {
+                    kind: LayoutKind::Vertical,
+                    sizes: vec![main_h_pct, 100 - main_h_pct],
+                    children: vec![main_pane, other],
+                };
+            } else {
+                let bottom_sizes = equal_sizes(leaves.len());
+                let bottom = Node::Split { kind: LayoutKind::Horizontal, sizes: bottom_sizes, children: leaves };
+                win.root = Node::Split {
+                    kind: LayoutKind::Vertical,
+                    sizes: vec![main_h_pct, 100 - main_h_pct],
+                    children: vec![main_pane, bottom],
+                };
             }
         }
         "main-vertical" | "main-v" => {
-            if let Node::Split { kind, sizes, .. } = &mut win.root {
-                *kind = LayoutKind::Horizontal;
-                if sizes.len() >= 2 {
-                    sizes[0] = 60;
-                    let remaining = 40 / (sizes.len() - 1).max(1) as u16;
-                    for s in sizes.iter_mut().skip(1) { *s = remaining; }
-                }
+            // Horizontal split: left pane (main) + right vertical split of remaining
+            let main_pane = leaves.remove(0);
+            if leaves.len() == 1 {
+                let other = leaves.remove(0);
+                win.root = Node::Split {
+                    kind: LayoutKind::Horizontal,
+                    sizes: vec![main_v_pct, 100 - main_v_pct],
+                    children: vec![main_pane, other],
+                };
+            } else {
+                let right_sizes = equal_sizes(leaves.len());
+                let right = Node::Split { kind: LayoutKind::Vertical, sizes: right_sizes, children: leaves };
+                win.root = Node::Split {
+                    kind: LayoutKind::Horizontal,
+                    sizes: vec![main_v_pct, 100 - main_v_pct],
+                    children: vec![main_pane, right],
+                };
             }
         }
         "tiled" => {
-            if let Node::Split { sizes, .. } = &mut win.root {
-                let size = 100 / sizes.len().max(1) as u16;
-                for s in sizes.iter_mut() { *s = size; }
+            // Balanced binary tree of splits
+            fn build_tiled(mut panes: Vec<Node>) -> Node {
+                if panes.len() == 1 { return panes.remove(0); }
+                if panes.len() == 2 {
+                    return Node::Split {
+                        kind: LayoutKind::Horizontal,
+                        sizes: vec![50, 50],
+                        children: panes,
+                    };
+                }
+                let mid = panes.len() / 2;
+                let right_panes = panes.split_off(mid);
+                let left = build_tiled(panes);
+                let right = build_tiled(right_panes);
+                // Alternate between vertical and horizontal at each level
+                Node::Split {
+                    kind: LayoutKind::Vertical,
+                    sizes: vec![50, 50],
+                    children: vec![left, right],
+                }
+            }
+            win.root = build_tiled(leaves);
+        }
+        _ => {
+            // Unknown layout name — try to parse as tmux layout string
+            let new_root = parse_tmux_layout_string(layout, &mut leaves);
+            if let Some(root) = new_root {
+                win.root = root;
+            } else {
+                // Parsing failed; put panes back as even-horizontal fallback
+                let sizes = equal_sizes(pane_count);
+                win.root = Node::Split { kind: LayoutKind::Horizontal, sizes, children: leaves };
             }
         }
-        _ => {}
+    }
+    // Reset active_path to first leaf
+    win.active_path = crate::tree::first_leaf_path(&win.root);
+}
+
+const LAYOUT_NAMES: [&str; 5] = ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
+
+/// Cycle through available layouts (forward)
+pub fn cycle_layout(app: &mut AppState) {
+    let win = &mut app.windows[app.active_idx];
+    if matches!(win.root, Node::Leaf(_)) { return; }
+    let next_idx = (win.layout_index + 1) % LAYOUT_NAMES.len();
+    win.layout_index = next_idx;
+    apply_layout(app, LAYOUT_NAMES[next_idx]);
+}
+
+/// Cycle through available layouts (reverse)
+pub fn cycle_layout_reverse(app: &mut AppState) {
+    let win = &mut app.windows[app.active_idx];
+    if matches!(win.root, Node::Leaf(_)) { return; }
+    let prev_idx = (win.layout_index + LAYOUT_NAMES.len() - 1) % LAYOUT_NAMES.len();
+    win.layout_index = prev_idx;
+    apply_layout(app, LAYOUT_NAMES[prev_idx]);
+}
+
+/// Parse a tmux layout string into a Node tree.
+///
+/// Format: `checksum,WxH,X,Y{child1,child2,...}` or `checksum,WxH,X,Y[child1,child2,...]`
+/// - `{...}` = horizontal split (children side-by-side)
+/// - `[...]` = vertical split (children stacked)
+/// - Each child is either a leaf `WxH,X,Y,pane_id` or a nested split `WxH,X,Y{...}` / `WxH,X,Y[...]`
+///
+/// The `panes` vec provides existing pane nodes to fill the tree leaves.
+/// Returns `None` if parsing fails.
+pub fn parse_tmux_layout_string(layout_str: &str, panes: &mut Vec<Node>) -> Option<Node> {
+    // Skip the 4-hex-char checksum + comma prefix
+    let s = layout_str.trim();
+    if s.len() < 5 { return None; }
+    // Find the first comma after the checksum
+    let after_checksum = s.find(',')? + 1;
+    let body = &s[after_checksum..];
+    
+    let (node, _) = parse_node(body, panes)?;
+    Some(node)
+}
+
+/// Parse a single node from position in the string, returns (Node, chars_consumed)
+fn parse_node(s: &str, panes: &mut Vec<Node>) -> Option<(Node, usize)> {
+    // Parse WxH,X,Y first
+    let (w, h, consumed_dims) = parse_dimensions(s)?;
+    let rest = &s[consumed_dims..];
+    
+    // After dimensions, we have either:
+    // - '{' for horizontal split
+    // - '[' for vertical split  
+    // - ',' followed by pane_id (leaf)
+    // - end of string (leaf with no pane_id)
+    
+    if rest.starts_with('{') {
+        // Horizontal split
+        let (children, consumed_bracket) = parse_children(&rest[1..], '}', panes)?;
+        let total_w: u32 = children.iter().map(|(cw, _, _)| *cw as u32).sum();
+        let sizes: Vec<u16> = if total_w == 0 {
+            vec![100 / children.len().max(1) as u16; children.len()]
+        } else {
+            let mut szs: Vec<u16> = children.iter().map(|(cw, _, _)| ((*cw as u32) * 100 / total_w) as u16).collect();
+            let sum: u16 = szs.iter().sum();
+            if sum < 100 { if let Some(last) = szs.last_mut() { *last += 100 - sum; } }
+            szs
+        };
+        let nodes: Vec<Node> = children.into_iter().map(|(_, _, n)| n).collect();
+        Some((
+            Node::Split { kind: LayoutKind::Horizontal, sizes, children: nodes },
+            consumed_dims + 1 + consumed_bracket,
+        ))
+    } else if rest.starts_with('[') {
+        // Vertical split
+        let (children, consumed_bracket) = parse_children(&rest[1..], ']', panes)?;
+        let total_h: u32 = children.iter().map(|(_, ch, _)| *ch as u32).sum();
+        let sizes: Vec<u16> = if total_h == 0 {
+            vec![100 / children.len().max(1) as u16; children.len()]
+        } else {
+            let mut szs: Vec<u16> = children.iter().map(|(_, ch, _)| ((*ch as u32) * 100 / total_h) as u16).collect();
+            let sum: u16 = szs.iter().sum();
+            if sum < 100 { if let Some(last) = szs.last_mut() { *last += 100 - sum; } }
+            szs
+        };
+        let nodes: Vec<Node> = children.into_iter().map(|(_, _, n)| n).collect();
+        Some((
+            Node::Split { kind: LayoutKind::Vertical, sizes, children: nodes },
+            consumed_dims + 1 + consumed_bracket,
+        ))
+    } else {
+        // Leaf node — may have ,pane_id suffix
+        let mut extra = 0;
+        if rest.starts_with(',') {
+            // Skip pane_id
+            let id_str = &rest[1..];
+            let end = id_str.find(|c: char| c == ',' || c == '{' || c == '[' || c == '}' || c == ']').unwrap_or(id_str.len());
+            extra = 1 + end;
+        }
+        // Consume a pane from the provided vec
+        let leaf = if !panes.is_empty() { panes.remove(0) } else { return None; };
+        Some((leaf, consumed_dims + extra))
     }
 }
 
-/// Cycle through available layouts
-pub fn cycle_layout(app: &mut AppState) {
-    static LAYOUTS: [&str; 5] = ["even-horizontal", "even-vertical", "main-horizontal", "main-vertical", "tiled"];
+/// Parse WxH,X,Y — returns (width, height, chars_consumed)
+fn parse_dimensions(s: &str) -> Option<(u16, u16, usize)> {
+    // Parse W (digits)
+    let x_pos = s.find('x')?;
+    let w: u16 = s[..x_pos].parse().ok()?;
+    let after_x = &s[x_pos + 1..];
+    // Parse H (digits until ',')
+    let comma1 = after_x.find(',')?;
+    let h: u16 = after_x[..comma1].parse().ok()?;
+    let after_h = &after_x[comma1 + 1..];
+    // Parse X (digits until ',')
+    let comma2 = after_h.find(',')?;
+    // _x coordinate (skip)
+    let after_xcoord = &after_h[comma2 + 1..];
+    // Parse Y (digits until next non-digit)
+    let y_end = after_xcoord.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_xcoord.len());
+    // Total consumed: W + 'x' + H + ',' + X + ',' + Y
+    let total = x_pos + 1 + comma1 + 1 + comma2 + 1 + y_end;
+    Some((w, h, total))
+}
+
+/// Parse comma-separated children inside brackets.
+/// Returns vec of (width, height, Node) and total chars consumed including closing bracket.
+fn parse_children(s: &str, closing: char, panes: &mut Vec<Node>) -> Option<(Vec<(u16, u16, Node)>, usize)> {
+    let mut children = Vec::new();
+    let mut pos = 0;
     
-    let win = &app.windows[app.active_idx];
-    let (kind, sizes) = match &win.root {
-        Node::Leaf(_) => return,
-        Node::Split { kind, sizes, .. } => (*kind, sizes.clone()),
-    };
-    
-    let current_idx = if sizes.is_empty() {
-        0
-    } else if sizes.iter().all(|s| *s == sizes[0]) {
-        match kind {
-            LayoutKind::Horizontal => 0,
-            LayoutKind::Vertical => 1,
+    loop {
+        if pos >= s.len() { return None; }
+        if s.as_bytes()[pos] == closing as u8 {
+            pos += 1; // consume closing bracket
+            break;
         }
-    } else if sizes.len() >= 2 && sizes[0] > sizes[1] {
-        match kind {
-            LayoutKind::Vertical => 2,
-            LayoutKind::Horizontal => 3,
+        if !children.is_empty() {
+            // Expect comma separator between children
+            if s.as_bytes()[pos] == b',' {
+                pos += 1;
+            }
         }
-    } else {
-        4
-    };
+        
+        // Parse child dimensions first to get w,h
+        let child_str = &s[pos..];
+        let (cw, ch, _) = parse_dimensions(child_str)?;
+        // Now parse full node
+        let (node, consumed) = parse_node(child_str, panes)?;
+        children.push((cw, ch, node));
+        pos += consumed;
+    }
     
-    let next_idx = (current_idx + 1) % LAYOUTS.len();
-    apply_layout(app, LAYOUTS[next_idx]);
+    Some((children, pos))
 }

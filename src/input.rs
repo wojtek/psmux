@@ -40,9 +40,21 @@ fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, 
 pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
     match app.mode {
         Mode::Passthrough => {
-            let is_ctrl_b = (key.code, key.modifiers) == app.prefix_key
-                || matches!(key.code, KeyCode::Char(c) if c == '\u{0002}');
-            if is_ctrl_b {
+            // Check switch-client -T key table first
+            if let Some(table_name) = app.current_key_table.take() {
+                let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
+                if let Some(bind) = app.key_tables.get(&table_name)
+                    .and_then(|t| t.iter().find(|b| b.key == key_tuple))
+                    .cloned()
+                {
+                    return execute_action(app, &bind.action);
+                }
+                // Key not found in table — fall through to normal dispatch
+            }
+            let is_prefix = (key.code, key.modifiers) == app.prefix_key
+                || matches!(key.code, KeyCode::Char(c) if c == '\u{0002}')
+                || app.prefix2_key.map_or(false, |p2| (key.code, key.modifiers) == p2);
+            if is_prefix {
                 app.mode = Mode::Prefix { armed_at: Instant::now() };
                 return Ok(false);
             }
@@ -475,19 +487,60 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             {
                 return execute_action(app, &bind.action);
             }
-            // Handle find-char pending state (waiting for char after f/F/t/T)
-            if let Some(pending) = app.copy_find_char_pending.take() {
+            // Handle register pending state (waiting for a-z after ")
+            if app.copy_register_pending {
+                app.copy_register_pending = false;
                 if let KeyCode::Char(ch) = key.code {
-                    match pending {
-                        0 => crate::copy_mode::find_char_forward(app, ch),
-                        1 => crate::copy_mode::find_char_backward(app, ch),
-                        2 => crate::copy_mode::find_char_to_forward(app, ch),
-                        3 => crate::copy_mode::find_char_to_backward(app, ch),
+                    if ch.is_ascii_lowercase() {
+                        app.copy_register = Some(ch);
+                    }
+                }
+                return Ok(false);
+            }
+            // Handle text-object pending state (waiting for w/W after a/i)
+            if let Some(prefix) = app.copy_text_object_pending.take() {
+                if let KeyCode::Char(ch) = key.code {
+                    match (prefix, ch) {
+                        (0, 'w') => { crate::copy_mode::select_a_word(app); }
+                        (1, 'w') => { crate::copy_mode::select_inner_word(app); }
+                        (0, 'W') => { crate::copy_mode::select_a_word_big(app); }
+                        (1, 'W') => { crate::copy_mode::select_inner_word_big(app); }
                         _ => {}
                     }
                 }
                 return Ok(false);
             }
+            // Handle find-char pending state (waiting for char after f/F/t/T)
+            if let Some(pending) = app.copy_find_char_pending.take() {
+                let n = app.copy_count.take().unwrap_or(1);
+                if let KeyCode::Char(ch) = key.code {
+                    match pending {
+                        0 => { for _ in 0..n { crate::copy_mode::find_char_forward(app, ch); } }
+                        1 => { for _ in 0..n { crate::copy_mode::find_char_backward(app, ch); } }
+                        2 => { for _ in 0..n { crate::copy_mode::find_char_to_forward(app, ch); } }
+                        3 => { for _ in 0..n { crate::copy_mode::find_char_to_backward(app, ch); } }
+                        _ => {}
+                    }
+                }
+                return Ok(false);
+            }
+            // Handle numeric prefix accumulation for copy-mode motions (vi-style)
+            if let KeyCode::Char(d) = key.code {
+                if d.is_ascii_digit() && !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
+                    let digit = d.to_digit(10).unwrap() as usize;
+                    if let Some(count) = app.copy_count {
+                        // Accumulate: multiply by 10 and add digit (cap at 9999)
+                        app.copy_count = Some((count * 10 + digit).min(9999));
+                        return Ok(false);
+                    } else if digit >= 1 {
+                        // Start new count with 1-9
+                        app.copy_count = Some(digit);
+                        return Ok(false);
+                    }
+                    // digit == 0 with no existing count → fall through to line-start handler
+                }
+            }
+            let copy_repeat = app.copy_count.take().unwrap_or(1);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => { 
                     app.mode = Mode::Passthrough; 
@@ -514,10 +567,10 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         }
                     }
                 }
-                KeyCode::Left | KeyCode::Char('h') => { move_copy_cursor(app, -1, 0); }
-                KeyCode::Right | KeyCode::Char('l') => { move_copy_cursor(app, 1, 0); }
-                KeyCode::Up | KeyCode::Char('k') => { move_copy_cursor(app, 0, -1); }
-                KeyCode::Down | KeyCode::Char('j') => { move_copy_cursor(app, 0, 1); }
+                KeyCode::Left | KeyCode::Char('h') => { for _ in 0..copy_repeat { move_copy_cursor(app, -1, 0); } }
+                KeyCode::Right | KeyCode::Char('l') => { for _ in 0..copy_repeat { move_copy_cursor(app, 1, 0); } }
+                KeyCode::Up | KeyCode::Char('k') => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, -1); } }
+                KeyCode::Down | KeyCode::Char('j') => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, 1); } }
                 // Page scroll: C-b / PageUp = page up, C-f / PageDown = page down
                 KeyCode::PageUp => { scroll_copy_up(app, 10); }
                 KeyCode::PageDown => { scroll_copy_down(app, 10); }
@@ -542,25 +595,46 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
                     scroll_copy_down(app, half);
                 }
+                // Emacs copy-mode keys (must be before unqualified char matches)
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 1); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 1); }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_start(app); }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_end(app); }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Passthrough;
+                    app.copy_anchor = None;
+                    app.copy_pos = None;
+                    app.copy_scroll_offset = 0;
+                }
                 KeyCode::Char('g') => { scroll_to_top(app); }
                 KeyCode::Char('G') => { scroll_to_bottom(app); }
                 // Word motions: w = next word, b = prev word, e = end of word
-                KeyCode::Char('w') => { crate::copy_mode::move_word_forward(app); }
-                KeyCode::Char('b') => { crate::copy_mode::move_word_backward(app); }
-                KeyCode::Char('e') => { crate::copy_mode::move_word_end(app); }
+                KeyCode::Char('w') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_forward(app); } }
+                KeyCode::Char('b') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_backward(app); } }
+                KeyCode::Char('e') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_end(app); } }
                 // WORD motions: W = next WORD, B = prev WORD, E = end WORD
-                KeyCode::Char('W') => { crate::copy_mode::move_word_forward_big(app); }
-                KeyCode::Char('B') => { crate::copy_mode::move_word_backward_big(app); }
-                KeyCode::Char('E') => { crate::copy_mode::move_word_end_big(app); }
+                KeyCode::Char('W') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_forward_big(app); } }
+                KeyCode::Char('B') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_backward_big(app); } }
+                KeyCode::Char('E') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_end_big(app); } }
                 // Screen position: H = top, M = middle, L = bottom
                 KeyCode::Char('H') => { crate::copy_mode::move_to_screen_top(app); }
                 KeyCode::Char('M') => { crate::copy_mode::move_to_screen_middle(app); }
                 KeyCode::Char('L') => { crate::copy_mode::move_to_screen_bottom(app); }
                 // Find char: f/F/t/T — sets pending state for next char
-                KeyCode::Char('f') => { app.copy_find_char_pending = Some(0); }
-                KeyCode::Char('F') => { app.copy_find_char_pending = Some(1); }
-                KeyCode::Char('t') => { app.copy_find_char_pending = Some(2); }
-                KeyCode::Char('T') => { app.copy_find_char_pending = Some(3); }
+                KeyCode::Char('f') => { app.copy_find_char_pending = Some(0); app.copy_count = Some(copy_repeat); }
+                KeyCode::Char('F') => { app.copy_find_char_pending = Some(1); app.copy_count = Some(copy_repeat); }
+                KeyCode::Char('t') => { app.copy_find_char_pending = Some(2); app.copy_count = Some(copy_repeat); }
+                KeyCode::Char('T') => { app.copy_find_char_pending = Some(3); app.copy_count = Some(copy_repeat); }
                 // D = copy from cursor to end of line
                 KeyCode::Char('D') => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
@@ -643,40 +717,21 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('n') => { search_next(app); }
                 KeyCode::Char('N') => { search_prev(app); }
-                // Emacs copy-mode keys
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 1); }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 1); }
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_start(app); }
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_end(app); }
-                // C-v handled above (mode-keys aware)
-                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.mode = Mode::CopySearch { input: String::new(), forward: true };
-                }
-                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.mode = Mode::CopySearch { input: String::new(), forward: false };
-                }
-                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.mode = Mode::Passthrough;
-                    app.copy_anchor = None;
-                    app.copy_pos = None;
-                    app.copy_scroll_offset = 0;
-                    let win = &mut app.windows[app.active_idx];
-                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if let Ok(mut parser) = p.term.lock() {
-                            parser.screen_mut().set_scrollback(0);
-                        }
-                    }
-                }
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Set mark (anchor)
                     if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                         app.copy_anchor = Some((r, c));
                         app.copy_pos = Some((r, c));
                     }
+                }
+                // Named register prefix: " then a-z
+                KeyCode::Char('"') => { app.copy_register_pending = true; }
+                // Text-object prefixes: a/i then w/W
+                KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    app.copy_text_object_pending = Some(0);
+                }
+                KeyCode::Char('i') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    app.copy_text_object_pending = Some(1);
                 }
                 _ => {}
             }

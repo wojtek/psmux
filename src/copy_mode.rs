@@ -22,6 +22,10 @@ pub fn enter_copy_mode(app: &mut AppState) {
     // visible immediately on entering copy mode (fixes #25).
     app.copy_pos = current_prompt_pos(app);
     app.copy_find_char_pending = None;
+    app.copy_text_object_pending = None;
+    app.copy_register_pending = false;
+    app.copy_register = None;
+    app.copy_count = None;
 }
 
 #[cfg(windows)]
@@ -428,13 +432,52 @@ pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
             }
         }
     }
+    // Store in named register if one was selected
+    if let Some(reg) = app.copy_register.take() {
+        app.named_registers.insert(reg, text.clone());
+    }
     app.paste_buffers.insert(0, text.clone());
     if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
     copy_to_system_clipboard(&text);
+    // Pipe to copy-command if configured
+    if !app.copy_command.is_empty() {
+        let cmd = app.copy_command.clone();
+        pipe_text_to_command(&text, &cmd);
+    }
     Ok(())
 }
 
+/// Pipe text to a shell command's stdin.
+fn pipe_text_to_command(text: &str, cmd: &str) {
+    let shell = if cfg!(windows) { "pwsh" } else { "sh" };
+    let args: Vec<&str> = if cfg!(windows) {
+        vec!["-NoProfile", "-Command", cmd]
+    } else {
+        vec!["-c", cmd]
+    };
+    if let Ok(mut child) = std::process::Command::new(shell)
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
 pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
+    // If a named register was selected, paste from it
+    if let Some(reg) = app.copy_register.take() {
+        if let Some(text) = app.named_registers.get(&reg).cloned() {
+            let win = &mut app.windows[app.active_idx];
+            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", text); }
+        }
+        return Ok(());
+    }
     if let Some(buf) = app.paste_buffers.first() {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", buf); }
@@ -695,13 +738,23 @@ pub fn search_prev(app: &mut AppState) {
     app.copy_pos = Some((r, c));
 }
 
-pub fn capture_active_pane_range(app: &mut AppState, s: Option<u16>, e: Option<u16>) -> io::Result<Option<String>> {
+pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i32>) -> io::Result<Option<String>> {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let screen = parser.screen();
-    let start = s.unwrap_or(0).min(p.last_rows.saturating_sub(1));
-    let end = e.unwrap_or(p.last_rows.saturating_sub(1)).min(p.last_rows.saturating_sub(1));
+    let rows = p.last_rows as i32;
+    // Negative values mean offset from end of visible area
+    let start = match s {
+        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
+        None => 0,
+    };
+    let end = match e {
+        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
+        None => p.last_rows.saturating_sub(1),
+    };
     let mut text = String::new();
     for r in start..=end { for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); } } text.push('\n'); }
     Ok(Some(text))
@@ -898,4 +951,105 @@ pub fn move_matching_bracket(app: &mut AppState) {
             return;
         }
     }
+}
+
+// ── Text Object Selection ──────────────────────────────────────────────
+
+/// Select "inner word" (iw) — word under cursor without surrounding whitespace.
+/// Uses `char_class` for word boundary detection (same as `w`/`b`/`e` motions).
+pub fn select_inner_word(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let seps = app.word_separators.clone();
+    let (text, _cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let col = c as usize;
+    if col >= bytes.len() { return; }
+    let cls = char_class(bytes[col], &seps);
+    // Find start of word
+    let mut start = col;
+    while start > 0 && char_class(bytes[start - 1], &seps) == cls { start -= 1; }
+    // Find end of word
+    let mut end = col;
+    while end + 1 < bytes.len() && char_class(bytes[end + 1], &seps) == cls { end += 1; }
+    app.copy_anchor = Some((r, start as u16));
+    app.copy_pos = Some((r, end as u16));
+    app.copy_selection_mode = crate::types::SelectionMode::Char;
+}
+
+/// Select "a word" (aw) — word under cursor plus trailing whitespace.
+pub fn select_a_word(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let seps = app.word_separators.clone();
+    let (text, _cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let col = c as usize;
+    if col >= bytes.len() { return; }
+    let cls = char_class(bytes[col], &seps);
+    // Find start of word
+    let mut start = col;
+    while start > 0 && char_class(bytes[start - 1], &seps) == cls { start -= 1; }
+    // Find end of word
+    let mut end = col;
+    while end + 1 < bytes.len() && char_class(bytes[end + 1], &seps) == cls { end += 1; }
+    // Include trailing whitespace
+    while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
+    app.copy_anchor = Some((r, start as u16));
+    app.copy_pos = Some((r, end as u16));
+    app.copy_selection_mode = crate::types::SelectionMode::Char;
+}
+
+/// Select "inner WORD" (iW) — whitespace-delimited token without surrounding whitespace.
+pub fn select_inner_word_big(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let (text, _cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let col = c as usize;
+    if col >= bytes.len() { return; }
+    if bytes[col].is_whitespace() {
+        // Cursor on whitespace — select contiguous whitespace
+        let mut start = col;
+        while start > 0 && bytes[start - 1].is_whitespace() { start -= 1; }
+        let mut end = col;
+        while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
+        app.copy_anchor = Some((r, start as u16));
+        app.copy_pos = Some((r, end as u16));
+    } else {
+        // Cursor on non-whitespace — select contiguous non-whitespace
+        let mut start = col;
+        while start > 0 && !bytes[start - 1].is_whitespace() { start -= 1; }
+        let mut end = col;
+        while end + 1 < bytes.len() && !bytes[end + 1].is_whitespace() { end += 1; }
+        app.copy_anchor = Some((r, start as u16));
+        app.copy_pos = Some((r, end as u16));
+    }
+    app.copy_selection_mode = crate::types::SelectionMode::Char;
+}
+
+/// Select "a WORD" (aW) — whitespace-delimited token plus trailing whitespace.
+pub fn select_a_word_big(app: &mut AppState) {
+    let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
+    let (text, _cols) = match read_row_text(app, r) { Some(t) => t, None => return };
+    let bytes: Vec<char> = text.chars().collect();
+    let col = c as usize;
+    if col >= bytes.len() { return; }
+    if bytes[col].is_whitespace() {
+        // Cursor on whitespace — select contiguous whitespace
+        let mut start = col;
+        while start > 0 && bytes[start - 1].is_whitespace() { start -= 1; }
+        let mut end = col;
+        while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
+        app.copy_anchor = Some((r, start as u16));
+        app.copy_pos = Some((r, end as u16));
+    } else {
+        // Cursor on non-whitespace — select contiguous non-whitespace
+        let mut start = col;
+        while start > 0 && !bytes[start - 1].is_whitespace() { start -= 1; }
+        let mut end = col;
+        while end + 1 < bytes.len() && !bytes[end + 1].is_whitespace() { end += 1; }
+        // Include trailing whitespace
+        while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
+        app.copy_anchor = Some((r, start as u16));
+        app.copy_pos = Some((r, end as u16));
+    }
+    app.copy_selection_mode = crate::types::SelectionMode::Char;
 }

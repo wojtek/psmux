@@ -426,6 +426,37 @@ pub fn get_active_pane_id_at_path(node: &Node, path: &[usize]) -> Option<usize> 
     get_active_pane_id(node, path)
 }
 
+/// Get the positional index (0-based) of a pane within its window, by pane ID.
+/// Panes are enumerated in tree traversal order (left-to-right, top-to-bottom).
+pub fn get_pane_position_in_window(node: &Node, target_id: usize) -> Option<usize> {
+    fn collect_ids(node: &Node, ids: &mut Vec<usize>) {
+        match node {
+            Node::Leaf(p) => ids.push(p.id),
+            Node::Split { children, .. } => {
+                for c in children { collect_ids(c, ids); }
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    collect_ids(node, &mut ids);
+    ids.iter().position(|&id| id == target_id)
+}
+
+/// Get the Nth leaf pane (0-based positional index) from the tree.
+pub fn get_nth_pane(node: &Node, n: usize) -> Option<&Pane> {
+    fn collect_panes<'a>(node: &'a Node, panes: &mut Vec<&'a Pane>) {
+        match node {
+            Node::Leaf(p) => panes.push(p),
+            Node::Split { children, .. } => {
+                for c in children { collect_panes(c, panes); }
+            }
+        }
+    }
+    let mut panes = Vec::new();
+    collect_panes(node, &mut panes);
+    panes.get(n).copied()
+}
+
 pub fn find_window_index_by_id(app: &AppState, wid: usize) -> Option<usize> {
     app.windows.iter().position(|w| w.id == wid)
 }
@@ -546,4 +577,19 @@ pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
         }
     }
     Ok((app.windows.is_empty(), any_pruned))
+}
+
+/// Collect all leaf (Pane) nodes from the tree, consuming it.
+/// Returns them in DFS (left-to-right) order.
+pub fn collect_leaves(node: Node) -> Vec<Node> {
+    match node {
+        Node::Leaf(_) => vec![node],
+        Node::Split { children, .. } => {
+            let mut leaves = Vec::new();
+            for child in children {
+                leaves.extend(collect_leaves(child));
+            }
+            leaves
+        }
+    }
 }

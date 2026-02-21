@@ -320,6 +320,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut prefix_key: (KeyCode, KeyModifiers) = (KeyCode::Char('b'), KeyModifiers::CONTROL);
     // Precompute the raw control character for the default prefix
     let mut prefix_raw_char: Option<char> = Some('\x02');
+    // Secondary prefix key (prefix2), default None
+    let mut prefix2_key: Option<(KeyCode, KeyModifiers)> = None;
+    let mut prefix2_raw_char: Option<char> = None;
     // Status bar style from server (parsed from tmux status-style format)
     let mut status_fg: Color = Color::Black;
     let mut status_bg: Color = Color::Green;
@@ -336,11 +339,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     // Synced bindings from server (updated each frame from DumpState)
     let mut synced_bindings: Vec<BindingEntry> = Vec::new();
 
+    // list-keys overlay state (C-b ?)
+    let mut keys_viewer = false;
+    let mut keys_viewer_lines: Vec<String> = Vec::new();
+    let mut keys_viewer_scroll: usize = 0;
+
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool, #[serde(default)] activity: bool, #[serde(default)] tab_text: String }
     
     fn default_base_index() -> usize { 1 }
     fn default_prediction_dimming() -> bool { dim_predictions_enabled() }
+    fn default_status_left_length() -> usize { 10 }
+    fn default_status_right_length() -> usize { 40 }
+    fn default_status_lines() -> usize { 1 }
 
     /// A single key binding synced from the server.
     #[derive(serde::Deserialize, Clone, Debug)]
@@ -362,6 +373,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         windows: Vec<WinStatus>,
         #[serde(default)]
         prefix: Option<String>,
+        #[serde(default)]
+        prefix2: Option<String>,
         #[serde(default)]
         tree: Vec<WinTree>,
         #[serde(default = "default_base_index")]
@@ -399,6 +412,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         /// Dynamic key bindings from server
         #[serde(default)]
         bindings: Vec<BindingEntry>,
+        /// status-left-length (max display width for left status)
+        #[serde(default = "default_status_left_length")]
+        status_left_length: usize,
+        /// status-right-length (max display width for right status)
+        #[serde(default = "default_status_right_length")]
+        status_right_length: usize,
+        /// Number of status bar lines
+        #[serde(default = "default_status_lines")]
+        status_lines: usize,
+        /// Custom format strings for additional status lines
+        #[serde(default)]
+        status_format: Vec<String>,
     }
 
     let mut cmd_batch: Vec<String> = Vec::new();
@@ -495,17 +520,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         // Dynamic prefix key check (default: Ctrl+B, configurable via .psmux.conf)
                         let is_prefix = (key.code, key.modifiers) == prefix_key
-                            || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
+                            || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c))
+                            || prefix2_key.map_or(false, |p2| (key.code, key.modifiers) == p2)
+                            || prefix2_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c));
 
                         // Overlay Esc must be checked BEFORE selection-Esc so that
                         // pressing Esc always closes the active overlay first.
-                        if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some()) {
+                        if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
                             command_input = false;
                             renaming = false;
                             pane_renaming = false;
                             chooser = false;
                             tree_chooser = false;
                             session_chooser = false;
+                            keys_viewer = false;
                             confirm_cmd = None;
                             // Also clear any lingering selection
                             rsel_start = None;
@@ -521,7 +549,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         else if is_prefix { prefix_armed = true; }
                         // Check root-table bindings (bind-key -n / bind-key -T root)
                         // These fire without prefix, before keys are forwarded to PTY
-                        else if !command_input && !renaming && !pane_renaming && !chooser && !tree_chooser && !session_chooser && confirm_cmd.is_none() && {
+                        else if !command_input && !renaming && !pane_renaming && !chooser && !tree_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
                             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
                             synced_bindings.iter().any(|b| b.t == "root" && parse_key_string(&b.k).map_or(false, |k| normalize_key_for_binding(k) == key_tuple))
                         } {
@@ -602,8 +630,63 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     session_renaming = true;
                                 }
                                 KeyCode::Char('?') => {
-                                    // List keys — send to server and display result
-                                    cmd_batch.push("list-keys\n".into());
+                                    // Build key list locally and show overlay
+                                    keys_viewer_lines.clear();
+                                    keys_viewer_scroll = 0;
+
+                                    // Same hardcoded defaults as server.rs ListKeys handler
+                                    let defaults: Vec<(&str, &str)> = vec![
+                                        ("c", "new-window"),
+                                        ("n", "next-window"),
+                                        ("p", "previous-window"),
+                                        ("%", "split-window -h"),
+                                        ("\"", "split-window -v"),
+                                        ("x", "kill-pane"),
+                                        ("d", "detach-client"),
+                                        ("w", "choose-window"),
+                                        (",", "rename-window"),
+                                        ("$", "rename-session"),
+                                        ("space", "next-layout"),
+                                        ("[", "copy-mode"),
+                                        ("]", "paste-buffer"),
+                                        (":", "command-prompt"),
+                                        ("q", "display-panes"),
+                                        ("z", "resize-pane -Z"),
+                                        ("o", "select-pane -t +"),
+                                        (";", "last-pane"),
+                                        ("l", "last-window"),
+                                        ("{", "swap-pane -U"),
+                                        ("}", "swap-pane -D"),
+                                        ("!", "break-pane"),
+                                        ("&", "kill-window"),
+                                        ("Up", "select-pane -U"),
+                                        ("Down", "select-pane -D"),
+                                        ("Left", "select-pane -L"),
+                                        ("Right", "select-pane -R"),
+                                        ("?", "list-keys"),
+                                        ("t", "clock-mode"),
+                                        ("=", "choose-buffer"),
+                                    ];
+
+                                    // Collect user-overridden keys for prefix table
+                                    let overridden_keys: std::collections::HashSet<String> = synced_bindings.iter()
+                                        .filter(|b| b.t == "prefix")
+                                        .map(|b| b.k.clone())
+                                        .collect();
+
+                                    // Add defaults (excluding overridden)
+                                    for (k, cmd) in &defaults {
+                                        if !overridden_keys.contains(*k) {
+                                            keys_viewer_lines.push(format!("bind-key -T prefix {} {}", k, cmd));
+                                        }
+                                    }
+                                    // Add all user bindings
+                                    for b in &synced_bindings {
+                                        let repeat_flag = if b.r { " -r" } else { "" };
+                                        keys_viewer_lines.push(format!("bind-key{} -T {} {} {}", repeat_flag, b.t, b.k, b.c));
+                                    }
+
+                                    keys_viewer = true;
                                 }
                                 KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
                                 KeyCode::Char('=') => { cmd_batch.push("choose-buffer\n".into()); }
@@ -890,6 +973,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     }
                                 }
                                 KeyCode::Esc if tree_chooser => { tree_chooser = false; }
+                                // --- list-keys viewer (C-b ?) ---
+                                KeyCode::Up if keys_viewer => { if keys_viewer_scroll > 0 { keys_viewer_scroll -= 1; } }
+                                KeyCode::Down if keys_viewer => { keys_viewer_scroll += 1; }
+                                KeyCode::PageUp if keys_viewer => { keys_viewer_scroll = keys_viewer_scroll.saturating_sub(20); }
+                                KeyCode::PageDown if keys_viewer => { keys_viewer_scroll += 20; }
+                                KeyCode::Home if keys_viewer => { keys_viewer_scroll = 0; }
+                                KeyCode::End if keys_viewer => { keys_viewer_scroll = keys_viewer_lines.len().saturating_sub(1); }
+                                KeyCode::Char('q') if keys_viewer => { keys_viewer = false; }
+                                KeyCode::Esc if keys_viewer => { keys_viewer = false; }
+                                KeyCode::Char('k') if keys_viewer => { if keys_viewer_scroll > 0 { keys_viewer_scroll -= 1; } }
+                                KeyCode::Char('j') if keys_viewer => { keys_viewer_scroll += 1; }
                                 // --- kill confirmation: y/Y/Enter confirms, n/N/Esc cancels ---
                                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if confirm_cmd.is_some() => {
                                     if let Some(cmd) = confirm_cmd.take() {
@@ -1149,7 +1243,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         // Rate-limit dump-state requests to avoid flooding the server.
         // dump_in_flight prevents >1 concurrent request; the interval check
         // ensures we don't re-request faster than ~100fps when typing.
-        let overlays_active = command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || confirm_cmd.is_some();
+        let overlays_active = command_input || renaming || pane_renaming || chooser || tree_chooser || session_chooser || keys_viewer || confirm_cmd.is_some();
         let should_dump = if force_dump || size_changed {
             true
         } else if typing_active {
@@ -1211,6 +1305,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             }
         }
 
+        // Update prefix2 key from server config (if provided)
+        if let Some(ref prefix2_str) = state.prefix2 {
+            if !prefix2_str.is_empty() {
+                if let Some((kc, km)) = parse_key_string(prefix2_str) {
+                    prefix2_key = Some((kc, km));
+                    prefix2_raw_char = if km.contains(KeyModifiers::CONTROL) {
+                        if let KeyCode::Char(c) = kc {
+                            Some((c as u8 & 0x1f) as char)
+                        } else { None }
+                    } else { None };
+                }
+            } else {
+                prefix2_key = None;
+                prefix2_raw_char = None;
+            }
+        }
+
         // Update status-style from server config (if provided)
         if let Some(ref ss) = state.status_style {
             if !ss.is_empty() {
@@ -1227,11 +1338,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         }
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
-            if !sl.is_empty() { custom_status_left = Some(sl); }
+            if !sl.is_empty() {
+                // Truncate to status_left_length (Unicode-aware, char count)
+                let truncated: String = sl.chars().take(state.status_left_length).collect();
+                custom_status_left = Some(truncated);
+            }
         }
         if let Some(sr) = state.status_right {
-            if !sr.is_empty() { custom_status_right = Some(sr); }
+            if !sr.is_empty() {
+                // Truncate to status_right_length (Unicode-aware, char count)
+                let truncated: String = sr.chars().take(state.status_right_length).collect();
+                custom_status_right = Some(truncated);
+            }
         }
+        let status_lines = state.status_lines;
+        let status_format = state.status_format;
         // Update pane border styles
         if let Some(ref pbs) = state.pane_border_style {
             if !pbs.is_empty() {
@@ -1267,7 +1388,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default().direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref()).split(area);
+                .constraints([Constraint::Min(1), Constraint::Length(status_lines as u16)].as_ref()).split(area);
 
             /// Render a large ASCII clock overlay (tmux clock-mode)
             fn render_clock_overlay(f: &mut Frame, area: Rect) {
@@ -1641,6 +1762,55 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 let para = Paragraph::new(Text::from(lines));
                 f.render_widget(para, overlay.inner(oa));
             }
+            if keys_viewer {
+                // Proportional overlay: 90% width, up to 80% height
+                let avail_h = chunks[0].height;
+                let overlay_h = (avail_h * 80 / 100).max(5).min(avail_h.saturating_sub(2));
+                let overlay = Block::default().borders(Borders::ALL)
+                    .title(" list-keys (q/Esc=close, Up/Down/PgUp/PgDn=scroll) ");
+                let oa = centered_rect(90, overlay_h, chunks[0]);
+                f.render_widget(Clear, oa);
+                f.render_widget(&overlay, oa);
+                let inner = overlay.inner(oa);
+                let visible_h = inner.height as usize;
+                // Clamp scroll so we don't scroll past the end
+                let max_scroll = keys_viewer_lines.len().saturating_sub(visible_h);
+                if keys_viewer_scroll > max_scroll { keys_viewer_scroll = max_scroll; }
+                let mut lines: Vec<Line> = Vec::new();
+                for (i, entry) in keys_viewer_lines.iter().enumerate().skip(keys_viewer_scroll).take(visible_h) {
+                    // Highlight the "bind-key" keyword and table name
+                    if let Some(rest) = entry.strip_prefix("bind-key") {
+                        lines.push(Line::from(vec![
+                            Span::styled("bind-key", Style::default().fg(Color::Green)),
+                            Span::raw(rest.to_string()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(entry.clone()));
+                    }
+                }
+                // Show scroll indicator in bottom-right
+                let para = Paragraph::new(Text::from(lines));
+                f.render_widget(para, inner);
+                // Scroll position indicator
+                if keys_viewer_lines.len() > visible_h {
+                    let pct = if max_scroll == 0 { 100 } else { keys_viewer_scroll * 100 / max_scroll };
+                    let indicator = if keys_viewer_scroll == 0 {
+                        "Top".to_string()
+                    } else if keys_viewer_scroll >= max_scroll {
+                        "Bot".to_string()
+                    } else {
+                        format!("{}%", pct)
+                    };
+                    let ind_len = indicator.len() as u16;
+                    if oa.width > ind_len + 2 {
+                        let ind_x = oa.x + oa.width - ind_len - 2;
+                        let ind_y = oa.y + oa.height - 1;
+                        let ind_rect = Rect::new(ind_x, ind_y, ind_len, 1);
+                        let ind_para = Paragraph::new(Span::styled(indicator, Style::default().fg(Color::DarkGray)));
+                        f.render_widget(ind_para, ind_rect);
+                    }
+                }
+            }
             if chooser {
                 let mut rects: Vec<(usize, Rect)> = Vec::new();
                 fn rec(node: &LayoutJson, area: Rect, out: &mut Vec<(usize, Rect)>) {
@@ -1761,7 +1931,28 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             }
             let status_bar = Paragraph::new(Line::from(status_spans)).style(sb_base);
             f.render_widget(Clear, chunks[1]);
-            f.render_widget(status_bar, chunks[1]);
+            // Render the first status line (line 0)
+            let line0_area = Rect { x: chunks[1].x, y: chunks[1].y, width: chunks[1].width, height: 1.min(chunks[1].height) };
+            f.render_widget(status_bar, line0_area);
+            // Render additional status lines (index 1+) from status_format
+            for line_idx in 1..status_lines {
+                let line_y = chunks[1].y + line_idx as u16;
+                if line_y >= chunks[1].y + chunks[1].height { break; }
+                let line_area = Rect { x: chunks[1].x, y: line_y, width: chunks[1].width, height: 1 };
+                let text = if line_idx < status_format.len() && !status_format[line_idx].is_empty() {
+                    status_format[line_idx].clone()
+                } else {
+                    String::new()
+                };
+                // Pad to full width
+                let padded: String = if text.len() < line_area.width as usize {
+                    format!("{}{}", text, " ".repeat(line_area.width as usize - text.len()))
+                } else {
+                    text.chars().take(line_area.width as usize).collect()
+                };
+                let line_widget = Paragraph::new(Line::from(Span::styled(padded, sb_base))).style(sb_base);
+                f.render_widget(line_widget, line_area);
+            }
             if renaming {
                 let overlay = Block::default().borders(Borders::ALL).title("rename window");
                 let oa = centered_rect(60, 3, chunks[0]);

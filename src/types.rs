@@ -60,6 +60,8 @@ pub struct Window {
     /// True when the user has manually renamed this window (auto-rename won't override).
     /// Cleared when `set automatic-rename on` is explicitly set.
     pub manual_rename: bool,
+    /// Current position in the named layout cycle (0..4)
+    pub layout_index: usize,
 }
 
 /// A menu item for display-menu
@@ -161,6 +163,7 @@ pub struct AppState {
     pub escape_time_ms: u64,
     pub repeat_time_ms: u64,
     pub prefix_key: (KeyCode, KeyModifiers),
+    pub prefix2_key: Option<(KeyCode, KeyModifiers)>,
     pub prediction_dimming: bool,
     pub drag: Option<DragState>,
     pub last_window_area: Rect,
@@ -175,8 +178,8 @@ pub struct AppState {
     /// Selection mode: Char (default), Line (V), Rect (C-v)
     pub copy_selection_mode: SelectionMode,
     /// Copy-mode search query
-    pub copy_search_query: String,
-    /// Copy-mode search matches: (row, col_start, col_end) in screen coords
+    pub copy_search_query: String,    /// Numeric prefix count for copy-mode motions (vi-style)
+    pub copy_count: Option<usize>,    /// Copy-mode search matches: (row, col_start, col_end) in screen coords
     pub copy_search_matches: Vec<(u16, u16, u16)>,
     /// Current match index in copy_search_matches
     pub copy_search_idx: usize,
@@ -184,12 +187,24 @@ pub struct AppState {
     pub copy_search_forward: bool,
     /// Pending find-char operation: (f=0,F=1,t=2,T=3) for next char input
     pub copy_find_char_pending: Option<u8>,
+    /// Pending text-object prefix: 0 = 'a' (a-word), 1 = 'i' (inner-word)
+    pub copy_text_object_pending: Option<u8>,
+    /// Pending register selection: true when '"' was pressed, waiting for a-z
+    pub copy_register_pending: bool,
+    /// Currently selected named register (a-z), None = default unnamed
+    pub copy_register: Option<char>,
+    /// Named registers a-z for copy-mode yank/paste
+    pub named_registers: std::collections::HashMap<char, String>,
     pub display_map: Vec<(usize, Vec<usize>)>,
     /// Key tables: "prefix" (default), "root", "copy-mode-vi", "copy-mode-emacs", etc.
     pub key_tables: std::collections::HashMap<String, Vec<Bind>>,
+    /// Current key table for switch-client -T (None = normal mode)
+    pub current_key_table: Option<String>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
     pub control_port: Option<u16>,
     pub session_name: String,
+    /// Numeric session ID (tmux-compatible: $0, $1, $2...).
+    pub session_id: usize,
     /// -L socket name for namespace isolation (tmux compatible).
     /// When set, port/key files are stored as `{socket_name}__{session_name}.port`.
     pub socket_name: Option<String>,
@@ -296,6 +311,28 @@ pub struct AppState {
     pub status_interval: u64,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
+    /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
+    pub main_pane_width: u16,
+    /// main-pane-height: percentage for main pane in main-horizontal layout (0 = use 60% heuristic)
+    pub main_pane_height: u16,
+    /// status-left-length: max display width for status-left (default 10)
+    pub status_left_length: usize,
+    /// status-right-length: max display width for status-right (default 40)
+    pub status_right_length: usize,
+    /// status lines: number of status bar lines (default 1, set via `set status N`)
+    pub status_lines: usize,
+    /// status-format: custom format strings for each status line (index 1+)
+    pub status_format: Vec<String>,
+    /// window-size: "smallest", "largest", "manual", "latest" (default "latest")
+    pub window_size: String,
+    /// allow-passthrough: "on", "off", "all" (default "off")
+    pub allow_passthrough: String,
+    /// copy-command: command to pipe yanked text to (default empty)
+    pub copy_command: String,
+    /// command-alias: map of alias name to expansion
+    pub command_aliases: std::collections::HashMap<String, String>,
+    /// set-clipboard: "on", "off", "external" (default "on")
+    pub set_clipboard: String,
 }
 
 impl AppState {
@@ -309,6 +346,7 @@ impl AppState {
             escape_time_ms: 500,
             repeat_time_ms: 500,
             prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
+            prefix2_key: None,
             prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -318,31 +356,31 @@ impl AppState {
             paste_buffers: Vec::new(),
             status_left: "[#S] ".to_string(),
             status_right: "\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(),
-            window_base_index: 1,
+            window_base_index: 0,
             copy_anchor: None,
             copy_pos: None,
             copy_scroll_offset: 0,
             copy_selection_mode: SelectionMode::Char,
+            copy_count: None,
             copy_search_query: String::new(),
             copy_search_matches: Vec::new(),
             copy_search_idx: 0,
             copy_search_forward: true,
             copy_find_char_pending: None,
+            copy_text_object_pending: None,
+            copy_register_pending: false,
+            copy_register: None,
+            named_registers: std::collections::HashMap::new(),
             display_map: Vec::new(),
-            key_tables: {
-                let mut tables = std::collections::HashMap::new();
-                tables.entry("root".to_string()).or_insert_with(Vec::new).push(
-                    Bind {
-                        key: (crossterm::event::KeyCode::Char('q'), crossterm::event::KeyModifiers::CONTROL),
-                        action: Action::Detach,
-                        repeat: false,
-                    },
-                );
-                tables
-            },
+            key_tables: std::collections::HashMap::new(),
+            current_key_table: None,
             control_rx: None,
             control_port: None,
             session_name,
+            session_id: {
+                static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             socket_name: None,
             attached_clients: 0,
             created_at: Local::now(),
@@ -399,6 +437,17 @@ impl AppState {
             command_history_idx: 0,
             status_interval: 15,
             status_justify: "left".to_string(),
+            main_pane_width: 0,
+            main_pane_height: 0,
+            status_left_length: 10,
+            status_right_length: 40,
+            status_lines: 1,
+            status_format: Vec::new(),
+            window_size: "latest".to_string(),
+            allow_passthrough: "off".to_string(),
+            copy_command: String::new(),
+            command_aliases: std::collections::HashMap::new(),
+            set_clipboard: "on".to_string(),
         }
     }
 
@@ -447,6 +496,8 @@ pub enum Action {
     RenameWindow,
     WindowChooser,
     ZoomPane,
+    /// Switch to a named key table (switch-client -T)
+    SwitchTable(String),
 }
 
 #[derive(Clone)]
@@ -464,7 +515,7 @@ pub enum CtrlReq {
     FocusPane(usize),
     FocusPaneByIndex(usize),
     SessionInfo(mpsc::Sender<String>),
-    CapturePaneRange(mpsc::Sender<String>, Option<u16>, Option<u16>),
+    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>),
     ClientAttach,
     ClientDetach,
     DumpLayout(mpsc::Sender<String>),
@@ -572,6 +623,8 @@ pub enum CtrlReq {
     ServerInfo(mpsc::Sender<String>),
     SendPrefix,
     PrevLayout,
+    SwitchClientTable(String),
+    ListCommands(mpsc::Sender<String>),
     ResizeWindow(String, u16),
     RespawnWindow,
     FocusIn,

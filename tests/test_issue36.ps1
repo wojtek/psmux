@@ -118,12 +118,12 @@ if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "mouse" -Exp
 Write-Host ""
 Write-Host "--- base-index option ---"
 
-Write-Test "Default base-index is 1"
-if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "base-index" -Expected "1") {
-    Write-Pass "Default base-index is 1"
+Write-Test "Default base-index is 0"
+if (Wait-ForOptionValue -Session $SESSION_NAME -Binary $PSMUX -Name "base-index" -Expected "0") {
+    Write-Pass "Default base-index is 0"
 } else {
     $v = (& $PSMUX show-options -v base-index -t $SESSION_NAME 2>&1) | Out-String
-    Write-Fail "Expected base-index=1, got: '$($v.Trim())'"
+    Write-Fail "Expected base-index=0, got: '$($v.Trim())'"
 }
 
 Write-Test "set -g base-index 0"

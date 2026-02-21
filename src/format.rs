@@ -8,10 +8,24 @@
 // -F custom format for list commands.
 
 use std::env;
+use std::cell::Cell;
 
 use crate::types::*;
 use crate::tree::*;
 use crate::config::format_key_binding;
+
+// Thread-local override for per-pane format expansion in list-panes.
+// When set to Some(pos), pane_* variables resolve for the Nth pane (0-based)
+// instead of the active pane.
+thread_local! {
+    static PANE_POS_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    static BUFFER_IDX_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Set the buffer index for per-buffer format expansion in list-buffers -F.
+pub fn set_buffer_idx_override(idx: Option<usize>) {
+    BUFFER_IDX_OVERRIDE.set(idx);
+}
 
 // ─────────────────── tmux window_layout generation ────────────────────
 
@@ -114,8 +128,9 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 }
                 b'P' => {
                     if let Some(w) = app.windows.get(win_idx) {
-                        let pid = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
-                        result.push_str(&pid.to_string());
+                        let active_id = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
+                        let pos = crate::tree::get_pane_position_in_window(&w.root, active_id).unwrap_or(0);
+                        result.push_str(&(pos + app.pane_base_index).to_string());
                     }
                     i += 2; continue;
                 }
@@ -129,7 +144,11 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'D' => {
-                    result.push_str(&chrono::Local::now().format("%Y-%m-%d").to_string());
+                    // tmux: #D = unique pane id (like %0, %1)
+                    if let Some(w) = app.windows.get(win_idx) {
+                        let active_id = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
+                        result.push_str(&format!("%{}", active_id));
+                    }
                     i += 2; continue;
                 }
                 b'#' => { result.push('#'); i += 2; continue; }
@@ -160,11 +179,12 @@ pub fn expand_format_for_pane(
     fmt: &str,
     app: &AppState,
     win_idx: usize,
-    _pane_id: usize,
+    pane_pos: usize,
 ) -> String {
-    // For pane-specific expansion, delegate to window expansion
-    // TODO: expand with specific pane targeting for multi-pane windows
-    expand_format_for_window(fmt, app, win_idx)
+    PANE_POS_OVERRIDE.set(Some(pane_pos));
+    let result = expand_format_for_window(fmt, app, win_idx);
+    PANE_POS_OVERRIDE.set(None);
+    result
 }
 
 // ─────────────────── expression dispatcher ───────────────────────
@@ -214,8 +234,10 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
                 if let Some(win) = app.windows.get(win_idx) {
                     let mut pane_ids = Vec::new();
                     collect_pane_ids(&win.root, &mut pane_ids);
-                    for pid in pane_ids {
-                        parts.push(expand_format_for_pane(inner_fmt, app, win_idx, pid));
+                    for (pos, _pid) in pane_ids.iter().enumerate() {
+                        PANE_POS_OVERRIDE.set(Some(pos));
+                        parts.push(expand_format_for_window(inner_fmt, app, win_idx));
+                        PANE_POS_OVERRIDE.set(None);
                     }
                 }
                 return parts.join(" ");
@@ -663,6 +685,7 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "status-position" => Some(app.status_position.clone()),
         "status-style" => Some(app.status_style.clone()),
         "prefix" => Some(format_key_binding(&app.prefix_key)),
+        "prefix2" => Some(app.prefix2_key.as_ref().map(|k| format_key_binding(k)).unwrap_or_else(|| "none".to_string())),
         "base-index" => Some(app.window_base_index.to_string()),
         "pane-base-index" => Some(app.pane_base_index.to_string()),
         "escape-time" => Some(app.escape_time_ms.to_string()),
@@ -759,8 +782,9 @@ fn expand_conditional(body: &str, app: &AppState, win_idx: usize) -> String {
     let (cond, true_branch, false_branch) = split_conditional(body);
 
     let is_true = if let Some((lhs_str, op, rhs_str)) = find_comparison_in_cond(&cond) {
-        let lhs = expand_format_for_window(&format!("#{{{}}}", lhs_str), app, win_idx);
-        let rhs = expand_format_for_window(&format!("#{{{}}}", rhs_str), app, win_idx);
+        // Expand sides as format strings (plain text passes through, #{var} expands)
+        let lhs = expand_format_for_window(lhs_str, app, win_idx);
+        let rhs = expand_format_for_window(rhs_str, app, win_idx);
         match op {
             "==" => lhs == rhs,
             "!=" => lhs != rhs,
@@ -771,7 +795,13 @@ fn expand_conditional(body: &str, app: &AppState, win_idx: usize) -> String {
             _ => false,
         }
     } else {
-        let cond_val = expand_format_for_window(&format!("#{{{}}}", cond), app, win_idx);
+        // If cond already contains format markers (#), expand it directly.
+        // Otherwise wrap as #{variable_name} to resolve the variable.
+        let cond_val = if cond.contains('#') {
+            expand_format_for_window(&cond, app, win_idx)
+        } else {
+            expand_format_for_window(&format!("#{{{}}}", cond), app, win_idx)
+        };
         is_truthy(&cond_val)
     };
 
@@ -785,12 +815,30 @@ fn expand_conditional(body: &str, app: &AppState, win_idx: usize) -> String {
 fn find_comparison_in_cond(cond: &str) -> Option<(&str, &str, &str)> {
     let ops = ["<=", ">=", "==", "!=", "<", ">"];
     for op in ops {
-        if let Some(pos) = cond.find(op) {
-            let lhs = &cond[..pos];
-            let rhs = &cond[pos + op.len()..];
-            if !lhs.is_empty() || !rhs.is_empty() {
-                return Some((lhs, op, rhs));
+        // Scan for op outside of nested #{...} blocks
+        let bytes = cond.as_bytes();
+        let op_bytes = op.as_bytes();
+        let mut i = 0;
+        let mut depth = 0usize;
+        while i + op_bytes.len() <= bytes.len() {
+            if i + 1 < bytes.len() && bytes[i] == b'#' && bytes[i + 1] == b'{' {
+                depth += 1;
+                i += 2;
+                continue;
             }
+            if bytes[i] == b'}' && depth > 0 {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
+                let lhs = &cond[..i];
+                let rhs = &cond[i + op.len()..];
+                if !lhs.is_empty() || !rhs.is_empty() {
+                    return Some((lhs, op, rhs));
+                }
+            }
+            i += 1;
         }
     }
     None
@@ -807,7 +855,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             return match var {
                 "session_name" => app.session_name.clone(),
                 "session_windows" => app.windows.len().to_string(),
-                "session_id" => format!("${}", app.session_name),
+                "session_id" => format!("${}", app.session_id),
                 "pid" | "server_pid" => std::process::id().to_string(),
                 "version" => VERSION.to_string(),
                 "host" | "hostname" => hostname_cached(),
@@ -818,12 +866,31 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             };
         }
     };
+    // Resolve the target pane for format expansion. When PANE_POS_OVERRIDE is set
+    // (during list-panes iteration), use that positional pane instead of the active pane.
+    let (fmt_pane_pos, fmt_pane_is_active) = {
+        let override_pos = PANE_POS_OVERRIDE.get();
+        if let Some(pos) = override_pos {
+            let active_id = get_active_pane_id(&win.root, &win.active_path);
+            let is_active = crate::tree::get_nth_pane(&win.root, pos)
+                .map(|p| Some(p.id) == active_id).unwrap_or(false);
+            (pos, is_active)
+        } else {
+            let active_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
+            let pos = crate::tree::get_pane_position_in_window(&win.root, active_id).unwrap_or(0);
+            (pos, true)
+        }
+    };
+    // Helper closure to get the target pane reference
+    let target_pane = || -> Option<&Pane> {
+        crate::tree::get_nth_pane(&win.root, fmt_pane_pos)
+    };
     match var {
         // ── Session ──
         "session_name" => app.session_name.clone(),
         "session_attached" => if app.attached_clients > 0 { "1".into() } else { "0".into() },
         "session_windows" => app.windows.len().to_string(),
-        "session_id" => format!("${}", app.session_name),
+        "session_id" => format!("${}", app.session_id),
         "session_created" => app.created_at.timestamp().to_string(),
         "session_created_string" => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
         "session_activity" | "session_last_attached" => app.created_at.timestamp().to_string(),
@@ -868,26 +935,26 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_offset_x" | "window_offset_y" | "window_stack_index" => "0".into(),
 
         // ── Pane ──
-        "pane_index" => get_active_pane_id(&win.root, &win.active_path).unwrap_or(0).to_string(),
+        "pane_index" => {
+            (fmt_pane_pos + app.pane_base_index).to_string()
+        }
         "pane_id" => {
-            let pid = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
-            format!("%{}", pid)
+            if let Some(p) = target_pane() { format!("%{}", p.id) } else { "%0".into() }
         }
         "pane_title" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if !p.title.is_empty() { p.title.clone() } else { win.name.clone() }
             } else { win.name.clone() }
         }
         "pane_width" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_cols.to_string() } else { "80".into() }
+            if let Some(p) = target_pane() { p.last_cols.to_string() } else { "80".into() }
         }
         "pane_height" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { p.last_rows.to_string() } else { "24".into() }
+            if let Some(p) = target_pane() { p.last_rows.to_string() } else { "24".into() }
         }
-        "pane_active" => "1".into(),
+        "pane_active" => if fmt_pane_is_active { "1".into() } else { "0".into() },
         "pane_current_command" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
-                // Query real foreground process name from PID
+            if let Some(p) = target_pane() {
                 if let Some(pid) = p.child_pid {
                     crate::platform::process_info::get_foreground_process_name(pid)
                         .unwrap_or_else(|| "shell".into())
@@ -899,8 +966,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { String::new() }
         }
         "pane_current_path" | "pane_path" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
-                // Query real CWD from the deepest child process
+            if let Some(p) = target_pane() {
                 if let Some(pid) = p.child_pid {
                     crate::platform::process_info::get_foreground_cwd(pid)
                         .unwrap_or_default()
@@ -912,12 +978,12 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { String::new() }
         }
         "pane_pid" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 p.child_pid.map(|pid| pid.to_string()).unwrap_or_default()
             } else { String::new() }
         }
         "pane_tty" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) { format!("/dev/pty{}", p.id) }
+            if let Some(p) = target_pane() { format!("/dev/pty{}", p.id) }
             else { String::new() }
         }
         "pane_in_mode" => match app.mode {
@@ -931,7 +997,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         },
         "pane_synchronized" => if app.sync_input { "1".into() } else { "0".into() },
         "pane_dead" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if p.dead { "1".into() } else { "0".into() }
             } else { "0".into() }
         }
@@ -940,8 +1006,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_input_off"
         | "pane_pipe" | "pane_unseen_changes" => "0".into(),
         "pane_last" => {
-            // Check if this pane was the last active pane
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if !app.last_pane_path.is_empty() {
                     if let Some(last_p) = active_pane(&win.root, &app.last_pane_path) {
                         if last_p.id == p.id { return "1".into(); }
@@ -951,7 +1016,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             "0".into()
         }
         "pane_marked" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if let Some((mw, mp)) = app.marked_pane {
                     if mw == win_idx && mp == p.id { "1".into() } else { "0".into() }
                 } else { "0".into() }
@@ -961,7 +1026,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             if app.marked_pane.is_some() { "1".into() } else { "0".into() }
         }
         "pane_left" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -970,7 +1035,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "0".into() }
         }
         "pane_top" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -979,7 +1044,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "0".into() }
         }
         "pane_right" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -988,7 +1053,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "79".into() }
         }
         "pane_bottom" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -997,8 +1062,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "23".into() }
         }
         "pane_at_top" => {
-            // Check if pane is at the top edge of the window
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -1009,7 +1073,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "1".into() }
         }
         "pane_at_bottom" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -1022,7 +1086,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "1".into() }
         }
         "pane_at_left" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -1033,7 +1097,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             } else { "1".into() }
         }
         "pane_at_right" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
@@ -1051,7 +1115,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
 
         // ── Cursor ──
         "cursor_x" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if let Ok(parser) = p.term.lock() {
                     let (_, c) = parser.screen().cursor_position();
                     return c.to_string();
@@ -1060,7 +1124,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             "0".into()
         }
         "cursor_y" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if let Ok(parser) = p.term.lock() {
                     let (r, _) = parser.screen().cursor_position();
                     return r.to_string();
@@ -1069,7 +1133,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             "0".into()
         }
         "cursor_character" => {
-            if let Some(p) = active_pane(&win.root, &win.active_path) {
+            if let Some(p) = target_pane() {
                 if let Ok(parser) = p.term.lock() {
                     let (r, c) = parser.screen().cursor_position();
                     if let Some(cell) = parser.screen().cell(r, c) {
@@ -1162,9 +1226,18 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         }
 
         // ── Buffer ──
-        "buffer_size" => app.paste_buffers.first().map(|b| b.len().to_string()).unwrap_or("0".into()),
-        "buffer_sample" => app.paste_buffers.first().map(|b| b.chars().take(50).collect::<String>()).unwrap_or_default(),
-        "buffer_name" => if app.paste_buffers.is_empty() { String::new() } else { "buffer0000".into() },
+        "buffer_size" => {
+            let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
+            app.paste_buffers.get(idx).map(|b| b.len().to_string()).unwrap_or("0".into())
+        }
+        "buffer_sample" => {
+            let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
+            app.paste_buffers.get(idx).map(|b| b.chars().take(50).collect::<String>()).unwrap_or_default()
+        }
+        "buffer_name" => {
+            let idx = BUFFER_IDX_OVERRIDE.get().unwrap_or(0);
+            if idx < app.paste_buffers.len() { format!("buffer{:04}", idx) } else { String::new() }
+        }
         "buffer_created" => app.created_at.timestamp().to_string(),
 
         // ── Client ──
@@ -1204,6 +1277,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         // ── Options as format variables ──
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
         "prefix" => format_key_binding(&app.prefix_key),
+        "prefix2" => app.prefix2_key.as_ref().map(|k| format_key_binding(k)).unwrap_or_else(|| "none".to_string()),
         "status" => if app.status_visible { "on".into() } else { "off".into() },
         "mode_keys" => app.mode_keys.clone(),
         "history_limit" => app.history_limit.to_string(),
@@ -1342,7 +1416,7 @@ pub fn default_list_sessions_format() -> &'static str {
 
 /// Default format for list-buffers.
 pub fn default_list_buffers_format() -> &'static str {
-    "buffer#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\""
+    "#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\""
 }
 
 /// Format a list of windows using a format string.
@@ -1362,8 +1436,11 @@ pub fn format_list_panes(app: &AppState, fmt: &str, win_idx: usize) -> String {
     };
     let mut ids = Vec::new();
     collect_pane_ids(&win.root, &mut ids);
-    ids.iter().map(|_pid| {
-        expand_format_for_window(fmt, app, win_idx)
+    ids.iter().enumerate().map(|(pos, _pid)| {
+        PANE_POS_OVERRIDE.set(Some(pos));
+        let line = expand_format_for_window(fmt, app, win_idx);
+        PANE_POS_OVERRIDE.set(None);
+        line
     }).collect::<Vec<_>>().join("\n")
 }
 

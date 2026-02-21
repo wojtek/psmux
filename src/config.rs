@@ -130,7 +130,13 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                 app.prefix_key = key;
             }
         }
-        "prefix2" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "prefix2" => {
+            if value == "none" || value.is_empty() {
+                app.prefix2_key = None;
+            } else if let Some(key) = parse_key_name(value) {
+                app.prefix2_key = Some(key);
+            }
+        }
         "escape-time" => {
             if let Ok(ms) = value.parse::<u64>() {
                 app.escape_time_ms = ms;
@@ -142,7 +148,20 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "cursor-style" => env::set_var("PSMUX_CURSOR_STYLE", value),
         "cursor-blink" => env::set_var("PSMUX_CURSOR_BLINK", if matches!(value, "on"|"true"|"1") { "1" } else { "0" }),
         "status" => {
-            app.status_visible = matches!(value, "on" | "true" | "1" | "2");
+            if let Ok(n) = value.parse::<usize>() {
+                if n >= 2 {
+                    app.status_visible = true;
+                    app.status_lines = n;
+                } else if n == 1 {
+                    app.status_visible = true;
+                    app.status_lines = 1;
+                } else {
+                    app.status_visible = false;
+                    app.status_lines = 1;
+                }
+            } else {
+                app.status_visible = matches!(value, "on" | "true");
+            }
         }
         "status-style" => {
             app.status_style = value.to_string();
@@ -251,7 +270,40 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "window-style" | "window-active-style" => { app.environment.insert(key.to_string(), value.to_string()); }
         "wrap-search" => { app.environment.insert(key.to_string(), value.to_string()); }
         "lock-after-time" | "lock-command" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "main-pane-width" => {
+            if let Ok(n) = value.parse::<u16>() { app.main_pane_width = n; }
+        }
+        "main-pane-height" => {
+            if let Ok(n) = value.parse::<u16>() { app.main_pane_height = n; }
+        }
+        "status-left-length" => {
+            if let Ok(n) = value.parse::<usize>() { app.status_left_length = n; }
+        }
+        "status-right-length" => {
+            if let Ok(n) = value.parse::<usize>() { app.status_right_length = n; }
+        }
+        "window-size" => { app.window_size = value.to_string(); }
+        "allow-passthrough" => { app.allow_passthrough = value.to_string(); }
+        "copy-command" => { app.copy_command = value.to_string(); }
+        "set-clipboard" => { app.set_clipboard = value.to_string(); }
+        "command-alias" => {
+            if let Some(pos) = value.find('=') {
+                let alias = value[..pos].trim().to_string();
+                let expansion = value[pos+1..].trim().to_string();
+                app.command_aliases.insert(alias, expansion);
+            }
+        }
         _ => {
+            // Handle status-format[N] patterns
+            if key.starts_with("status-format[") && key.ends_with(']') {
+                if let Ok(idx) = key["status-format[".len()..key.len()-1].parse::<usize>() {
+                    while app.status_format.len() <= idx {
+                        app.status_format.push(String::new());
+                    }
+                    app.status_format[idx] = value.to_string();
+                    return;
+                }
+            }
             // Store any unknown option in the environment map for plugin compat
             app.environment.insert(key.to_string(), value.to_string());
         }
@@ -637,12 +689,12 @@ fn parse_run_shell(_app: &mut AppState, line: &str) {
 
     if background {
         #[cfg(windows)]
-        { let _ = std::process::Command::new("cmd").args(["/C", shell_cmd]).spawn(); }
+        { let _ = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", shell_cmd]).spawn(); }
         #[cfg(not(windows))]
         { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).spawn(); }
     } else {
         #[cfg(windows)]
-        { let _ = std::process::Command::new("cmd").args(["/C", shell_cmd]).output(); }
+        { let _ = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", shell_cmd]).output(); }
         #[cfg(not(windows))]
         { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).output(); }
     }
@@ -703,7 +755,7 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
         !condition.is_empty() && condition != "0"
     } else {
         #[cfg(windows)]
-        { std::process::Command::new("cmd").args(["/C", condition]).status().map(|s| s.success()).unwrap_or(false) }
+        { std::process::Command::new("pwsh").args(["-NoProfile", "-Command", condition]).status().map(|s| s.success()).unwrap_or(false) }
         #[cfg(not(windows))]
         { std::process::Command::new("sh").args(["-c", condition]).status().map(|s| s.success()).unwrap_or(false) }
     };

@@ -160,7 +160,7 @@ Test-Assert "new-session -P -F '#{pane_id}' returns %N" ($nsPaneIdStr -match '^%
 # Test 3.3: new-session -d -P -F '#{session_name}:#{window_index}' returns full format
 $nsFull = & $exe new-session -d -s test-complex -P -F '#{session_name}:#{window_index}' 2>&1
 $nsFullStr = ($nsFull | Out-String).Trim()
-Test-Assert "new-session -P -F complex returns expected" ($nsFullStr -eq "test-complex:1") "Got: '$nsFullStr'"
+Test-Assert "new-session -P -F complex returns expected" ($nsFullStr -eq "test-complex:0") "Got: '$nsFullStr'"
 
 # Cleanup
 & $exe kill-session -t test-pdefault 2>$null
