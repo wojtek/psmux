@@ -332,8 +332,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     let mut custom_status_right: Option<String> = None;
     let mut pane_border_fg: Color = Color::DarkGray;
     let mut pane_active_border_fg: Color = Color::Green;
-    let mut win_status_fmt: String = "#I:#W#F".to_string();
-    let mut win_status_current_fmt: String = "#I:#W#F".to_string();
+    let mut win_status_fmt: String = "#I:#W#{?window_flags,#{window_flags}, }".to_string();
+    let mut win_status_current_fmt: String = "#I:#W#{?window_flags,#{window_flags}, }".to_string();
     let mut win_status_sep: String = " ".to_string();
     let mut win_status_style: Option<(Option<Color>, Option<Color>, bool)> = None;
     let mut win_status_current_style: Option<(Option<Color>, Option<Color>, bool)> = None;
@@ -1404,6 +1404,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                         sel_start_col,
                         sel_end_row,
                         sel_end_col,
+                        sel_mode,
                         copy_cursor_row,
                         copy_cursor_col,
                         content,
@@ -1426,7 +1427,23 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                                     if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
                                     let in_selection = if *copy_mode && *active {
                                         if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
-                                            r >= *sr && r <= *er && c >= *sc && c <= *ec
+                                            let mode = sel_mode.as_deref().unwrap_or("char");
+                                            match mode {
+                                                "rect" => r >= *sr && r <= *er && c >= (*sc).min(*ec) && c <= (*sc).max(*ec),
+                                                "line" => r >= *sr && r <= *er,
+                                                _ /* char */ => {
+                                                    if *sr == *er {
+                                                        // Single line
+                                                        r == *sr && c >= (*sc).min(*ec) && c <= (*sc).max(*ec)
+                                                    } else if r == *sr {
+                                                        c >= *sc
+                                                    } else if r == *er {
+                                                        c <= *ec
+                                                    } else {
+                                                        r > *sr && r < *er
+                                                    }
+                                                }
+                                            }
                                         } else { false }
                                     } else { false };
                                     if *active && dim_preds && !*alternate_screen
@@ -1815,7 +1832,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
             };
             // Left portion: custom status_left or default [session] prefix
             let left_prefix = match custom_status_left {
-                Some(ref sl) => format!("{} ", sl),
+                Some(ref sl) => sl.clone(),
                 None => format!("[{}] ", name),
             };
             let mut status_spans: Vec<Span> = vec![
@@ -1839,15 +1856,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
                 if w.active {
                     let active_style = if let Some((fg, bg, bold)) = win_status_current_style {
                         let mut s = Style::default();
-                        if let Some(c) = fg { s = s.fg(c); } else { s = s.fg(Color::Black); }
-                        if let Some(c) = bg { s = s.bg(c); } else { s = s.bg(Color::Yellow); }
+                        if let Some(c) = fg { s = s.fg(c); }
+                        if let Some(c) = bg { s = s.bg(c); }
                         if bold { s = s.add_modifier(Modifier::BOLD); }
                         s
                     } else {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
+                        // tmux default: inherit from status-style (no special highlight)
+                        sb_base
                     };
                     status_spans.push(Span::styled(tab_text, active_style));
                 } else if w.activity {

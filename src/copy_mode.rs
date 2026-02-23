@@ -26,6 +26,114 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_register_pending = false;
     app.copy_register = None;
     app.copy_count = None;
+    // Mark the active pane as being in copy mode (pane-local state).
+    save_copy_state_to_pane(app);
+}
+
+/// Exit copy mode: reset all copy state and scroll the active pane back to
+/// live output.  Every copy-mode exit path should call this to avoid leaving
+/// a pane scrolled while no longer in copy mode (fixes #43).
+pub fn exit_copy_mode(app: &mut AppState) {
+    app.mode = Mode::Passthrough;
+    app.copy_anchor = None;
+    app.copy_pos = None;
+    app.copy_scroll_offset = 0;
+    let win = &mut app.windows[app.active_idx];
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        // Clear the pane-local copy state so re-entering this pane won't
+        // restore a stale copy mode.
+        p.copy_state = None;
+        if let Ok(mut parser) = p.term.lock() {
+            parser.screen_mut().set_scrollback(0);
+        }
+    }
+}
+
+/// Save the current global copy-mode state into the active pane.
+/// Called whenever we are about to switch away from a pane that is in copy mode.
+pub fn save_copy_state_to_pane(app: &mut AppState) {
+    let (in_search, search_input, search_input_forward) = match &app.mode {
+        Mode::CopySearch { input, forward } => (true, input.clone(), *forward),
+        _ => (false, String::new(), true),
+    };
+    let state = CopyModeState {
+        anchor: app.copy_anchor,
+        anchor_scroll_offset: app.copy_anchor_scroll_offset,
+        pos: app.copy_pos,
+        scroll_offset: app.copy_scroll_offset,
+        selection_mode: app.copy_selection_mode,
+        search_query: app.copy_search_query.clone(),
+        count: app.copy_count,
+        search_matches: app.copy_search_matches.clone(),
+        search_idx: app.copy_search_idx,
+        search_forward: app.copy_search_forward,
+        find_char_pending: app.copy_find_char_pending,
+        text_object_pending: app.copy_text_object_pending,
+        register_pending: app.copy_register_pending,
+        register: app.copy_register,
+        in_search,
+        search_input,
+        search_input_forward,
+    };
+    let win = &mut app.windows[app.active_idx];
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        p.copy_state = Some(state);
+    }
+}
+
+/// Restore copy-mode state from the newly-focused pane into the global
+/// AppState fields.  If the pane has no saved copy state, set mode to
+/// Passthrough.
+pub fn restore_copy_state_from_pane(app: &mut AppState) {
+    let win = &app.windows[app.active_idx];
+    let state = active_pane(&win.root, &win.active_path)
+        .and_then(|p| p.copy_state.clone());
+    if let Some(s) = state {
+        app.copy_anchor = s.anchor;
+        app.copy_anchor_scroll_offset = s.anchor_scroll_offset;
+        app.copy_pos = s.pos;
+        app.copy_scroll_offset = s.scroll_offset;
+        app.copy_selection_mode = s.selection_mode;
+        app.copy_search_query = s.search_query;
+        app.copy_count = s.count;
+        app.copy_search_matches = s.search_matches;
+        app.copy_search_idx = s.search_idx;
+        app.copy_search_forward = s.search_forward;
+        app.copy_find_char_pending = s.find_char_pending;
+        app.copy_text_object_pending = s.text_object_pending;
+        app.copy_register_pending = s.register_pending;
+        app.copy_register = s.register;
+        if s.in_search {
+            app.mode = Mode::CopySearch { input: s.search_input, forward: s.search_input_forward };
+        } else {
+            app.mode = Mode::CopyMode;
+        }
+    } else {
+        // New pane is not in copy mode — switch to passthrough.
+        app.mode = Mode::Passthrough;
+    }
+}
+
+/// Handle a pane or window focus change: save current copy state if in copy
+/// mode, then after the switch, restore the new pane's state.
+/// Call the `switch_fn` closure between save and restore to perform the
+/// actual focus change.
+pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switch_fn: F) {
+    let was_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    if was_copy {
+        save_copy_state_to_pane(app);
+    }
+    switch_fn(app);
+    // After switching, check if the new pane has copy state to restore.
+    let win = &app.windows[app.active_idx];
+    let new_pane_has_copy = active_pane(&win.root, &win.active_path)
+        .map_or(false, |p| p.copy_state.is_some());
+    if new_pane_has_copy {
+        restore_copy_state_from_pane(app);
+    } else if was_copy {
+        // We were in copy mode but new pane is not — switch to passthrough.
+        app.mode = Mode::Passthrough;
+    }
 }
 
 #[cfg(windows)]
@@ -370,68 +478,93 @@ pub fn scroll_to_bottom(app: &mut AppState) {
 pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
     let (anchor, pos) = match (app.copy_anchor, app.copy_pos) { (Some(a), Some(p)) => (a,p), _ => return Ok(()) };
     let sel_mode = app.copy_selection_mode;
+    let anchor_scroll = app.copy_anchor_scroll_offset;
+    let current_scroll = app.copy_scroll_offset;
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
-    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
-    let screen = parser.screen();
-    let r0 = anchor.0.min(pos.0); let r1 = anchor.0.max(pos.0);
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(()) };
+    let rows = p.last_rows;
+    let cols = p.last_cols;
+
+    // Compute absolute line positions (relative to an arbitrary reference).
+    // abs = screen_row - scrollback_at_that_time
+    // Higher abs = further down in the terminal buffer (more recent).
+    let anchor_abs = anchor.0 as i64 - anchor_scroll as i64;
+    let cursor_abs = pos.0 as i64 - current_scroll as i64;
+    let sel_top_abs = anchor_abs.min(cursor_abs);
+    let sel_bot_abs = anchor_abs.max(cursor_abs);
+    let total_lines = (sel_bot_abs - sel_top_abs + 1) as usize;
+
+    // For character mode: determine which endpoint is the "top" (first) line
+    let (top_col, bot_col) = if anchor_abs <= cursor_abs {
+        (anchor.1, pos.1)
+    } else {
+        (pos.1, anchor.1)
+    };
+
+    // Read all selected rows by adjusting scrollback as needed.
+    // At scrollback S, row R shows absolute line (R - S).
+    // To read absolute line L: row = L + S, needs 0 <= L + S < rows.
     let mut text = String::new();
-    match sel_mode {
-        crate::types::SelectionMode::Rect => {
-            // Rectangle selection: fixed column range on every row
-            let c0 = anchor.1.min(pos.1); let c1 = anchor.1.max(pos.1);
-            for r in r0..=r1 {
-                let mut line = String::new();
-                for c in c0..=c1 {
-                    if let Some(cell) = screen.cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
-                }
-                text.push_str(line.trim_end());
-                if r < r1 { text.push('\n'); }
-            }
-        }
-        crate::types::SelectionMode::Line => {
-            // Line selection: full rows from r0 to r1
-            let cols = p.last_cols;
-            for r in r0..=r1 {
-                let mut line = String::new();
-                for c in 0..cols {
-                    if let Some(cell) = screen.cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
-                }
-                text.push_str(line.trim_end());
-                text.push('\n');
-            }
-        }
-        crate::types::SelectionMode::Char => {
-            // Character-wise (linewise spanning): first line from anchor col,
-            // middle lines full width, last line to cursor col
-            let cols = p.last_cols;
-            let ac = anchor.1.min(pos.1); let pc = anchor.1.max(pos.1);
-            // Single-line selection
-            if r0 == r1 {
-                let c0 = ac; let c1 = pc;
-                for c in c0..=c1 {
-                    if let Some(cell) = screen.cell(r0, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
-                }
-            } else {
-                // Determine which endpoint is anchor vs cursor
-                let (start_r, start_c, end_r, end_c) = if (anchor.0, anchor.1) <= (pos.0, pos.1) {
-                    (anchor.0, anchor.1, pos.0, pos.1)
-                } else {
-                    (pos.0, pos.1, anchor.0, anchor.1)
-                };
-                for r in r0..=r1 {
-                    let line_start = if r == start_r { start_c } else { 0 };
-                    let line_end = if r == end_r { end_c } else { cols.saturating_sub(1) };
+    let mut abs_idx: usize = 0; // running index within selection
+    let mut next_abs = sel_top_abs;
+    while next_abs <= sel_bot_abs {
+        // Set scrollback so next_abs maps to row 0 (or as close as possible)
+        let target_sb = (-next_abs).max(0) as usize;
+        parser.screen_mut().set_scrollback(target_sb);
+        let actual_sb = parser.screen().scrollback() as i64;
+        let vis_start_abs = -actual_sb;
+        let vis_end_abs   = -actual_sb + rows as i64 - 1;
+        let read_start = next_abs.max(vis_start_abs);
+        let read_end   = sel_bot_abs.min(vis_end_abs);
+        if read_start > read_end { break; }
+
+        for aline in read_start..=read_end {
+            let r = (aline + actual_sb) as u16;
+            let is_first = abs_idx == 0;
+            let is_last  = abs_idx + 1 == total_lines;
+            match sel_mode {
+                crate::types::SelectionMode::Rect => {
+                    let c0 = anchor.1.min(pos.1); let c1 = anchor.1.max(pos.1);
                     let mut line = String::new();
-                    for c in line_start..=line_end {
-                        if let Some(cell) = screen.cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
+                    for c in c0..=c1 {
+                        if let Some(cell) = parser.screen().cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
                     }
                     text.push_str(line.trim_end());
-                    if r < r1 { text.push('\n'); }
+                    if !is_last { text.push('\n'); }
+                }
+                crate::types::SelectionMode::Line => {
+                    let mut line = String::new();
+                    for c in 0..cols {
+                        if let Some(cell) = parser.screen().cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
+                    }
+                    text.push_str(line.trim_end());
+                    text.push('\n');
+                }
+                crate::types::SelectionMode::Char => {
+                    if total_lines == 1 {
+                        let c0 = anchor.1.min(pos.1); let c1 = anchor.1.max(pos.1);
+                        for c in c0..=c1 {
+                            if let Some(cell) = parser.screen().cell(r, c) { text.push_str(&cell.contents().to_string()); } else { text.push(' '); }
+                        }
+                    } else {
+                        let line_start = if is_first { top_col } else { 0 };
+                        let line_end   = if is_last  { bot_col } else { cols.saturating_sub(1) };
+                        let mut line = String::new();
+                        for c in line_start..=line_end {
+                            if let Some(cell) = parser.screen().cell(r, c) { line.push_str(&cell.contents().to_string()); } else { line.push(' '); }
+                        }
+                        text.push_str(line.trim_end());
+                        if !is_last { text.push('\n'); }
+                    }
                 }
             }
+            abs_idx += 1;
         }
+        next_abs = read_end + 1;
     }
+    // Restore original scrollback
+    parser.screen_mut().set_scrollback(current_scroll);
     // Store in named register if one was selected
     if let Some(reg) = app.copy_register.take() {
         app.named_registers.insert(reg, text.clone());
@@ -1015,6 +1148,7 @@ pub fn select_inner_word(app: &mut AppState) {
     let mut end = col;
     while end + 1 < bytes.len() && char_class(bytes[end + 1], &seps) == cls { end += 1; }
     app.copy_anchor = Some((r, start as u16));
+    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
     app.copy_pos = Some((r, end as u16));
     app.copy_selection_mode = crate::types::SelectionMode::Char;
 }
@@ -1037,6 +1171,7 @@ pub fn select_a_word(app: &mut AppState) {
     // Include trailing whitespace
     while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
     app.copy_anchor = Some((r, start as u16));
+    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
     app.copy_pos = Some((r, end as u16));
     app.copy_selection_mode = crate::types::SelectionMode::Char;
 }
@@ -1055,6 +1190,7 @@ pub fn select_inner_word_big(app: &mut AppState) {
         let mut end = col;
         while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
         app.copy_anchor = Some((r, start as u16));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
         app.copy_pos = Some((r, end as u16));
     } else {
         // Cursor on non-whitespace — select contiguous non-whitespace
@@ -1063,6 +1199,7 @@ pub fn select_inner_word_big(app: &mut AppState) {
         let mut end = col;
         while end + 1 < bytes.len() && !bytes[end + 1].is_whitespace() { end += 1; }
         app.copy_anchor = Some((r, start as u16));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
         app.copy_pos = Some((r, end as u16));
     }
     app.copy_selection_mode = crate::types::SelectionMode::Char;
@@ -1082,6 +1219,7 @@ pub fn select_a_word_big(app: &mut AppState) {
         let mut end = col;
         while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
         app.copy_anchor = Some((r, start as u16));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
         app.copy_pos = Some((r, end as u16));
     } else {
         // Cursor on non-whitespace — select contiguous non-whitespace
@@ -1092,6 +1230,7 @@ pub fn select_a_word_big(app: &mut AppState) {
         // Include trailing whitespace
         while end + 1 < bytes.len() && bytes[end + 1].is_whitespace() { end += 1; }
         app.copy_anchor = Some((r, start as u16));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
         app.copy_pos = Some((r, end as u16));
     }
     app.copy_selection_mode = crate::types::SelectionMode::Char;

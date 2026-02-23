@@ -257,7 +257,8 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
             app.mode = Mode::PaneChooser { opened_at: Instant::now() };
         }
         Action::MoveFocus(dir) => {
-            crate::input::move_focus(app, *dir);
+            let d = *dir;
+            switch_with_copy_save(app, |app| { crate::input::move_focus(app, d); });
         }
         Action::NewWindow => {
             let pty_system = portable_pty::PtySystemSelection::default()
@@ -276,14 +277,18 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
         }
         Action::NextWindow => {
             if !app.windows.is_empty() {
-                app.last_window_idx = app.active_idx;
-                app.active_idx = (app.active_idx + 1) % app.windows.len();
+                switch_with_copy_save(app, |app| {
+                    app.last_window_idx = app.active_idx;
+                    app.active_idx = (app.active_idx + 1) % app.windows.len();
+                });
             }
         }
         Action::PrevWindow => {
             if !app.windows.is_empty() {
-                app.last_window_idx = app.active_idx;
-                app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                switch_with_copy_save(app, |app| {
+                    app.last_window_idx = app.active_idx;
+                    app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                });
             }
         }
         Action::CopyMode => {
@@ -397,21 +402,27 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
         }
         "next-window" | "next" => {
             if !app.windows.is_empty() {
-                app.last_window_idx = app.active_idx;
-                app.active_idx = (app.active_idx + 1) % app.windows.len();
+                switch_with_copy_save(app, |app| {
+                    app.last_window_idx = app.active_idx;
+                    app.active_idx = (app.active_idx + 1) % app.windows.len();
+                });
             }
         }
         "previous-window" | "prev" => {
             if !app.windows.is_empty() {
-                app.last_window_idx = app.active_idx;
-                app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                switch_with_copy_save(app, |app| {
+                    app.last_window_idx = app.active_idx;
+                    app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                });
             }
         }
         "last-window" | "last" => {
             if app.last_window_idx < app.windows.len() {
-                let tmp = app.active_idx;
-                app.active_idx = app.last_window_idx;
-                app.last_window_idx = tmp;
+                switch_with_copy_save(app, |app| {
+                    let tmp = app.active_idx;
+                    app.active_idx = app.last_window_idx;
+                    app.last_window_idx = tmp;
+                });
             }
         }
         "select-window" | "selectw" => {
@@ -421,8 +432,10 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         if idx >= app.window_base_index {
                             let internal_idx = idx - app.window_base_index;
                             if internal_idx < app.windows.len() {
-                                app.last_window_idx = app.active_idx;
-                                app.active_idx = internal_idx;
+                                switch_with_copy_save(app, |app| {
+                                    app.last_window_idx = app.active_idx;
+                                    app.active_idx = internal_idx;
+                                });
                             }
                         }
                     }
@@ -430,14 +443,17 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
             }
         }
         "select-pane" | "selectp" => {
-            if parts.iter().any(|p| *p == "-l") {
-                // select-pane -l: switch to last pane
-                let win = &mut app.windows[app.active_idx];
-                if !app.last_pane_path.is_empty() {
-                    let tmp = win.active_path.clone();
-                    win.active_path = app.last_pane_path.clone();
-                    app.last_pane_path = tmp;
-                }
+            // Save/restore copy mode across pane switches (tmux parity #43)
+            let is_last = parts.iter().any(|p| *p == "-l");
+            if is_last {
+                switch_with_copy_save(app, |app| {
+                    let win = &mut app.windows[app.active_idx];
+                    if !app.last_pane_path.is_empty() {
+                        let tmp = win.active_path.clone();
+                        win.active_path = app.last_pane_path.clone();
+                        app.last_pane_path = tmp;
+                    }
+                });
                 return Ok(());
             }
             let dir = if parts.iter().any(|p| *p == "-U") { FocusDir::Up }
@@ -445,17 +461,21 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                 else if parts.iter().any(|p| *p == "-L") { FocusDir::Left }
                 else if parts.iter().any(|p| *p == "-R") { FocusDir::Right }
                 else { return Ok(()); };
-            let win = &app.windows[app.active_idx];
-            app.last_pane_path = win.active_path.clone();
-            crate::input::move_focus(app, dir);
+            switch_with_copy_save(app, |app| {
+                let win = &app.windows[app.active_idx];
+                app.last_pane_path = win.active_path.clone();
+                crate::input::move_focus(app, dir);
+            });
         }
         "last-pane" | "lastp" => {
-            let win = &mut app.windows[app.active_idx];
-            if !app.last_pane_path.is_empty() {
-                let tmp = win.active_path.clone();
-                win.active_path = app.last_pane_path.clone();
-                app.last_pane_path = tmp;
-            }
+            switch_with_copy_save(app, |app| {
+                let win = &mut app.windows[app.active_idx];
+                if !app.last_pane_path.is_empty() {
+                    let tmp = win.active_path.clone();
+                    win.active_path = app.last_pane_path.clone();
+                    app.last_pane_path = tmp;
+                }
+            });
         }
         "rename-window" | "renamew" => {
             if let Some(name) = parts.get(1) {

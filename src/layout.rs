@@ -60,6 +60,8 @@ pub enum LayoutJson {
         sel_end_row: Option<u16>,
         sel_end_col: Option<u16>,
         #[serde(default)]
+        sel_mode: Option<String>,
+        #[serde(default)]
         copy_cursor_row: Option<u16>,
         #[serde(default)]
         copy_cursor_col: Option<u16>,
@@ -246,6 +248,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     sel_start_col: None,
                     sel_end_row: None,
                     sel_end_col: None,
+                    sel_mode: None,
                     copy_cursor_row: None,
                     copy_cursor_col: None,
                     content: lines,
@@ -344,7 +347,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let in_copy = matches!(app.mode, Mode::CopyMode);
     let scroll_off = app.copy_scroll_offset;
     let anchor = app.copy_anchor;
+    let anchor_scroll = app.copy_anchor_scroll_offset;
     let cpos = app.copy_pos;
+    let sel_mode = app.copy_selection_mode;
 
     // ── tiny helpers (no captures needed, so plain `fn` items) ───────
 
@@ -398,7 +403,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
         in_copy: bool,
         scroll_off: usize,
         anchor: Option<(u16, u16)>,
+        anchor_scroll: usize,
         cpos: Option<(u16, u16)>,
+        sel_mode: crate::types::SelectionMode,
         out: &mut String,
     ) {
         match node {
@@ -417,7 +424,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 for (i, c) in children.iter_mut().enumerate() {
                     if i > 0 { out.push(','); }
                     cur_path.push(i);
-                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, cpos, out);
+                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, sel_mode, out);
                     cur_path.pop();
                 }
                 out.push_str("]}");
@@ -581,12 +588,46 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 // selection bounds + copy cursor position
                 if is_active && in_copy {
                     if let (Some((ar, ac)), Some((pr, pc))) = (anchor, cpos) {
+                        // Compute display position of anchor accounting for
+                        // scrollback changes since the anchor was set.  Clamp
+                        // to the visible row range [0, last_rows-1].
+                        let display_ar = (ar as i32 + scroll_off as i32 - anchor_scroll as i32)
+                            .max(0)
+                            .min(p.last_rows as i32 - 1) as u16;
+                        // For char mode: send directional start/end so the
+                        // client can render flow selection (first line from
+                        // start_col to EOL, middle full, last line to end_col).
+                        // For rect mode: send min/max columns.
+                        // For line mode: columns are irrelevant.
+                        let (sr, sc, er, ec) = match sel_mode {
+                            crate::types::SelectionMode::Char => {
+                                let top = display_ar.min(pr);
+                                let bot = display_ar.max(pr);
+                                let (tc, bc) = if display_ar <= pr {
+                                    (ac, pc) // anchor is top, cursor is bottom
+                                } else {
+                                    (pc, ac) // cursor is top, anchor is bottom
+                                };
+                                (top, tc, bot, bc)
+                            }
+                            crate::types::SelectionMode::Rect => {
+                                (display_ar.min(pr), ac.min(pc), display_ar.max(pr), ac.max(pc))
+                            }
+                            crate::types::SelectionMode::Line => {
+                                (display_ar.min(pr), 0u16, display_ar.max(pr), p.last_cols.saturating_sub(1))
+                            }
+                        };
+                        let mode_str = match sel_mode {
+                            crate::types::SelectionMode::Char => "char",
+                            crate::types::SelectionMode::Line => "line",
+                            crate::types::SelectionMode::Rect => "rect",
+                        };
                         let _ = std::fmt::Write::write_fmt(out, format_args!(
-                            "\"sel_start_row\":{},\"sel_start_col\":{},\"sel_end_row\":{},\"sel_end_col\":{},",
-                            ar.min(pr), ac.min(pc), ar.max(pr), ac.max(pc),
+                            "\"sel_start_row\":{},\"sel_start_col\":{},\"sel_end_row\":{},\"sel_end_col\":{},\"sel_mode\":\"{}\",",
+                            sr, sc, er, ec, mode_str,
                         ));
                     } else {
-                        out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
+                        out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,\"sel_mode\":null,");
                     }
                     if let Some((pr, pc)) = cpos {
                         let _ = std::fmt::Write::write_fmt(out, format_args!(
@@ -597,7 +638,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         out.push_str("\"copy_cursor_row\":null,\"copy_cursor_col\":null,");
                     }
                 } else {
-                    out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,");
+                    out.push_str("\"sel_start_row\":null,\"sel_start_col\":null,\"sel_end_row\":null,\"sel_end_col\":null,\"sel_mode\":null,");
                     out.push_str("\"copy_cursor_row\":null,\"copy_cursor_col\":null,");
                 }
 
@@ -667,7 +708,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let mut out = String::with_capacity(32768);
     write_node(
         &mut win.root, &mut path, &active_path,
-        in_copy, scroll_off, anchor, cpos, &mut out,
+        in_copy, scroll_off, anchor, anchor_scroll, cpos, sel_mode, &mut out,
     );
     Ok(out)
 }

@@ -32,6 +32,9 @@ pub struct Pane {
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,
+    /// Per-pane copy mode state (tmux-style pane-local copy mode).
+    /// Some(_) when this pane is in copy mode, None otherwise.
+    pub copy_state: Option<CopyModeState>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -153,6 +156,32 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectionMode { Char, Line, Rect }
 
+/// Per-pane copy mode state, saved/restored on pane focus changes to provide
+/// tmux-style pane-local copy mode.
+#[derive(Clone)]
+pub struct CopyModeState {
+    pub anchor: Option<(u16, u16)>,
+    pub anchor_scroll_offset: usize,
+    pub pos: Option<(u16, u16)>,
+    pub scroll_offset: usize,
+    pub selection_mode: SelectionMode,
+    pub search_query: String,
+    pub count: Option<usize>,
+    pub search_matches: Vec<(u16, u16, u16)>,
+    pub search_idx: usize,
+    pub search_forward: bool,
+    pub find_char_pending: Option<u8>,
+    pub text_object_pending: Option<u8>,
+    pub register_pending: bool,
+    pub register: Option<char>,
+    /// true when the pane was in CopySearch (not CopyMode)
+    pub in_search: bool,
+    /// search input buffer (only meaningful when in_search == true)
+    pub search_input: String,
+    /// search direction for CopySearch
+    pub search_input_forward: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FocusDir { Left, Right, Up, Down }
 
@@ -173,6 +202,8 @@ pub struct AppState {
     pub status_right: String,
     pub window_base_index: usize,
     pub copy_anchor: Option<(u16,u16)>,
+    /// Scroll offset when copy_anchor was set (for viewport-relative adjustment)
+    pub copy_anchor_scroll_offset: usize,
     pub copy_pos: Option<(u16,u16)>,
     pub copy_scroll_offset: usize,
     /// Selection mode: Char (default), Line (V), Rect (C-v)
@@ -358,6 +389,7 @@ impl AppState {
             status_right: "\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(),
             window_base_index: 0,
             copy_anchor: None,
+            copy_anchor_scroll_offset: 0,
             copy_pos: None,
             copy_scroll_offset: 0,
             copy_selection_mode: SelectionMode::Char,

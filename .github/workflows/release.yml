@@ -43,15 +43,38 @@ jobs:
       - name: Create release package
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $version = "${{ github.ref_name }}"
           $zipName = "psmux-$version-${{ matrix.artifact }}"
+          $releaseDir = "target/${{ matrix.target }}/release"
           New-Item -ItemType Directory -Path $zipName -Force
-          Copy-Item "target/${{ matrix.target }}/release/psmux.exe" "$zipName/psmux.exe"
-          Copy-Item "target/${{ matrix.target }}/release/pmux.exe" "$zipName/pmux.exe"
-          Copy-Item "target/${{ matrix.target }}/release/tmux.exe" "$zipName/tmux.exe"
-          Copy-Item "README.md" "$zipName/"
-          Copy-Item "LICENSE" "$zipName/"
+
+          # Verify all expected binaries exist before copying
+          foreach ($exe in @("psmux.exe", "pmux.exe", "tmux.exe")) {
+            $path = Join-Path $releaseDir $exe
+            if (-not (Test-Path $path)) {
+              Write-Error "FATAL: Expected binary '$path' not found! Build may have failed silently."
+              Get-ChildItem $releaseDir -Filter "*.exe" | ForEach-Object { Write-Output "  Found: $($_.FullName) ($($_.Length) bytes)" }
+              exit 1
+            }
+          }
+
+          Copy-Item "$releaseDir/psmux.exe" "$zipName/psmux.exe" -ErrorAction Stop
+          Copy-Item "$releaseDir/pmux.exe" "$zipName/pmux.exe" -ErrorAction Stop
+          Copy-Item "$releaseDir/tmux.exe" "$zipName/tmux.exe" -ErrorAction Stop
+          Copy-Item "README.md" "$zipName/" -ErrorAction Stop
+          Copy-Item "LICENSE" "$zipName/" -ErrorAction Stop
           Compress-Archive -Path "$zipName/*" -DestinationPath "$zipName.zip"
+
+          # Verify zip contents
+          $entries = [System.IO.Compression.ZipFile]::OpenRead("$zipName.zip").Entries.Name
+          foreach ($exe in @("psmux.exe", "pmux.exe", "tmux.exe")) {
+            if ($exe -notin $entries) {
+              Write-Error "FATAL: '$exe' missing from zip archive!"
+              exit 1
+            }
+          }
+          Write-Output "Zip contains: $($entries -join ', ')"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

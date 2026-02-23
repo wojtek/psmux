@@ -107,17 +107,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     crate::window_ops::resize_pane_horizontal(app, 1); true
                 }
-                KeyCode::Left => { move_focus(app, FocusDir::Left); true }
-                KeyCode::Right => { move_focus(app, FocusDir::Right); true }
-                KeyCode::Up => { move_focus(app, FocusDir::Up); true }
-                KeyCode::Down => { move_focus(app, FocusDir::Down); true }
+                KeyCode::Left => { switch_with_copy_save(app, |app| move_focus(app, FocusDir::Left)); true }
+                KeyCode::Right => { switch_with_copy_save(app, |app| move_focus(app, FocusDir::Right)); true }
+                KeyCode::Up => { switch_with_copy_save(app, |app| move_focus(app, FocusDir::Up)); true }
+                KeyCode::Down => { switch_with_copy_save(app, |app| move_focus(app, FocusDir::Down)); true }
                 KeyCode::Char(d) if d.is_ascii_digit() => {
                     let idx = d.to_digit(10).unwrap() as usize;
                     if idx >= app.window_base_index {
                         let internal_idx = idx - app.window_base_index;
                         if internal_idx < app.windows.len() {
-                            app.last_window_idx = app.active_idx;
-                            app.active_idx = internal_idx;
+                            switch_with_copy_save(app, |app| {
+                                app.last_window_idx = app.active_idx;
+                                app.active_idx = internal_idx;
+                            });
                         }
                     }
                     true
@@ -131,15 +133,19 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 KeyCode::Char('n') => {
                     if !app.windows.is_empty() {
-                        app.last_window_idx = app.active_idx;
-                        app.active_idx = (app.active_idx + 1) % app.windows.len();
+                        switch_with_copy_save(app, |app| {
+                            app.last_window_idx = app.active_idx;
+                            app.active_idx = (app.active_idx + 1) % app.windows.len();
+                        });
                     }
                     true
                 }
                 KeyCode::Char('p') => {
                     if !app.windows.is_empty() {
-                        app.last_window_idx = app.active_idx;
-                        app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                        switch_with_copy_save(app, |app| {
+                            app.last_window_idx = app.active_idx;
+                            app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len();
+                        });
                     }
                     true
                 }
@@ -192,34 +198,40 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('z') => { toggle_zoom(app); true }
                 // --- next pane (o) ---
                 KeyCode::Char('o') => {
-                    let win = &app.windows[app.active_idx];
-                    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-                    compute_rects(&win.root, app.last_window_area, &mut rects);
-                    if let Some(cur) = rects.iter().position(|r| r.0 == win.active_path) {
-                        let next = (cur + 1) % rects.len();
-                        let new_path = rects[next].0.clone();
-                        let win = &mut app.windows[app.active_idx];
-                        app.last_pane_path = win.active_path.clone();
-                        win.active_path = new_path;
-                    }
+                    switch_with_copy_save(app, |app| {
+                        let win = &app.windows[app.active_idx];
+                        let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+                        compute_rects(&win.root, app.last_window_area, &mut rects);
+                        if let Some(cur) = rects.iter().position(|r| r.0 == win.active_path) {
+                            let next = (cur + 1) % rects.len();
+                            let new_path = rects[next].0.clone();
+                            let win = &mut app.windows[app.active_idx];
+                            app.last_pane_path = win.active_path.clone();
+                            win.active_path = new_path;
+                        }
+                    });
                     true
                 }
                 // --- last pane (;) ---
                 KeyCode::Char(';') => {
-                    let win = &mut app.windows[app.active_idx];
-                    if !app.last_pane_path.is_empty() && path_exists(&win.root, &app.last_pane_path) {
-                        let tmp = win.active_path.clone();
-                        win.active_path = app.last_pane_path.clone();
-                        app.last_pane_path = tmp;
-                    }
+                    switch_with_copy_save(app, |app| {
+                        let win = &mut app.windows[app.active_idx];
+                        if !app.last_pane_path.is_empty() && path_exists(&win.root, &app.last_pane_path) {
+                            let tmp = win.active_path.clone();
+                            win.active_path = app.last_pane_path.clone();
+                            app.last_pane_path = tmp;
+                        }
+                    });
                     true
                 }
                 // --- last window (l) ---
                 KeyCode::Char('l') => {
                     if app.last_window_idx < app.windows.len() {
-                        let tmp = app.active_idx;
-                        app.active_idx = app.last_window_idx;
-                        app.last_window_idx = tmp;
+                        switch_with_copy_save(app, |app| {
+                            let tmp = app.active_idx;
+                            app.active_idx = app.last_window_idx;
+                            app.last_window_idx = tmp;
+                        });
                     }
                     true
                 }
@@ -543,29 +555,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             let copy_repeat = app.copy_count.take().unwrap_or(1);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => { 
-                    app.mode = Mode::Passthrough; 
-                    app.copy_anchor = None; 
-                    app.copy_pos = None; 
-                    app.copy_scroll_offset = 0;
-                    let win = &mut app.windows[app.active_idx];
-                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if let Ok(mut parser) = p.term.lock() {
-                            parser.screen_mut().set_scrollback(0);
-                        }
-                    }
+                    exit_copy_mode(app);
                 }
                 // Ctrl+C exits copy mode (tmux parity, fixes #25)
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.mode = Mode::Passthrough;
-                    app.copy_anchor = None;
-                    app.copy_pos = None;
-                    app.copy_scroll_offset = 0;
-                    let win = &mut app.windows[app.active_idx];
-                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if let Ok(mut parser) = p.term.lock() {
-                            parser.screen_mut().set_scrollback(0);
-                        }
-                    }
+                    exit_copy_mode(app);
                 }
                 KeyCode::Left | KeyCode::Char('h') => { for _ in 0..copy_repeat { move_copy_cursor(app, -1, 0); } }
                 KeyCode::Right | KeyCode::Char('l') => { for _ in 0..copy_repeat { move_copy_cursor(app, 1, 0); } }
@@ -603,7 +597,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; exit_copy_mode(app); }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: true };
                 }
@@ -611,10 +605,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     app.mode = Mode::CopySearch { input: String::new(), forward: false };
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.mode = Mode::Passthrough;
-                    app.copy_anchor = None;
-                    app.copy_pos = None;
-                    app.copy_scroll_offset = 0;
+                    exit_copy_mode(app);
                 }
                 KeyCode::Char('g') => { scroll_to_top(app); }
                 KeyCode::Char('G') => { scroll_to_bottom(app); }
@@ -636,7 +627,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('t') => { app.copy_find_char_pending = Some(2); app.copy_count = Some(copy_repeat); }
                 KeyCode::Char('T') => { app.copy_find_char_pending = Some(3); app.copy_count = Some(copy_repeat); }
                 // D = copy from cursor to end of line
-                KeyCode::Char('D') => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                KeyCode::Char('D') => { crate::copy_mode::copy_end_of_line(app)?; exit_copy_mode(app); }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
                 KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
                 KeyCode::Char('$') => { crate::copy_mode::move_to_line_end(app); }
@@ -655,6 +646,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     // Start char-wise selection (vi visual mode)
                     if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
                         app.copy_anchor = Some((r,c));
+                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                         app.copy_pos = Some((r,c));
                         app.copy_selection_mode = crate::types::SelectionMode::Char;
                     }
@@ -663,6 +655,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     // Start line-wise selection (vi visual-line mode)
                     if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
                         app.copy_anchor = Some((r,c));
+                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                         app.copy_pos = Some((r,c));
                         app.copy_selection_mode = crate::types::SelectionMode::Line;
                     }
@@ -671,6 +664,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     // Swap cursor and anchor
                     if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
                         app.copy_anchor = Some(p);
+                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                         app.copy_pos = Some(a);
                     }
                 }
@@ -685,15 +679,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                             let new_text = buf.clone();
                             *buf = format!("{}{}", prev, new_text);
                         }
-                        app.mode = Mode::Passthrough;
-                        app.copy_scroll_offset = 0;
-                        app.copy_pos = None;
+                        exit_copy_mode(app);
                     }
                 }
                 // Space = begin selection (vi mode), Enter = copy-selection-and-cancel
                 KeyCode::Char(' ') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
                         app.copy_anchor = Some((r,c));
+                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                         app.copy_pos = Some((r,c));
                         app.copy_selection_mode = crate::types::SelectionMode::Char;
                     }
@@ -703,11 +696,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     if app.copy_anchor.is_some() {
                         yank_selection(app)?;
                     }
-                    app.mode = Mode::Passthrough;
-                    app.copy_scroll_offset = 0;
-                    app.copy_pos = None;
+                    exit_copy_mode(app);
                 }
-                KeyCode::Char('y') => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+                KeyCode::Char('y') => { yank_selection(app)?; exit_copy_mode(app); }
                 // --- copy-mode search ---
                 KeyCode::Char('/') => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: true };
@@ -721,6 +712,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     // Set mark (anchor)
                     if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                         app.copy_anchor = Some((r, c));
+                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                         app.copy_pos = Some((r, c));
                     }
                 }
@@ -1173,14 +1165,47 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
         for &(win_idx, x_start, x_end) in app.tab_positions.iter() {
             if me.column >= x_start && me.column < x_end {
                 if win_idx < app.windows.len() {
-                    app.last_window_idx = app.active_idx;
-                    app.active_idx = win_idx;
+                    switch_with_copy_save(app, |app| {
+                        app.last_window_idx = app.active_idx;
+                        app.active_idx = win_idx;
+                    });
                 }
                 return Ok(());
             }
         }
         // Click was on status bar but not on a tab — ignore
         return Ok(());
+    }
+
+    // If a left-click lands on a different pane while in copy mode, save
+    // copy state to the current pane and restore from the new pane (tmux parity #43).
+    if matches!(me.kind, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left))
+        && matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. })
+    {
+        let win = &app.windows[app.active_idx];
+        let mut rects_check: Vec<(Vec<usize>, Rect)> = Vec::new();
+        compute_rects(&win.root, window_area, &mut rects_check);
+        let mut clicked_new_path: Option<Vec<usize>> = None;
+        for (path, area) in rects_check.iter() {
+            if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
+                if *path != win.active_path {
+                    clicked_new_path = Some(path.clone());
+                }
+                break;
+            }
+        }
+        if let Some(np) = clicked_new_path {
+            // Save copy state to current pane, reset its scrollback
+            save_copy_state_to_pane(app);
+            // Switch active pane path
+            {
+                let win = &mut app.windows[app.active_idx];
+                app.last_pane_path = win.active_path.clone();
+                win.active_path = np;
+            }
+            // Restore from new pane (likely Passthrough if it wasn't in copy mode)
+            restore_copy_state_from_pane(app);
+        }
     }
 
     let win = &mut app.windows[app.active_idx];
@@ -1444,16 +1469,7 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
     }
     match c {
         'q' | ']' | '\x1b' => {
-            app.mode = Mode::Passthrough;
-            app.copy_anchor = None;
-            app.copy_pos = None;
-            app.copy_scroll_offset = 0;
-            let win = &mut app.windows[app.active_idx];
-            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                if let Ok(mut parser) = p.term.lock() {
-                    parser.screen_mut().set_scrollback(0);
-                }
-            }
+            exit_copy_mode(app);
         }
         'h' => { move_copy_cursor(app, -1, 0); }
         'l' => { move_copy_cursor(app, 1, 0); }
@@ -1474,13 +1490,14 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         'F' => { app.copy_find_char_pending = Some(1); }
         't' => { app.copy_find_char_pending = Some(2); }
         'T' => { app.copy_find_char_pending = Some(3); }
-        'D' => { crate::copy_mode::copy_end_of_line(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+        'D' => { crate::copy_mode::copy_end_of_line(app)?; exit_copy_mode(app); }
         '0' => { crate::copy_mode::move_to_line_start(app); }
         '$' => { crate::copy_mode::move_to_line_end(app); }
         '^' => { crate::copy_mode::move_to_first_nonblank(app); }
         ' ' => {
             if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                 app.copy_anchor = Some((r, c));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                 app.copy_pos = Some((r, c));
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
@@ -1488,6 +1505,7 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         'v' => {
             if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                 app.copy_anchor = Some((r, c));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                 app.copy_pos = Some((r, c));
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
@@ -1495,6 +1513,7 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         'V' => {
             if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                 app.copy_anchor = Some((r, c));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                 app.copy_pos = Some((r, c));
                 app.copy_selection_mode = crate::types::SelectionMode::Line;
             }
@@ -1502,6 +1521,7 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         'o' => {
             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
                 app.copy_anchor = Some(p);
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                 app.copy_pos = Some(a);
             }
         }
@@ -1513,12 +1533,10 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
                     let new_text = buf.clone();
                     *buf = format!("{}{}", prev, new_text);
                 }
-                app.mode = Mode::Passthrough;
-                app.copy_scroll_offset = 0;
-                app.copy_pos = None;
+                exit_copy_mode(app);
             }
         }
-        'y' => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+        'y' => { yank_selection(app)?; exit_copy_mode(app); }
         '/' => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
         '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
         'n' => { search_next(app); }
@@ -1564,30 +1582,20 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     if matches!(app.mode, Mode::CopyMode) {
         match k {
             "esc" | "q" => {
-                app.mode = Mode::Passthrough;
-                app.copy_anchor = None;
-                app.copy_pos = None;
-                app.copy_scroll_offset = 0;
-                let win = &mut app.windows[app.active_idx];
-                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if let Ok(mut parser) = p.term.lock() {
-                        parser.screen_mut().set_scrollback(0);
-                    }
-                }
+                exit_copy_mode(app);
             }
             "enter" => {
                 // Copy selection and exit copy mode (vi Enter)
                 if app.copy_anchor.is_some() {
                     yank_selection(app)?;
                 }
-                app.mode = Mode::Passthrough;
-                app.copy_scroll_offset = 0;
-                app.copy_pos = None;
+                exit_copy_mode(app);
             }
             "space" => {
                 // Begin selection (like v in vi mode)
                 if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                     app.copy_anchor = Some((r, c));
+                    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                     app.copy_pos = Some((r, c));
                     app.copy_selection_mode = crate::types::SelectionMode::Char;
                 }
@@ -1616,37 +1624,20 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "M-v" | "m-v" => { scroll_copy_up(app, 10); }
             "M-f" | "m-f" => { crate::copy_mode::move_word_forward(app); }
             "M-b" | "m-b" => { crate::copy_mode::move_word_backward(app); }
-            "M-w" | "m-w" => { yank_selection(app)?; app.mode = Mode::Passthrough; app.copy_scroll_offset = 0; app.copy_pos = None; }
+            "M-w" | "m-w" => { yank_selection(app)?; exit_copy_mode(app); }
             "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
             "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
             "C-c" | "c-c" => {
-                app.mode = Mode::Passthrough;
-                app.copy_anchor = None;
-                app.copy_pos = None;
-                app.copy_scroll_offset = 0;
-                let win = &mut app.windows[app.active_idx];
-                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if let Ok(mut parser) = p.term.lock() {
-                        parser.screen_mut().set_scrollback(0);
-                    }
-                }
+                exit_copy_mode(app);
             }
             "C-g" | "c-g" => {
-                app.mode = Mode::Passthrough;
-                app.copy_anchor = None;
-                app.copy_pos = None;
-                app.copy_scroll_offset = 0;
-                let win = &mut app.windows[app.active_idx];
-                if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if let Ok(mut parser) = p.term.lock() {
-                        parser.screen_mut().set_scrollback(0);
-                    }
-                }
+                exit_copy_mode(app);
             }
             "c-space" | "C-space" => {
                 // Set mark (anchor) at current position
                 if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                     app.copy_anchor = Some((r, c));
+                    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                     app.copy_pos = Some((r, c));
                 }
             }

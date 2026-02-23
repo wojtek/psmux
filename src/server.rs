@@ -14,6 +14,20 @@ use crate::cli::parse_target;
 use crate::pane::*;
 use crate::tree::{self, *};
 
+/// Collect all leaf pane paths in tree order (for next/prev pane cycling).
+fn collect_pane_paths_server(node: &Node, path: &mut Vec<usize>, panes: &mut Vec<Vec<usize>>) {
+    match node {
+        Node::Leaf(_) => { panes.push(path.clone()); }
+        Node::Split { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                path.push(i);
+                collect_pane_paths_server(c, path, panes);
+                path.pop();
+            }
+        }
+    }
+}
+
 /// Serialize key_tables into a compact JSON array for syncing to the client.
 /// Format: [{"t":"prefix","k":"x","c":"split-window -v","r":false}, ...]
 fn serialize_bindings_json(app: &AppState) -> String {
@@ -286,8 +300,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 
                 // Check if this line is a TARGET specification
+                // Save raw target for relative pane specifiers like :.+ and :.-
+                let mut global_raw_target: Option<String> = None;
                 if line.trim().starts_with("TARGET ") {
                     let target_spec = line.trim().strip_prefix("TARGET ").unwrap_or("");
+                    global_raw_target = Some(target_spec.to_string());
                     let parsed = parse_target(target_spec);
                     global_target_win = parsed.window;
                     global_target_pane = parsed.pane;
@@ -339,10 +356,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 let mut target_win: Option<usize> = global_target_win;
                 let mut target_pane: Option<usize> = global_target_pane;
                 let mut pane_is_id = global_pane_is_id;
+                // Save raw -t value for relative pane targets like :.+ or :.-
+                // Falls back to global_raw_target from TARGET protocol line
+                let mut raw_target: Option<String> = global_raw_target.clone();
                 let mut i = 0;
                 while i < args.len() {
                     if args[i] == "-t" {
                         if let Some(v) = args.get(i+1) {
+                            raw_target = Some(v.to_string());
                             // Parse the -t value using parse_target for consistent handling
                             let pt = parse_target(v);
                             if pt.window.is_some() { target_win = pt.window; }
@@ -613,7 +634,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                     "select-pane" | "selectp" => {
-                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                        // Detect relative pane targets: -t :.+  or  -t :.-
+                        let is_next_pane = raw_target.as_deref().map_or(false, |t| t.contains(".+") || t == "+" || t == ":.+");
+                        let is_prev_pane = raw_target.as_deref().map_or(false, |t| t.contains(".-") || t == "-" || t == ":.-");
+                        let dir = if is_next_pane { "next" }
+                            else if is_prev_pane { "prev" }
+                            else if args.iter().any(|a| *a == "-U") { "U" }
                             else if args.iter().any(|a| *a == "-D") { "D" }
                             else if args.iter().any(|a| *a == "-L") { "L" }
                             else if args.iter().any(|a| *a == "-R") { "R" }
@@ -1459,13 +1485,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if wid >= app.window_base_index {
                         let internal_idx = wid - app.window_base_index;
                         if internal_idx < app.windows.len() {
-                            app.active_idx = internal_idx;
+                            switch_with_copy_save(&mut app, |app| {
+                                app.active_idx = internal_idx;
+                            });
                         }
                     }
                     meta_dirty = true;
                 }
-                CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
-                CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); meta_dirty = true; }
+                CtrlReq::FocusPane(pid) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
+                CtrlReq::FocusPaneByIndex(idx) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_index(app, idx); }); meta_dirty = true; }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { " (attached)" } else { "" };
                     let windows = app.windows.len();
@@ -1601,14 +1629,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::ClockMode => { app.mode = Mode::ClockMode; }
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
-                CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
-                CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
+                CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_anchor_scroll_offset = app.copy_scroll_offset; app.copy_pos = Some((r,c)); } }
+                CtrlReq::CopyYank => { let _ = yank_selection(&mut app); exit_copy_mode(&mut app); }
                 CtrlReq::ClientSize(w, h) => { 
                     app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); meta_dirty = true; }
-                CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } meta_dirty = true; }
+                CtrlReq::FocusPaneCmd(pid) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
+                CtrlReq::FocusWindowCmd(wid) => { switch_with_copy_save(&mut app, |app| { if let Some(idx) = find_window_index_by_id(app, wid) { app.active_idx = idx; } }); meta_dirty = true; }
                 CtrlReq::MouseDown(x,y) => { if app.mouse_enabled { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; } }
                 CtrlReq::MouseDownRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; } }
                 CtrlReq::MouseDownMiddle(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; } }
@@ -1619,8 +1647,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::MouseMove(x,y) => { if app.mouse_enabled { remote_mouse_motion(&mut app, x, y); } }
                 CtrlReq::ScrollUp(x, y) => { if app.mouse_enabled { remote_scroll_up(&mut app, x, y); state_dirty = true; } }
                 CtrlReq::ScrollDown(x, y) => { if app.mouse_enabled { remote_scroll_down(&mut app, x, y); state_dirty = true; } }
-                CtrlReq::NextWindow => { if !app.windows.is_empty() { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
-                CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } meta_dirty = true; hook_event = Some("after-select-window"); }
+                CtrlReq::NextWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + 1) % app.windows.len(); }); } meta_dirty = true; hook_event = Some("after-select-window"); }
+                CtrlReq::PrevWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); }); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; win.manual_rename = true; meta_dirty = true; hook_event = Some("after-rename-window"); }
                 CtrlReq::ListWindows(resp) => { let json = list_windows_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ListWindowsTmux(resp) => { let text = list_windows_tmux(&app); let _ = resp.send(text); }
@@ -1773,6 +1801,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "begin-selection" => {
                             if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
                                 app.copy_anchor = Some((r,c));
+                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                                 app.copy_pos = Some((r,c));
                                 app.copy_selection_mode = crate::types::SelectionMode::Char;
                             }
@@ -1780,6 +1809,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "select-line" => {
                             if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
                                 app.copy_anchor = Some((r,c));
+                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                                 app.copy_pos = Some((r,c));
                                 app.copy_selection_mode = crate::types::SelectionMode::Line;
                             }
@@ -1882,6 +1912,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             crate::copy_mode::move_word_backward(&mut app);
                             if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
                                 app.copy_anchor = Some((r,c));
+                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                                 app.copy_selection_mode = crate::types::SelectionMode::Char;
                             }
                             crate::copy_mode::move_word_end(&mut app);
@@ -1889,6 +1920,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "other-end" => {
                             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
                                 app.copy_anchor = Some(p);
+                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                                 app.copy_pos = Some(a);
                             }
                         }
@@ -1918,6 +1950,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             // Select entire current line and yank
                             if let Some((r, _)) = crate::copy_mode::get_copy_pos(&mut app) {
                                 app.copy_anchor = Some((r, 0));
+                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
                                 app.copy_selection_mode = crate::types::SelectionMode::Line;
                                 let cols = app.windows.get(app.active_idx)
                                     .and_then(|w| active_pane(&w.root, &w.active_path))
@@ -1964,18 +1997,29 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SelectPane(dir) => {
                     match dir.as_str() {
-                        "U" => { move_focus(&mut app, FocusDir::Up); }
-                        "D" => { move_focus(&mut app, FocusDir::Down); }
-                        "L" => { move_focus(&mut app, FocusDir::Left); }
-                        "R" => { move_focus(&mut app, FocusDir::Right); }
+                        "U" | "D" | "L" | "R" => {
+                            let focus_dir = match dir.as_str() {
+                                "U" => FocusDir::Up, "D" => FocusDir::Down,
+                                "L" => FocusDir::Left, _ => FocusDir::Right,
+                            };
+                            switch_with_copy_save(&mut app, |app| {
+                                let old = app.windows[app.active_idx].active_path.clone();
+                                move_focus(app, focus_dir);
+                                if app.windows[app.active_idx].active_path != old {
+                                    app.last_pane_path = old;
+                                }
+                            });
+                        }
                         "last" => {
                             // select-pane -l: switch to last active pane
-                            let win = &mut app.windows[app.active_idx];
-                            if !app.last_pane_path.is_empty() {
-                                let tmp = win.active_path.clone();
-                                win.active_path = app.last_pane_path.clone();
-                                app.last_pane_path = tmp;
-                            }
+                            switch_with_copy_save(&mut app, |app| {
+                                let win = &mut app.windows[app.active_idx];
+                                if !app.last_pane_path.is_empty() {
+                                    let tmp = win.active_path.clone();
+                                    win.active_path = app.last_pane_path.clone();
+                                    app.last_pane_path = tmp;
+                                }
+                            });
                         }
                         "mark" => {
                             // select-pane -m: mark the current pane
@@ -1984,20 +2028,55 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 app.marked_pane = Some((app.active_idx, pid));
                             }
                         }
+                        "next" => {
+                            // select-pane next: cycle to next pane (like Prefix+o / tmux -t :.+)
+                            switch_with_copy_save(&mut app, |app| {
+                                let win = &app.windows[app.active_idx];
+                                let mut pane_paths = Vec::new();
+                                let mut path = Vec::new();
+                                collect_pane_paths_server(&win.root, &mut path, &mut pane_paths);
+                                if let Some(cur) = pane_paths.iter().position(|p| *p == win.active_path) {
+                                    let next = (cur + 1) % pane_paths.len();
+                                    let new_path = pane_paths[next].clone();
+                                    let win = &mut app.windows[app.active_idx];
+                                    app.last_pane_path = win.active_path.clone();
+                                    win.active_path = new_path;
+                                }
+                            });
+                        }
+                        "prev" => {
+                            // select-pane prev: cycle to previous pane (tmux -t :.-)
+                            switch_with_copy_save(&mut app, |app| {
+                                let win = &app.windows[app.active_idx];
+                                let mut pane_paths = Vec::new();
+                                let mut path = Vec::new();
+                                collect_pane_paths_server(&win.root, &mut path, &mut pane_paths);
+                                if let Some(cur) = pane_paths.iter().position(|p| *p == win.active_path) {
+                                    let prev = (cur + pane_paths.len() - 1) % pane_paths.len();
+                                    let new_path = pane_paths[prev].clone();
+                                    let win = &mut app.windows[app.active_idx];
+                                    app.last_pane_path = win.active_path.clone();
+                                    win.active_path = new_path;
+                                }
+                            });
+                        }
                         "unmark" => {
                             // select-pane -M: clear the marked pane
                             app.marked_pane = None;
                         }
                         _ => {}
                     }
+                    meta_dirty = true;
                     hook_event = Some("after-select-pane");
                 }
                 CtrlReq::SelectWindow(idx) => {
                     if idx >= app.window_base_index {
                         let internal_idx = idx - app.window_base_index;
                         if internal_idx < app.windows.len() {
-                            app.last_window_idx = app.active_idx;
-                            app.active_idx = internal_idx;
+                            switch_with_copy_save(&mut app, |app| {
+                                app.last_window_idx = app.active_idx;
+                                app.active_idx = internal_idx;
+                            });
                         }
                     }
                     meta_dirty = true;
@@ -2164,24 +2243,30 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::LastWindow => {
                     if app.windows.len() > 1 && app.last_window_idx < app.windows.len() {
-                        let tmp = app.active_idx;
-                        app.active_idx = app.last_window_idx;
-                        app.last_window_idx = tmp;
+                        switch_with_copy_save(&mut app, |app| {
+                            let tmp = app.active_idx;
+                            app.active_idx = app.last_window_idx;
+                            app.last_window_idx = tmp;
+                        });
                     }
+                    meta_dirty = true;
                     hook_event = Some("after-select-window");
                 }
                 CtrlReq::LastPane => {
-                    let win = &mut app.windows[app.active_idx];
-                    if !app.last_pane_path.is_empty() && path_exists(&win.root, &app.last_pane_path) {
-                        let tmp = win.active_path.clone();
-                        win.active_path = app.last_pane_path.clone();
-                        app.last_pane_path = tmp;
-                    } else if !win.active_path.is_empty() {
-                        let last = win.active_path.last_mut();
-                        if let Some(idx) = last {
-                            *idx = (*idx + 1) % 2;
+                    switch_with_copy_save(&mut app, |app| {
+                        let win = &mut app.windows[app.active_idx];
+                        if !app.last_pane_path.is_empty() && path_exists(&win.root, &app.last_pane_path) {
+                            let tmp = win.active_path.clone();
+                            win.active_path = app.last_pane_path.clone();
+                            app.last_pane_path = tmp;
+                        } else if !win.active_path.is_empty() {
+                            let last = win.active_path.last_mut();
+                            if let Some(idx) = last {
+                                *idx = (*idx + 1) % 2;
+                            }
                         }
-                    }
+                    });
+                    meta_dirty = true;
                 }
                 CtrlReq::RotateWindow(reverse) => {
                     rotate_panes(&mut app, reverse);
@@ -2324,8 +2409,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             "automatic-rename" => { app.automatic_rename = true; }
                             "pane-border-style" => { app.pane_border_style = String::new(); }
                             "pane-active-border-style" => { app.pane_active_border_style = "fg=green".to_string(); }
-                            "window-status-format" => { app.window_status_format = "#I:#W#F".to_string(); }
-                            "window-status-current-format" => { app.window_status_current_format = "#I:#W#F".to_string(); }
+                            "window-status-format" => { app.window_status_format = "#I:#W#{?window_flags,#{window_flags}, }".to_string(); }
+                            "window-status-current-format" => { app.window_status_current_format = "#I:#W#{?window_flags,#{window_flags}, }".to_string(); }
                             "window-status-separator" => { app.window_status_separator = " ".to_string(); }
                             "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", "bar"); }
                             "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", "1"); }

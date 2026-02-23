@@ -173,14 +173,23 @@ Enter copy mode with `Prefix + [` or `Prefix + {` to scroll through terminal his
 
 | Key | Action |
 |-----|--------|
-| `↑` / `k` | Scroll up 1 line |
-| `↓` / `j` | Scroll down 1 line |
-| `PageUp` / `b` | Scroll up 10 lines |
-| `PageDown` / `f` | Scroll down 10 lines |
+| `↑` / `k` | Move cursor / scroll up 1 line |
+| `↓` / `j` | Move cursor / scroll down 1 line |
+| `PageUp` / `Ctrl+b` | Scroll up 10 lines |
+| `PageDown` / `Ctrl+f` | Scroll down 10 lines |
+| `Ctrl+u` | Scroll up half page |
+| `Ctrl+d` | Scroll down half page |
 | `g` | Jump to top of scrollback |
 | `G` | Jump to bottom |
 | `←` / `h` | Move cursor left |
 | `→` / `l` | Move cursor right |
+| `w` | Move to next word |
+| `b` | Move to previous word |
+| `e` | Move to end of word |
+| `f{char}` | Find character forward |
+| `F{char}` | Find character backward |
+| `0` | Move to start of line |
+| `$` | Move to end of line |
 | `v` | Start selection |
 | `y` | Yank (copy) selection |
 | `Mouse drag + release` | Select text and copy to clipboard |
