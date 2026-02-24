@@ -1507,8 +1507,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // wid is a display index (same as tmux window number), convert to internal array index
                     if wid >= app.window_base_index {
                         let internal_idx = wid - app.window_base_index;
-                        if internal_idx < app.windows.len() {
+                        if internal_idx < app.windows.len() && internal_idx != app.active_idx {
                             switch_with_copy_save(&mut app, |app| {
+                                app.last_window_idx = app.active_idx;
                                 app.active_idx = internal_idx;
                             });
                             // Lazily resize panes in the newly-focused window
@@ -2134,7 +2135,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::SelectWindow(idx) => {
                     if idx >= app.window_base_index {
                         let internal_idx = idx - app.window_base_index;
-                        if internal_idx < app.windows.len() {
+                        if internal_idx < app.windows.len() && internal_idx != app.active_idx {
                             switch_with_copy_save(&mut app, |app| {
                                 app.last_window_idx = app.active_idx;
                                 app.active_idx = internal_idx;

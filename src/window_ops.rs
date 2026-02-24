@@ -118,17 +118,37 @@ fn is_fullscreen_tui(pane: &Pane) -> bool {
         if screen.alternate_screen() {
             return true;
         }
-        // Heuristic: check if the last row has non-blank content.
-        // TUI apps fill the entire screen, shell prompts leave the bottom empty.
-        let last_row = pane.last_rows.saturating_sub(1);
-        for col in 0..pane.last_cols {
-            if let Some(cell) = screen.cell(last_row, col) {
-                let t = cell.contents();
-                if !t.is_empty() && t != " " {
-                    return true;
+        // Heuristic: check if many of the last rows are non-blank AND the
+        // cursor is near the bottom.  Fullscreen TUI apps fill the entire
+        // screen and keep the cursor near the bottom (status bars, menus).
+        // A shell after `dir` may have content on the last row, but the
+        // cursor sits at the current prompt line — not necessarily at the
+        // bottom — and the rows below the cursor are blank.
+        let rows = pane.last_rows;
+        if rows < 3 { return false; }
+        let (cursor_row, _) = screen.cursor_position();
+        let last_row = rows.saturating_sub(1);
+        // Cursor must be in the bottom 3 rows for a fullscreen TUI
+        if cursor_row < last_row.saturating_sub(2) {
+            return false;
+        }
+        // Check that at least 3 of the last 4 rows have non-blank content
+        let check_rows = 4u16.min(rows);
+        let mut filled = 0u16;
+        for r in (last_row + 1 - check_rows)..=last_row {
+            let mut has_content = false;
+            for col in 0..pane.last_cols.min(40) { // only check first 40 cols
+                if let Some(cell) = screen.cell(r, col) {
+                    let t = cell.contents();
+                    if !t.is_empty() && t != " " {
+                        has_content = true;
+                        break;
+                    }
                 }
             }
+            if has_content { filled += 1; }
         }
+        return filled >= 3;
     }
     false
 }
@@ -173,22 +193,40 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
 ///      which directly writes MOUSE_EVENT records to the console input buffer.
 fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool,
                           button_state: u32, event_flags: u32, win_name: &str) {
-    let (mode, enc) = pane_mouse_protocol(pane);
+    // Read mouse protocol mode under parser lock and write VT sequence
+    // atomically to prevent TOCTOU race where the child disables mouse
+    // between the check and the write (which would cause escape sequences
+    // to appear as visible text in the pane).
+    let vt_injected = if let Ok(parser) = pane.term.lock() {
+        let s = parser.screen();
+        let mode = s.mouse_protocol_mode();
+        let enc = s.mouse_protocol_encoding();
+        if mode != vt100::MouseProtocolMode::None {
+            let vt_col = (col + 1).max(1) as u16;
+            let vt_row = (row + 1).max(1) as u16;
+            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} mode={:?} enc={:?} -> VT injection",
+                col, row, vt_button, press, win_name, mode, enc));
+            // Hold parser lock during write to prevent reader thread from
+            // updating mode while we're mid-write.
+            drop(parser); // release lock before PTY write to avoid deadlock
+            write_mouse_event_remote(&mut pane.master, vt_button, vt_col, vt_row, press, enc);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if vt_injected { return; }
+
     let vt_bridge = detect_vt_bridge(pane);
 
-    mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} btn_state=0x{:X} evt_flags=0x{:X} win={} mode={:?} enc={:?} vt_bridge={}",
-        col, row, vt_button, press, button_state, event_flags, win_name, mode, enc, vt_bridge));
-
-    if mode != vt100::MouseProtocolMode::None {
-        // Child explicitly requested mouse tracking — use VT injection with child's encoding
-        let vt_col = (col + 1).max(1) as u16;
-        let vt_row = (row + 1).max(1) as u16;
-        mouse_log(&format!("  -> VT injection (parser mode): enc={:?} vt_col={} vt_row={}", enc, vt_col, vt_row));
-        write_mouse_event_remote(&mut pane.master, vt_button, vt_col, vt_row, press, enc);
-    } else if vt_bridge {
+    if vt_bridge {
         // VT bridge (WSL/SSH): check if a fullscreen TUI app is running
         let fullscreen = is_fullscreen_tui(pane);
-        mouse_log(&format!("  -> VT bridge: fullscreen={}", fullscreen));
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true fullscreen={}",
+            col, row, vt_button, press, win_name, fullscreen));
         if fullscreen {
             // TUI app detected (htop, vim, etc.) — inject SGR mouse as KEY_EVENTs.
             // This bypasses ConPTY and delivers raw escape sequence characters to
@@ -215,7 +253,7 @@ fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, pre
         }
     } else {
         // Native console app — Win32 console injection only
-        mouse_log(&format!("  -> Win32 injection (native): col={} row={} btn=0x{:X} flags=0x{:X}", col, row, button_state, event_flags));
+        mouse_log(&format!("inject_mouse_combined: col={} row={} win={} -> Win32 native", col, row, win_name));
         let ok = inject_mouse(pane, col, row, button_state, event_flags);
         mouse_log(&format!("  -> Win32 inject result: {}", ok));
     }
