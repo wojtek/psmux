@@ -1015,23 +1015,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
             len: u32,
             read: *mut u32,
         ) -> i32;
-        fn ReadFile(
-            hFile: *mut c_void,
-            lpBuffer: *mut u8,
-            nNumberOfBytesToRead: u32,
-            lpNumberOfBytesRead: *mut u32,
-            lpOverlapped: *mut c_void,
-        ) -> i32;
         fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
-        fn CreateFileW(
-            lpFileName: *const u16,
-            dwDesiredAccess: u32,
-            dwShareMode: u32,
-            lpSecurityAttributes: *mut c_void,
-            dwCreationDisposition: u32,
-            dwFlagsAndAttributes: u32,
-            hTemplateFile: *mut c_void,
-        ) -> *mut c_void;
     }
 
     // ── Native MOUSE_EVENT → crossterm Event conversion ──────────────────
@@ -1194,85 +1178,8 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
         ssh_debug_log("WARNING: re-read GetConsoleMode failed after SetConsoleMode");
     }
 
-    // ── Try alternate input: ReadFile on CONIN$ ──────────────────────────
-    // ReadFile on a console handle reads raw character data (not
-    // INPUT_RECORDs).  On some Windows builds this may deliver raw bytes
-    // from the SSH stream BEFORE ConPTY's VT parser processes them,
-    // giving us access to SGR mouse sequences that ReadConsoleInputW
-    // never sees.  We spawn a small sniffer thread that logs whatever
-    // ReadFile returns.  If SGR mouse bytes appear here, we'll switch
-    // the main reader to ReadFile-based input.
-    {
-        let tx2 = tx.clone();
-        std::thread::Builder::new()
-            .name("ssh-readfile-sniffer".into())
-            .spawn(move || {
-                // Open CONIN$ for reading — gives us a separate handle to the
-                // console input buffer.
-                let conin: Vec<u16> = "CONIN$\0".encode_utf16().collect();
-                const GENERIC_READ: u32  = 0x80000000;
-                const FILE_SHARE_READ: u32 = 0x00000001;
-                const FILE_SHARE_WRITE: u32 = 0x00000002;
-                const OPEN_EXISTING: u32  = 3;
-                let h = unsafe {
-                    CreateFileW(
-                        conin.as_ptr(),
-                        GENERIC_READ,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        std::ptr::null_mut(),
-                        OPEN_EXISTING,
-                        0,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if h.is_null() || h == (-1isize) as *mut std::ffi::c_void {
-                    ssh_debug_log("ReadFile sniffer: CreateFileW(CONIN$) FAILED");
-                    return;
-                }
-                ssh_debug_log("ReadFile sniffer: opened CONIN$ — reading raw bytes");
-
-                let mut buf = [0u8; 256];
-                loop {
-                    let mut n: u32 = 0;
-                    let ok = unsafe {
-                        ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null_mut())
-                    };
-                    if ok == 0 || n == 0 {
-                        ssh_debug_log(&format!("ReadFile sniffer: exiting (ok={} n={})", ok, n));
-                        break;
-                    }
-                    let bytes = &buf[..n as usize];
-                    // Log hex dump of raw bytes
-                    let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-                    let ascii: String = bytes.iter().map(|&b| {
-                        if b >= 0x20 && b < 0x7F { b as char } else { '.' }
-                    }).collect();
-                    ssh_debug_log(&format!("ReadFile sniffer: {} bytes: [{}] «{}»", n, hex, ascii));
-
-                    // Check if any ESC byte arrived — this would indicate
-                    // VT sequences ARE reaching ReadFile.
-                    if bytes.contains(&0x1B) {
-                        ssh_debug_log("ReadFile sniffer: *** ESC (0x1B) detected — VT sequence in raw read! ***");
-                        // Feed bytes through VT parser and send events
-                        // (This path is the fallback if ReadConsoleInputW
-                        // doesn't deliver mouse data but ReadFile does.)
-                        let mut parser2 = VtParser::new();
-                        for &b in bytes {
-                            if let Some(ch) = char::from_u32(b as u32) {
-                                parser2.feed(ch, &mut |evt| {
-                                    ssh_debug_log(&format!("ReadFile sniffer emit: {:?}", evt));
-                                    let _ = tx2.send(evt);
-                                });
-                            }
-                        }
-                    }
-                }
-            })
-            .ok(); // Non-critical: if this thread fails to spawn, no harm done.
-    }
-    ssh_debug_log("ReadFile sniffer thread launched");
-
-    // Spawn the reader thread.  The console handle is process-global and remains
+    // ── Spawn the reader thread ────────────────────────────────────────
+    // The console handle is process-global and remains
     // valid for the entire process lifetime.  We pass it as usize (which is
     // Send) and cast back inside the thread.
     let handle_val = handle as usize;
