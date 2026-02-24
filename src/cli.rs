@@ -16,16 +16,6 @@ pub fn print_help() {
 USAGE:
     {prog} [COMMAND] [OPTIONS]
 
-SSH MOUSE SUPPORT:
-    ssh <ssh-args>          Wrap an SSH connection with mouse support
-                            Run on your LOCAL machine, not the server.
-                            Enables mouse reporting before SSH starts so
-                            psmux on the remote Windows host receives
-                            mouse events through the SSH connection.
-        Examples:
-            {prog} ssh user@windowshost
-            {prog} ssh -p 2222 user@host
-
 SESSION COMMANDS:
     (no command)            Start a new session or attach to existing one
     new-session, new        Create a new session
@@ -344,16 +334,6 @@ EXAMPLES:
                                     Send keystrokes to pane %1
     {prog} set -g default-shell cmd Use cmd.exe as default shell
     {prog} source-file ~/.psmux.conf Reload config
-    {prog} ssh user@windowshost     SSH with mouse support (run locally!)
-
-MOUSE OVER SSH:
-    On Windows 10, ConPTY consumes mouse-enable escape sequences and does
-    not forward them to the SSH client.  Use the `{prog} ssh` wrapper on
-    your LOCAL machine to enable mouse reporting before starting SSH:
-        {prog} ssh user@windowshost
-    On Linux/macOS, use the helper script in scripts/psmux-ssh.sh:
-        ./psmux-ssh.sh user@windowshost
-    Windows 11 build 22523+ supports mouse natively — no wrapper needed.
 
 NOTE: psmux ships as 'psmux', 'pmux', and 'tmux' - use whichever you prefer!
 
@@ -426,7 +406,6 @@ pub fn print_commands() {
   select-window (selectw)   - Select a window
   send-keys                 - Send keys to a pane
   set-buffer (setb)         - Set a paste buffer
-  ssh                       - SSH wrapper with mouse support (run locally)
   set-environment (setenv)  - Set an environment variable
   set-hook                  - Set a hook command
   set-option (set)          - Set a session or window option
