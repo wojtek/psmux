@@ -1517,8 +1517,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     meta_dirty = true;
                 }
-                CtrlReq::FocusPane(pid) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
-                CtrlReq::FocusPaneByIndex(idx) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_index(app, idx); }); meta_dirty = true; }
+                CtrlReq::FocusPane(pid) => { unzoom_if_zoomed(&mut app); switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
+                CtrlReq::FocusPaneByIndex(idx) => { unzoom_if_zoomed(&mut app); switch_with_copy_save(&mut app, |app| { focus_pane_by_index(app, idx); }); meta_dirty = true; }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { " (attached)" } else { "" };
                     let windows = app.windows.len();
@@ -1660,7 +1660,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::FocusPaneCmd(pid) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
+                CtrlReq::FocusPaneCmd(pid) => { unzoom_if_zoomed(&mut app); switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
                 CtrlReq::FocusWindowCmd(wid) => { switch_with_copy_save(&mut app, |app| { if let Some(idx) = find_window_index_by_id(app, wid) { app.active_idx = idx; } }); resize_all_panes(&mut app); meta_dirty = true; }
                 CtrlReq::MouseDown(x,y) => { if app.mouse_enabled { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; } }
                 CtrlReq::MouseDownRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; } }
@@ -2021,6 +2021,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::SelectPane(dir) => {
+                    // Auto-unzoom when navigating to another pane (tmux behavior).
+                    // This prevents the desync where active pane changes but
+                    // the viewport stays on the zoomed pane.  (fixes #46)
+                    let was_zoomed = unzoom_if_zoomed(&mut app);
+                    let _ = was_zoomed; // suppress unused warning
                     match dir.as_str() {
                         "U" | "D" | "L" | "R" => {
                             let focus_dir = match dir.as_str() {
@@ -2421,7 +2426,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         match option.as_str() {
                             "status-left" => { app.status_left = "psmux:#I".to_string(); }
-                            "status-right" => { app.status_right = "%H:%M".to_string(); }
+                            "status-right" => { app.status_right = "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(); }
                             "mouse" => { app.mouse_enabled = true; }
                             "escape-time" => { app.escape_time_ms = 500; }
                             "history-limit" => { app.history_limit = 2000; }

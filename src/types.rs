@@ -386,7 +386,7 @@ impl AppState {
             mouse_enabled: true,
             paste_buffers: Vec::new(),
             status_left: "[#S] ".to_string(),
-            status_right: "\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(),
+            status_right: "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(),
             window_base_index: 0,
             copy_anchor: None,
             copy_anchor_scroll_offset: 0,

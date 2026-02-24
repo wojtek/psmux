@@ -219,8 +219,15 @@ pub fn resize_all_panes(app: &mut AppState) {
         match node {
             Node::Leaf(pane) => {
                 if let Some((_, rect)) = rects.iter().find(|(p, _)| p == path) {
-                    let inner_height = rect.height.max(1);
-                    let inner_width = rect.width.max(1);
+                    // Skip resize for panes hidden by zoom (size 0 in either
+                    // dimension).  Resizing a hidden pane to 1x1 corrupts its
+                    // terminal buffer — lines get reflowed to 1-column width
+                    // and the cursor position is lost.  (fixes #44, #45)
+                    if rect.width == 0 || rect.height == 0 {
+                        return;
+                    }
+                    let inner_height = rect.height;
+                    let inner_width = rect.width;
                     
                     if pane.last_rows != inner_height || pane.last_cols != inner_width {
                         let _ = pane.master.resize(portable_pty::PtySize { 

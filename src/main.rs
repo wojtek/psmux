@@ -38,7 +38,17 @@ use crate::server::run_server;
 use crate::client::run_remote;
 use crate::util::*;
 
-fn main() -> io::Result<()> {
+fn main() {
+    if let Err(e) = run_main() {
+        // Print a user-friendly error message instead of Rust's Debug format
+        // which shows "Error: Custom { kind: Other, error: \"...\" }"  (fixes #47)
+        let msg = e.to_string();
+        eprintln!("psmux: {}", msg);
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     
     // Clean up any stale port files at startup

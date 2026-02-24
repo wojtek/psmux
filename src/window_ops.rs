@@ -221,6 +221,21 @@ fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, pre
     }
 }
 
+/// If zoom is currently active, unzoom (restore saved sizes) and resize panes.
+/// Returns true if zoom was active and was cancelled.
+pub fn unzoom_if_zoomed(app: &mut AppState) -> bool {
+    if let Some(saved) = app.zoom_saved.take() {
+        let win = &mut app.windows[app.active_idx];
+        for (p, sz) in saved.into_iter() {
+            if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &p) { *sizes = sz; }
+        }
+        resize_all_panes(app);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn toggle_zoom(app: &mut AppState) {
     let win = &mut app.windows[app.active_idx];
     if app.zoom_saved.is_none() {

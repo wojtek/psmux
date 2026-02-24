@@ -364,7 +364,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("status-position",            "bottom"),
     ("status-justify",             "left"),
     ("status-left",                "\"[#S] \""),
-    ("status-right",               "\"...\" %H:%M %d-%b-%y"),
+    ("status-right",               "\"#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y\""),
     ("status-left-length",         "10"),
     ("status-right-length",        "40"),
     ("status-style",               "bg=green,fg=black"),
