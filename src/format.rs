@@ -1351,6 +1351,11 @@ fn split_at_depth0(s: &str, delim: u8) -> Vec<String> {
             i += 1;
             continue;
         }
+        // Handle #, (escaped delimiter) – skip over without splitting
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == delim && depth == 0 {
+            i += 2;
+            continue;
+        }
         if bytes[i] == delim && depth == 0 {
             parts.push(s[start..i].to_string());
             start = i + 1;

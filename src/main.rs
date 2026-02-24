@@ -17,6 +17,7 @@ mod help;
 mod server;
 mod client;
 mod app;
+mod ssh_input;
 
 use std::io::{self, Write, Read as _, BufRead as _};
 use std::time::Duration;
@@ -36,6 +37,7 @@ use crate::session::*;
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
+use crate::ssh_input::{is_ssh_session, send_mouse_enable, InputSource};
 use crate::util::*;
 
 fn main() {
@@ -47,6 +49,87 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// `psmux ssh [args...]` — local-side wrapper that enables mouse reporting
+/// on the local terminal, then spawns `ssh` with the given arguments.
+///
+/// This solves the ConPTY mouse-over-SSH problem:  ConPTY on the remote
+/// Windows server consumes DECSET mouse-enable sequences from psmux's stdout,
+/// so the SSH client never sees them and never enables mouse reporting.
+/// By writing DECSET directly to the local terminal *before* launching SSH,
+/// the terminal enables mouse reporting and sends SGR mouse data through the
+/// SSH connection.  On the remote side, psmux's VTI + VT parser picks up the
+/// mouse bytes from KEY_EVENT records.
+///
+/// Run this on the LOCAL machine (the one you type SSH from):
+///   psmux ssh user@windowshost
+///   psmux ssh -p 2222 user@host
+fn run_ssh_wrap(ssh_args: &[&String]) -> io::Result<()> {
+    use std::io::Write;
+    use std::process::Command;
+
+    if ssh_args.is_empty() {
+        let prog = crate::cli::get_program_name();
+        eprintln!("Usage: {} ssh [ssh-options] [user@]host", prog);
+        eprintln!();
+        eprintln!("Wraps an SSH connection with terminal mouse support.");
+        eprintln!("Enables mouse reporting on the local terminal so that");
+        eprintln!("psmux on the remote Windows server receives mouse events.");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  {} ssh user@windowshost", prog);
+        eprintln!("  {} ssh -p 2222 user@myserver", prog);
+        return Ok(());
+    }
+
+    // DEC private mode escape sequences for mouse reporting:
+    //   1000 = basic press/release tracking
+    //   1002 = button-event tracking (drag)
+    //   1003 = any-event tracking (all motion)
+    //   1006 = SGR extended coordinates (supports >223 cols/rows)
+    const MOUSE_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+    const MOUSE_DISABLE: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+
+    // Enable mouse reporting on the local terminal.
+    {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(MOUSE_ENABLE.as_bytes());
+        let _ = out.flush();
+    }
+
+    // Spawn SSH with the user's arguments, inheriting stdin/stdout/stderr
+    // so the session is fully interactive.
+    let status = Command::new("ssh")
+        .args(ssh_args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    // Always disable mouse reporting on exit, even if SSH failed, to
+    // restore the terminal to a clean state.
+    {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(MOUSE_DISABLE.as_bytes());
+        let _ = out.flush();
+    }
+
+    match status {
+        Ok(s) => {
+            if !s.success() {
+                if let Some(code) = s.code() {
+                    std::process::exit(code);
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("psmux: failed to run ssh: {}", e);
+            Err(e)
+        }
+    }
+}
+
 
 fn run_main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -185,6 +268,28 @@ fn run_main() -> io::Result<()> {
             return Ok(());
         }
         _ => {}
+    }
+
+    // ── `psmux ssh` — local-side wrapper for SSH with mouse support ──────
+    //
+    // Usage:  psmux ssh [ssh-args...]   e.g.  psmux ssh user@host
+    //
+    // Problem: ConPTY on the remote Windows server consumes DECSET mouse-
+    // enable escape sequences (\x1b[?1000h etc.) from psmux's stdout and
+    // does NOT forward them through sshd to the SSH client.  The client
+    // terminal therefore never enables mouse reporting, and no mouse data
+    // is sent back.  (Fixed in Windows 11 build 22523+, but Windows 10 and
+    // earlier Windows 11 builds are affected.)
+    //
+    // Solution: this subcommand enables mouse reporting DIRECTLY on the
+    // LOCAL terminal (the one the user is typing in) before launching SSH,
+    // bypassing ConPTY entirely on the output side.  The local terminal
+    // then sends SGR mouse data through the SSH connection → sshd →
+    // ConPTY stdin with VTI enabled → KEY_EVENT u_char records → our VT
+    // parser decodes them into crossterm MouseEvent.  On exit, mouse
+    // reporting is disabled to restore the terminal.
+    if cmd == "ssh" {
+        return run_ssh_wrap(&cmd_args[1..]);
     }
     
     match cmd {
@@ -2198,6 +2303,33 @@ fn run_main() -> io::Result<()> {
         return Ok(());
     }
     env::set_var("PSMUX_ACTIVE", "1");
+
+    // ── Win10 SSH mouse hint ─────────────────────────────────────────────
+    // On Windows 10 (build < 22523), ConPTY consumes DECSET mouse-enable
+    // sequences on stdout and does NOT forward them to sshd.  The SSH
+    // client therefore never enables mouse reporting.  Print a one-time
+    // hint to stderr (before raw mode, so the user sees it) suggesting
+    // the local-side wrapper.
+    #[cfg(windows)]
+    if is_ssh_session() {
+        if let Some(build) = crate::ssh_input::windows_build_number() {
+            if build < 22523 {
+                let prog = crate::cli::get_program_name();
+                eprintln!(
+                    "\x1b[33mpsmux: mouse over SSH requires a local wrapper on Windows 10.\x1b[0m"
+                );
+                eprintln!(
+                    "\x1b[33mRun `{prog} ssh user@host` on your LOCAL machine, or see:\x1b[0m"
+                );
+                eprintln!(
+                    "\x1b[33m  https://github.com/marlocarlo/psmux#mouse-over-ssh\x1b[0m"
+                );
+                // Give the user a moment to see the message before alt-screen
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+        }
+    }
+
     let mut stdout = io::stdout();
     enable_virtual_terminal_processing();
     enable_raw_mode()?;
@@ -2205,10 +2337,23 @@ fn run_main() -> io::Result<()> {
     apply_cursor_style(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    
+
+    // Set up input source — detects SSH and enables VT mouse parsing if needed.
+    let is_ssh = is_ssh_session();
+    let input = InputSource::new(is_ssh)?;
+
+    // Over SSH, explicitly (re-)send mouse-enable escape sequences.
+    // ConPTY may have consumed crossterm's EnableMouseCapture output
+    // without forwarding it to sshd → the remote terminal never got told
+    // to enable mouse reporting.  This sends it again via WriteFile and
+    // stdout write to maximize the chance it reaches the client.
+    if is_ssh {
+        send_mouse_enable();
+    }
+
     // Loop to handle session switching without spawning new processes
     let result = loop {
-        let result = run_remote(&mut terminal);
+        let result = run_remote(&mut terminal, &input);
         
         // Check if we should switch to another session
         if let Ok(switch_to) = env::var("PSMUX_SWITCH_TO") {
