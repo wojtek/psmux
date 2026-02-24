@@ -1456,6 +1456,17 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
 
 /// Dispatch a single character as a copy-mode action.
 fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
+    // Handle text-object pending state (waiting for w/W after a/i)
+    if let Some(prefix) = app.copy_text_object_pending.take() {
+        match (prefix, c) {
+            (0, 'w') => { crate::copy_mode::select_a_word(app); }
+            (1, 'w') => { crate::copy_mode::select_inner_word(app); }
+            (0, 'W') => { crate::copy_mode::select_a_word_big(app); }
+            (1, 'W') => { crate::copy_mode::select_inner_word_big(app); }
+            _ => {}
+        }
+        return Ok(());
+    }
     // Handle find-char pending state (waiting for char after f/F/t/T)
     if let Some(pending) = app.copy_find_char_pending.take() {
         match pending {
@@ -1541,6 +1552,8 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
         'n' => { search_next(app); }
         'N' => { search_prev(app); }
+        'i' => { app.copy_text_object_pending = Some(1); }  // inner text object
+        'a' => { app.copy_text_object_pending = Some(0); }  // a text object
         _ => {} // Swallow unrecognized characters in copy mode
     }
     Ok(())
