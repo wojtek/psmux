@@ -18,7 +18,7 @@ pub fn cleanup_stale_port_files() {
                         let addr = format!("127.0.0.1:{}", port);
                         if std::net::TcpStream::connect_timeout(
                             &addr.parse().unwrap(),
-                            Duration::from_millis(50)
+                            Duration::from_millis(20)
                         ).is_err() {
                             let _ = std::fs::remove_file(&path);
                         }

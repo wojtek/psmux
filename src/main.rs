@@ -485,16 +485,19 @@ fn main() -> io::Result<()> {
                     let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 }
                 
-                // Wait for server to create port file (up to 2 seconds)
-                for _ in 0..20 {
+                // Wait for server to create port file (up to 5 seconds)
+                // Poll fast (10ms) — the server writes the port file early,
+                // before spawning ConPTY/pwsh, so it should appear quickly.
+                for _ in 0..500 {
                     if std::path::Path::new(&port_path).exists() {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
 
-                // Verify the server is actually alive (it might have died immediately
-                // if the initial command was invalid)
+                // Verify the server is actually alive — the TCP listener is
+                // already active when the port file appears (we moved file write
+                // before create_window), so this connect should succeed instantly.
                 if !std::path::Path::new(&port_path).exists() {
                     eprintln!("psmux: failed to create session '{}'", name);
                     std::process::exit(1);
@@ -505,7 +508,7 @@ fn main() -> io::Result<()> {
                             let addr = format!("127.0.0.1:{}", port);
                             std::net::TcpStream::connect_timeout(
                                 &addr.parse().unwrap(),
-                                Duration::from_millis(500)
+                                Duration::from_millis(100)
                             ).is_ok()
                         } else { false }
                     } else { false };
@@ -2166,12 +2169,12 @@ fn main() -> io::Result<()> {
                 let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             }
             
-            // Wait for server to start
-            for _ in 0..20 {
+            // Wait for server to start (fast polling — port file is written early)
+            for _ in 0..500 {
                 if std::path::Path::new(&port_path).exists() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         
