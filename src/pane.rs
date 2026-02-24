@@ -8,6 +8,19 @@ use portable_pty::{CommandBuilder, PtySize, PtySystemSelection};
 use crate::types::*;
 use crate::tree::*;
 
+/// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
+/// Resolved once on first use, reused for all subsequent pane spawns.
+static CACHED_SHELL_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Get the cached shell path, resolving via `which` only on first call.
+fn cached_shell() -> Option<&'static str> {
+    CACHED_SHELL_PATH.get_or_init(|| {
+        which::which("pwsh").ok()
+            .or_else(|| which::which("cmd").ok())
+            .map(|p| p.to_string_lossy().into_owned())
+    }).as_deref()
+}
+
 /// Determine the default shell name for window naming (like tmux shows "bash", "zsh").
 fn default_shell_name(command: Option<&str>, configured_shell: Option<&str>) -> String {
     if let Some(cmd) = command {
@@ -27,16 +40,19 @@ fn default_shell_name(command: Option<&str>, configured_shell: Option<&str>) -> 
             .unwrap_or(first)
             .to_string()
     } else {
-        // Default shell — find which shell we'll launch
-        which::which("pwsh").ok()
-            .or_else(|| which::which("cmd").ok())
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        // Default shell — use cached resolved path
+        cached_shell()
+            .and_then(|p| std::path::Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "shell".into())
     }
 }
 
 pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>) -> io::Result<()> {
-    let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
+    // Use actual terminal size if known, otherwise fall back to defaults
+    let area = app.last_window_area;
+    let rows = if area.height > 1 { area.height } else { 30 };
+    let cols = if area.width > 1 { area.width } else { 120 };
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
@@ -65,27 +81,12 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    thread::spawn(move || {
-        let mut local = [0u8; 65536];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => {
-                    let mut parser = term_reader.lock().unwrap();
-                    parser.process(&local[..n]);
-                    drop(parser);
-                    dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release);
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_reader_thread(reader, term_reader, dv_writer);
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
@@ -99,12 +100,15 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
 }
 
 pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
-    split_active_with_command(app, kind, None)
+    split_active_with_command(app, kind, None, None)
 }
 
 /// Create a new window with a raw command (program + args, no shell wrapping)
 pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, raw_args: &[String]) -> io::Result<()> {
-    let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
+    let area = app.last_window_area;
+    let rows = if area.height > 1 { area.height } else { 30 };
+    let cols = if area.width > 1 { area.width } else { 120 };
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
@@ -118,7 +122,8 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     // Close the slave handle immediately – see create_window() comment.
     drop(pair.slave);
 
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
+    let scrollback = app.history_limit;
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, scrollback)));
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
@@ -127,22 +132,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    thread::spawn(move || {
-        let mut local = [0u8; 65536];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => {
-                    let mut parser = term_reader.lock().unwrap();
-                    parser.process(&local[..n]);
-                    drop(parser);
-                    dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
-                    crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release);
-                }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_reader_thread(reader, term_reader, dv_writer);
 
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
     let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
@@ -154,9 +144,22 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     Ok(())
 }
 
-pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: Option<&str>) -> io::Result<()> {
-    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
-    let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
+pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: Option<&str>, pty_system_ref: Option<&dyn portable_pty::PtySystem>) -> io::Result<()> {
+    // Reuse provided PTY system or create one as fallback
+    let owned_pty;
+    let pty_system: &dyn portable_pty::PtySystem = if let Some(ps) = pty_system_ref {
+        ps
+    } else {
+        owned_pty = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+        &*owned_pty
+    };
+    // Compute target pane size from current window area and split direction
+    let area = app.last_window_area;
+    let (rows, cols) = match kind {
+        LayoutKind::Vertical => (if area.height > 2 { area.height / 2 } else { 15 }, if area.width > 1 { area.width } else { 120 }),
+        LayoutKind::Horizontal => (if area.height > 1 { area.height } else { 30 }, if area.width > 2 { area.width / 2 } else { 60 }),
+    };
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     // When no explicit command is given, use the configured default-shell.
     let mut shell_cmd = if command.is_some() {
@@ -175,16 +178,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
-    thread::spawn(move || {
-        let mut local = [0u8; 65536];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); drop(parser); dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release); crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release); }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_reader_thread(reader, term_reader, dv_writer);
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
     let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None });
     app.next_pane_id += 1;
@@ -228,10 +222,9 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
 
 pub fn build_command(command: Option<&str>) -> CommandBuilder {
     if let Some(cmd) = command {
-        let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
-        let cmd_exe = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
+        let shell = cached_shell().map(|s| s.to_string());
         
-        match pwsh.or(cmd_exe) {
+        match shell {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
                 builder.env("TERM", "xterm-256color");
@@ -255,8 +248,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             }
         }
     } else {
-        let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
-        let cmd_exe = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
+        let shell = cached_shell().map(|s| s.to_string());
         // PSReadLine v2.2.6+ enables PredictionSource HistoryAndPlugin by default.
         // Predictions cause display corruption in terminal multiplexers because
         // PSReadLine's VT rendering races with ConPTY output capture.
@@ -267,7 +259,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             "try { Set-PSReadLineOption -PredictionViewStyle InlineView -ErrorAction Stop } catch {}; ",
             "try { Remove-PSReadLineKeyHandler -Chord 'F2' -ErrorAction Stop } catch {}",
         );
-        match pwsh.or(cmd_exe) {
+        match shell {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
                 builder.env("TERM", "xterm-256color");
@@ -289,6 +281,26 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
     }
 }
 
+/// Cached resolved default-shell path to avoid repeated `which::which()` scans.
+static CACHED_DEFAULT_SHELL: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+static CACHED_DEFAULT_SHELL_MAP: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// Resolve a program name via `which`, caching the result.
+fn cached_which(program: &str) -> String {
+    // Fast path: check if already cached in the global OnceLock for the default
+    // (most common case is always the same shell)
+    let mut map = CACHED_DEFAULT_SHELL_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(cached) = map.get(program) {
+        return cached.clone();
+    }
+    let resolved = which::which(program).ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string());
+    map.insert(program.to_string(), resolved.clone());
+    resolved
+}
+
 /// Build a CommandBuilder that launches the given shell path interactively.
 /// Used when `default-shell` / `default-command` is configured.
 /// Supports pwsh, powershell, cmd, and any arbitrary executable.
@@ -298,16 +310,20 @@ pub fn build_default_shell(shell_path: &str) -> CommandBuilder {
     let program = parts.first().copied().unwrap_or(shell_path);
     let extra_args: Vec<&str> = if parts.len() > 1 { parts[1..].to_vec() } else { vec![] };
 
-    // Resolve bare names via `which`.
-    let resolved = which::which(program).ok()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.to_string());
+    // Resolve bare names via cached `which` — avoids repeated PATH scans.
+    let resolved = cached_which(program);
 
     let lower = resolved.to_lowercase();
     let mut builder = CommandBuilder::new(&resolved);
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     builder.env("PSMUX_SESSION", "1");
+
+    // Prepend extra arguments (e.g. -NoProfile) BEFORE our -NoExit/-Command block
+    // so they're interpreted as flags rather than as -Command arguments.
+    if !extra_args.is_empty() {
+        builder.args(extra_args.clone());
+    }
 
     if lower.contains("pwsh") || lower.contains("powershell") {
         // PSReadLine prediction workaround for PowerShell-based shells.
@@ -318,11 +334,6 @@ pub fn build_default_shell(shell_path: &str) -> CommandBuilder {
             "try { Remove-PSReadLineKeyHandler -Chord 'F2' -ErrorAction Stop } catch {}",
         );
         builder.args(["-NoLogo", "-NoExit", "-Command", psrl_init]);
-    }
-
-    // Append any extra arguments from the default-shell string.
-    if !extra_args.is_empty() {
-        builder.args(extra_args);
     }
 
     builder
@@ -345,6 +356,41 @@ pub fn build_raw_command(raw_args: &[String]) -> CommandBuilder {
         builder.args(args);
     }
     builder
+}
+
+/// Spawn a dedicated PTY reader thread that processes output and updates the
+/// data_version counter. Exits cleanly after 200 consecutive zero-byte reads
+/// (indicating the PTY pipe is closed) or on any I/O error.
+///
+/// Uses an 8KB read buffer (down from 64KB) to reduce mutex hold time during
+/// `parser.process()`, which improves DumpState latency under heavy output.
+pub fn spawn_reader_thread(
+    mut reader: Box<dyn std::io::Read + Send>,
+    term_reader: Arc<Mutex<vt100::Parser>>,
+    dv_writer: Arc<std::sync::atomic::AtomicU64>,
+) {
+    thread::spawn(move || {
+        let mut local = [0u8; 8192];
+        let mut zero_reads: u32 = 0;
+        loop {
+            match reader.read(&mut local) {
+                Ok(n) if n > 0 => {
+                    zero_reads = 0;
+                    if let Ok(mut parser) = term_reader.lock() {
+                        parser.process(&local[..n]);
+                    }
+                    dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(_) => {
+                    zero_reads += 1;
+                    if zero_reads > 200 { break; }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 // reap_children is in tree.rs

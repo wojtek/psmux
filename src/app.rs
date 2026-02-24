@@ -594,7 +594,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::SplitWindow(k, cmd, _detached, _start_dir, _size_pct) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref()); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k, cmd, _detached, _start_dir, _size_pct) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref(), None); resize_all_panes(&mut app); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }

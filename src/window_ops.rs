@@ -654,8 +654,15 @@ pub fn break_pane_to_window(app: &mut AppState) {
     }
 }
 
-pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
-    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>) -> io::Result<()> {
+    // Reuse provided PTY system or create one as fallback
+    let owned_pty;
+    let pty_system: &dyn portable_pty::PtySystem = if let Some(ps) = pty_system_ref {
+        ps
+    } else {
+        owned_pty = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+        &*owned_pty
+    };
     let win = &mut app.windows[app.active_idx];
     let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
     let pane_id = pane.id;
@@ -678,16 +685,7 @@ pub fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
     
-    thread::spawn(move || {
-        let mut local = [0u8; 65536];
-        loop {
-            match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); drop(parser); dv_writer.fetch_add(1, std::sync::atomic::Ordering::Release); crate::types::PTY_DATA_READY.store(true, std::sync::atomic::Ordering::Release); }
-                Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
-            }
-        }
-    });
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer);
     
     pane.master = pair.master;
     pane.child = child;

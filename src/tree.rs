@@ -71,7 +71,12 @@ pub fn replace_leaf_with_split(node: &mut Node, path: &Vec<usize>, kind: LayoutK
                     return;
                 } else { cur = &mut children[idx]; }
             }
-            Node::Leaf(_) => return,
+            Node::Leaf(_) => {
+                // Path is invalid (points through a Leaf). Kill the new pane
+                // to prevent leaking its ConPTY handle and reader thread.
+                kill_node(new_leaf);
+                return;
+            },
         }
     }
 }
@@ -242,8 +247,11 @@ pub fn resize_all_panes(app: &mut AppState) {
         }
     }
     
-    // Resize panes in ALL windows, not just the active one
-    for win in app.windows.iter_mut() {
+    // Only resize the active window immediately — background windows will be
+    // resized lazily when switched to.  This avoids O(total_panes) ConPTY
+    // resize syscalls on every structural change.
+    if app.active_idx < app.windows.len() {
+        let win = &mut app.windows[app.active_idx];
         let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
         compute_rects(&win.root, area, &mut rects);
         let mut path = Vec::new();

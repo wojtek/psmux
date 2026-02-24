@@ -1417,16 +1417,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     match req {
                 CtrlReq::NewWindow(cmd, name, detached, start_dir) => {
                     let prev_idx = app.active_idx;
+                    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
-                    let _ = create_window(&*pty_system, &mut app, cmd.as_deref());
+                    if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref()) {
+                        eprintln!("psmux: new-window error: {e}");
+                    }
+                    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     if detached { app.active_idx = prev_idx; }
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window");
                 }
                 CtrlReq::NewWindowPrint(cmd, name, detached, start_dir, format_str, resp) => {
                     let prev_idx = app.active_idx;
+                    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
-                    let _ = create_window(&*pty_system, &mut app, cmd.as_deref());
+                    if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref()) {
+                        eprintln!("psmux: new-window error: {e}");
+                    }
+                    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     // Use full format engine for -P output (tmux compatible)
                     let new_win_idx = app.windows.len() - 1;
@@ -1437,9 +1445,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window");
                 }
                 CtrlReq::SplitWindow(k, cmd, detached, start_dir, size_pct) => {
+                    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let _ = split_active_with_command(&mut app, k, cmd.as_deref());
+                    if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system)) {
+                        eprintln!("psmux: split-window error: {e}");
+                    }
                     // Apply size if specified (as percentage)
                     if let Some(_pct) = size_pct {
                         // Size will be applied by resize_all_panes using the layout ratios
@@ -1452,12 +1463,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         revert_path.push(0);
                         app.windows[app.active_idx].active_path = revert_path;
                     }
+                    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
                 }
                 CtrlReq::SplitWindowPrint(k, cmd, detached, start_dir, size_pct, format_str, resp) => {
+                    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let _ = split_active_with_command(&mut app, k, cmd.as_deref());
+                    if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system)) {
+                        eprintln!("psmux: split-window error: {e}");
+                    }
                     if let Some(_pct) = size_pct { }
                     // Use full format engine for -P output (tmux compatible)
                     let fmt = format_str.as_deref().unwrap_or("#{session_name}:#{window_index}.#{pane_index}");
@@ -1468,6 +1483,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.windows[app.active_idx].active_path = revert_path;
                     }
                     let _ = resp.send(pane_info);
+                    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
                 }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-kill-pane"); }
@@ -1488,6 +1504,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             switch_with_copy_save(&mut app, |app| {
                                 app.active_idx = internal_idx;
                             });
+                            // Lazily resize panes in the newly-focused window
+                            resize_all_panes(&mut app);
                         }
                     }
                     meta_dirty = true;
@@ -1636,7 +1654,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     resize_all_panes(&mut app);
                 }
                 CtrlReq::FocusPaneCmd(pid) => { switch_with_copy_save(&mut app, |app| { focus_pane_by_id(app, pid); }); meta_dirty = true; }
-                CtrlReq::FocusWindowCmd(wid) => { switch_with_copy_save(&mut app, |app| { if let Some(idx) = find_window_index_by_id(app, wid) { app.active_idx = idx; } }); meta_dirty = true; }
+                CtrlReq::FocusWindowCmd(wid) => { switch_with_copy_save(&mut app, |app| { if let Some(idx) = find_window_index_by_id(app, wid) { app.active_idx = idx; } }); resize_all_panes(&mut app); meta_dirty = true; }
                 CtrlReq::MouseDown(x,y) => { if app.mouse_enabled { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; } }
                 CtrlReq::MouseDownRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; } }
                 CtrlReq::MouseDownMiddle(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; } }
@@ -1647,8 +1665,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::MouseMove(x,y) => { if app.mouse_enabled { remote_mouse_motion(&mut app, x, y); } }
                 CtrlReq::ScrollUp(x, y) => { if app.mouse_enabled { remote_scroll_up(&mut app, x, y); state_dirty = true; } }
                 CtrlReq::ScrollDown(x, y) => { if app.mouse_enabled { remote_scroll_down(&mut app, x, y); state_dirty = true; } }
-                CtrlReq::NextWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + 1) % app.windows.len(); }); } meta_dirty = true; hook_event = Some("after-select-window"); }
-                CtrlReq::PrevWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); }); } meta_dirty = true; hook_event = Some("after-select-window"); }
+                CtrlReq::NextWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + 1) % app.windows.len(); }); resize_all_panes(&mut app); } meta_dirty = true; hook_event = Some("after-select-window"); }
+                CtrlReq::PrevWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); }); resize_all_panes(&mut app); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; win.manual_rename = true; meta_dirty = true; hook_event = Some("after-rename-window"); }
                 CtrlReq::ListWindows(resp) => { let json = list_windows_json(&app)?; let _ = resp.send(json); }
                 CtrlReq::ListWindowsTmux(resp) => { let text = list_windows_tmux(&app); let _ = resp.send(text); }
@@ -2077,6 +2095,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 app.last_window_idx = app.active_idx;
                                 app.active_idx = internal_idx;
                             });
+                            resize_all_panes(&mut app);
                         }
                     }
                     meta_dirty = true;
@@ -2322,7 +2341,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::RespawnPane => {
-                    respawn_active_pane(&mut app)?;
+                    respawn_active_pane(&mut app, Some(&*pty_system))?;
                     hook_event = Some("after-respawn-pane");
                 }
                 CtrlReq::BindKey(table_name, key, command, repeat) => {
@@ -2954,7 +2973,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::RespawnWindow => {
                     // Kill all panes in the active window and respawn	
-                    respawn_active_pane(&mut app)?;
+                    respawn_active_pane(&mut app, Some(&*pty_system))?;
                     state_dirty = true;
                 }
             }
