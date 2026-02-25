@@ -417,21 +417,35 @@ match cmd {
             }
         }
         if has_x {
-            // send-keys -X copy-mode-command
+            // send-keys -X copy-mode-command — flags are only -X, -N, -t
             let cmd_parts: Vec<&str> = args.iter().filter(|a| **a != "-X" && !a.starts_with('-')).copied().collect();
             for _ in 0..repeat_count {
                 let _ = tx.send(CtrlReq::SendKeysX(cmd_parts.join(" ")));
             }
         } else {
-            let keys: Vec<&str> = args.iter()
-                .enumerate()
-                .filter(|(i, a)| {
-                    !a.starts_with('-') && **a != "-l" && **a != "-t"
-                    // Skip the argument to -N
-                    && !(i > &0 && args.get(i - 1).map_or(false, |prev| *prev == "-N"))
-                })
-                .map(|(_, a)| *a)
-                .collect();
+            // Proper flag-then-keys parsing: flags are only recognized BEFORE
+            // the first key argument. Once text starts, everything is a key.
+            // This fixes arguments starting with '-' being silently dropped.
+            let mut keys: Vec<&str> = Vec::new();
+            let mut parsing_flags = true;
+            let mut skip_next = false;
+            for arg in args.iter() {
+                if skip_next { skip_next = false; continue; }
+                if !parsing_flags {
+                    keys.push(arg);
+                } else if *arg == "--" {
+                    parsing_flags = false;
+                } else if *arg == "-l" || *arg == "-H" || *arg == "-R" {
+                    // Known boolean flags — skip
+                } else if *arg == "-t" || *arg == "-N" {
+                    // Known flags with an argument — skip next too
+                    skip_next = true;
+                } else {
+                    // First non-flag argument — start collecting keys
+                    parsing_flags = false;
+                    keys.push(arg);
+                }
+            }
             for _ in 0..repeat_count {
                 let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
             }
