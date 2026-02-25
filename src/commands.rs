@@ -260,9 +260,7 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
             switch_with_copy_save(app, |app| { crate::input::move_focus(app, d); });
         }
         Action::NewWindow => {
-            let pty_system = portable_pty::PtySystemSelection::default()
-                .get()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+            let pty_system = portable_pty::native_pty_system();
             create_window(&*pty_system, app, None)?;
         }
         Action::SplitHorizontal => {
@@ -332,7 +330,7 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
     if parts.is_empty() { return Ok(()); }
     match parts[0] {
         "new-window" => {
-            let pty_system = portable_pty::PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+            let pty_system = portable_pty::native_pty_system();
             create_window(&*pty_system, app, None)?;
         }
         "split-window" => {
@@ -527,9 +525,7 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
             
             // Try PTY-based popup for interactive commands
             let pty_result = if !rest.is_empty() {
-                portable_pty::PtySystemSelection::default()
-                    .get()
-                    .ok()
+                Some(portable_pty::native_pty_system())
                     .and_then(|pty_sys| {
                         let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                         let pair = pty_sys.openpty(pty_size).ok()?;
@@ -551,7 +547,8 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                                 }
                             });
                         }
-                        Some(PopupPty { master: pair.master, child, term })
+                        let pty_writer = pair.master.take_writer().ok()?;
+                        Some(PopupPty { master: pair.master, writer: pty_writer, child, term })
                     })
             } else { None };
             

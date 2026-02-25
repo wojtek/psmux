@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::env;
 use std::net::TcpListener;
 
-use portable_pty::PtySystemSelection;
+use portable_pty::native_pty_system;
 use ratatui::prelude::Rect;
 
 use crate::types::{AppState, CtrlReq, Mode, FocusDir, LayoutKind, PipePaneState, VERSION,
@@ -52,9 +52,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
 
-    let pty_system = PtySystemSelection::default()
-        .get()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    let pty_system = native_pty_system();
 
     let mut app = AppState::new(session_name);
     app.socket_name = socket_name;
@@ -1644,9 +1642,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::DisplayPopup(command, width, height, close_on_exit) => {
                     if !command.is_empty() {
                         // Try to spawn with PTY for interactive programs (fzf, etc.)
-                        let pty_result = portable_pty::PtySystemSelection::default()
-                            .get()
-                            .ok()
+                        let pty_result = Some(portable_pty::native_pty_system())
                             .and_then(|pty_sys| {
                                 let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                                 let pair = pty_sys.openpty(pty_size).ok()?;
@@ -1668,7 +1664,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         }
                                     });
                                 }
-                                Some(PopupPty { master: pair.master, child, term })
+                                let pty_writer = pair.master.take_writer().ok()?;
+                                Some(PopupPty { master: pair.master, writer: pty_writer, child, term })
                             });
                         
                         app.mode = Mode::PopupMode {
@@ -1748,8 +1745,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if !encoded.is_empty() {
                         let win = &mut app.windows[app.active_idx];
                         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                            let _ = p.master.write_all(&encoded);
-                            let _ = p.master.flush();
+                            let _ = p.writer.write_all(&encoded);
+                            let _ = p.writer.flush();
                         }
                     }
                 }
@@ -1763,7 +1760,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let win = &mut app.windows[app.active_idx];
                         fn send_focus_seq(node: &mut Node, seq: &[u8]) {
                             match node {
-                                Node::Leaf(p) => { let _ = p.master.write_all(seq); let _ = p.master.flush(); }
+                                Node::Leaf(p) => { let _ = p.writer.write_all(seq); let _ = p.writer.flush(); }
                                 Node::Split { children, .. } => { for c in children { send_focus_seq(c, seq); } }
                             }
                         }
@@ -1776,7 +1773,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let win = &mut app.windows[app.active_idx];
                         fn send_focus_seq(node: &mut Node, seq: &[u8]) {
                             match node {
-                                Node::Leaf(p) => { let _ = p.master.write_all(seq); let _ = p.master.flush(); }
+                                Node::Leaf(p) => { let _ = p.writer.write_all(seq); let _ = p.writer.flush(); }
                                 Node::Split { children, .. } => { for c in children { send_focus_seq(c, seq); } }
                             }
                         }

@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::env;
 
 use crossterm::event::{self, Event, KeyEventKind};
-use portable_pty::{PtySize, PtySystemSelection};
+use portable_pty::{PtySize, native_pty_system};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use ratatui::backend::CrosstermBackend;
@@ -31,9 +31,7 @@ use crate::window_ops::{toggle_zoom, remote_mouse_down, remote_mouse_drag, remot
 use crate::util::{list_windows_json, list_tree_json};
 
 pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    let pty_system = PtySystemSelection::default()
-        .get()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    let pty_system = native_pty_system();
 
     let mut app = AppState::new(
         env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string())
@@ -163,7 +161,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut quit = false;
     loop {
         terminal.draw(|f| {
-            let area = f.size();
+            let area = f.area();
             let status_at_top = app.status_position == "top";
             let constraints = if status_at_top {
                 vec![Constraint::Length(1), Constraint::Min(1)]
@@ -328,7 +326,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 f.render_widget(para, prompt_area);
                 // Place cursor at the right position in the prompt
                 let cx = prompt_area.x + 1 + *cursor as u16; // +1 for ':'
-                f.set_cursor(cx, prompt_area.y);
+                f.set_cursor_position((cx, prompt_area.y));
             }
 
             if let Mode::WindowChooser { selected, ref tree } = app.mode {
@@ -609,7 +607,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let Some(req) = req else { break; };
             match req {
                 CtrlReq::NewWindow(cmd, name, _detached, _start_dir) => {
-                    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+                    let pty_system = native_pty_system();
                     create_window(&*pty_system, &mut app, cmd.as_deref())?;
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     resize_all_panes(&mut app);

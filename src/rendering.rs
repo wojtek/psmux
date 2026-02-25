@@ -154,7 +154,7 @@ pub fn render_node(
                 let cc = cc.min(target_cols.saturating_sub(1));
                 let cx = inner.x + cc;
                 let cy = inner.y + cr;
-                f.set_cursor(cx, cy);
+                f.set_cursor_position((cx, cy));
             }
         }
         Node::Split { kind, sizes, children } => {

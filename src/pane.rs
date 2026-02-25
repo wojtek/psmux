@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use portable_pty::{CommandBuilder, PtySize, PtySystemSelection};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::types::{AppState, Pane, Node, LayoutKind, Window};
 use crate::tree::{replace_leaf_with_split, active_pane_mut, kill_leaf};
@@ -90,7 +90,9 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
+    let pty_writer = pair.master.take_writer()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0 });
@@ -135,7 +137,9 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     spawn_reader_thread(reader, term_reader, dv_writer);
 
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
+    let pty_writer = pair.master.take_writer()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0 });
@@ -187,7 +191,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let pty_system: &dyn portable_pty::PtySystem = if let Some(ps) = pty_system_ref {
         ps
     } else {
-        owned_pty = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+        owned_pty = native_pty_system();
         &*owned_pty
     };
     // Compute target pane size from the *active pane's* actual dimensions,
@@ -233,7 +237,9 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let dv_writer = data_version.clone();
     spawn_reader_thread(reader, term_reader, dv_writer);
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
-    let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None });
+    let pty_writer = pair.master.take_writer()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);

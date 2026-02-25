@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{PtySize, PtySystemSelection};
+use portable_pty::{PtySize, native_pty_system};
 use ratatui::prelude::*;
 
 use crate::types::{AppState, Mode, Pane, Node, LayoutKind, DragState, Window, FocusDir};
@@ -51,8 +51,7 @@ fn pane_inner_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
 }
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
-fn write_mouse_event_remote(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
-    use std::io::Write;
+fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let ch = if press { 'M' } else { 'm' };
@@ -208,7 +207,7 @@ fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, pre
             // Hold parser lock during write to prevent reader thread from
             // updating mode while we're mid-write.
             drop(parser); // release lock before PTY write to avoid deadlock
-            write_mouse_event_remote(&mut pane.master, vt_button, vt_col, vt_row, press, enc);
+            write_mouse_event_remote(&mut pane.writer, vt_button, vt_col, vt_row, press, enc);
             true
         } else {
             false
@@ -712,7 +711,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let pty_system: &dyn portable_pty::PtySystem = if let Some(ps) = pty_system_ref {
         ps
     } else {
-        owned_pty = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+        owned_pty = native_pty_system();
         &*owned_pty
     };
     let win = &mut app.windows[app.active_idx];
@@ -739,7 +738,10 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     
     crate::pane::spawn_reader_thread(reader, term_reader, dv_writer);
     
+    let pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    
     pane.master = pair.master;
+    pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
     pane.data_version = data_version;

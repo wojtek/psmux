@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-use portable_pty::PtySystemSelection;
+use portable_pty::native_pty_system;
 use ratatui::prelude::*;
 
 use crate::types::{AppState, Mode, FocusDir, LayoutKind, DragState, Node};
@@ -19,8 +19,7 @@ use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
-fn write_mouse_event(master: &mut Box<dyn portable_pty::MasterPty>, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
-    use std::io::Write;
+fn write_mouse_event(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let ch = if press { 'M' } else { 'm' };
@@ -129,9 +128,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('c') => {
-                    let pty_system = PtySystemSelection::default()
-                        .get()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+                    let pty_system = native_pty_system();
                     create_window(&*pty_system, app, None)?;
                     true
                 }
@@ -843,32 +840,32 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                             should_close = true;
                         } else {
                             // Forward Escape to the PTY
-                            let _ = pty.master.write_all(b"\x1b");
+                            let _ = pty.writer.write_all(b"\x1b");
                         }
                     }
                     KeyCode::Char(c) => {
                         if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                             let ctrl = (c as u8).wrapping_sub(b'a').wrapping_add(1);
-                            let _ = pty.master.write_all(&[ctrl]);
+                            let _ = pty.writer.write_all(&[ctrl]);
                         } else {
                             let mut buf = [0u8; 4];
                             let s = c.encode_utf8(&mut buf);
-                            let _ = pty.master.write_all(s.as_bytes());
+                            let _ = pty.writer.write_all(s.as_bytes());
                         }
                     }
-                    KeyCode::Enter => { let _ = pty.master.write_all(b"\r"); }
-                    KeyCode::Backspace => { let _ = pty.master.write_all(b"\x7f"); }
-                    KeyCode::Tab => { let _ = pty.master.write_all(b"\t"); }
-                    KeyCode::BackTab => { let _ = pty.master.write_all(b"\x1b[Z"); }
-                    KeyCode::Up => { let _ = pty.master.write_all(b"\x1b[A"); }
-                    KeyCode::Down => { let _ = pty.master.write_all(b"\x1b[B"); }
-                    KeyCode::Right => { let _ = pty.master.write_all(b"\x1b[C"); }
-                    KeyCode::Left => { let _ = pty.master.write_all(b"\x1b[D"); }
-                    KeyCode::Home => { let _ = pty.master.write_all(b"\x1b[H"); }
-                    KeyCode::End => { let _ = pty.master.write_all(b"\x1b[F"); }
-                    KeyCode::PageUp => { let _ = pty.master.write_all(b"\x1b[5~"); }
-                    KeyCode::PageDown => { let _ = pty.master.write_all(b"\x1b[6~"); }
-                    KeyCode::Delete => { let _ = pty.master.write_all(b"\x1b[3~"); }
+                    KeyCode::Enter => { let _ = pty.writer.write_all(b"\r"); }
+                    KeyCode::Backspace => { let _ = pty.writer.write_all(b"\x7f"); }
+                    KeyCode::Tab => { let _ = pty.writer.write_all(b"\t"); }
+                    KeyCode::BackTab => { let _ = pty.writer.write_all(b"\x1b[Z"); }
+                    KeyCode::Up => { let _ = pty.writer.write_all(b"\x1b[A"); }
+                    KeyCode::Down => { let _ = pty.writer.write_all(b"\x1b[B"); }
+                    KeyCode::Right => { let _ = pty.writer.write_all(b"\x1b[C"); }
+                    KeyCode::Left => { let _ = pty.writer.write_all(b"\x1b[D"); }
+                    KeyCode::Home => { let _ = pty.writer.write_all(b"\x1b[H"); }
+                    KeyCode::End => { let _ = pty.writer.write_all(b"\x1b[F"); }
+                    KeyCode::PageUp => { let _ = pty.writer.write_all(b"\x1b[5~"); }
+                    KeyCode::PageDown => { let _ = pty.writer.write_all(b"\x1b[6~"); }
+                    KeyCode::Delete => { let _ = pty.writer.write_all(b"\x1b[3~"); }
                     _ => {}
                 }
                 // Check if child exited
@@ -963,7 +960,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         app.mode = Mode::Passthrough;
                         let win = &mut app.windows[app.active_idx];
                         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                            let _ = write!(p.master, "{}", text);
+                            let _ = write!(p.writer, "{}", text);
                         }
                     } else {
                         app.mode = Mode::Passthrough;
@@ -1124,7 +1121,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         let win = &mut app.windows[app.active_idx];
         fn write_all_panes(node: &mut Node, data: &[u8]) {
             match node {
-                Node::Leaf(p) if !p.dead => { let _ = p.master.write_all(data); let _ = p.master.flush(); }
+                Node::Leaf(p) if !p.dead => { let _ = p.writer.write_all(data); let _ = p.writer.flush(); }
                 Node::Leaf(_) => {}
                 Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
             }
@@ -1134,8 +1131,8 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         let win = &mut app.windows[app.active_idx];
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if !active.dead {
-                let _ = active.master.write_all(&encoded);
-                let _ = active.master.flush();
+                let _ = active.writer.write_all(&encoded);
+                let _ = active.writer.flush();
             }
         }
     }
@@ -1284,7 +1281,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                         if mode != vt100::MouseProtocolMode::None {
                             let vt_col = (col + 1).max(1) as u16;
                             let vt_row = (row + 1).max(1) as u16;
-                            write_mouse_event(&mut active.master, 0, vt_col, vt_row, true, enc);
+                            write_mouse_event(&mut active.writer, 0, vt_col, vt_row, true, enc);
                         } else {
                             if active.child_pid.is_none() {
                                 active.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*active.child) };
@@ -1329,7 +1326,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                     if mode != vt100::MouseProtocolMode::None {
                         let vt_col = (col + 1).max(1) as u16;
                         let vt_row = (row + 1).max(1) as u16;
-                        write_mouse_event(&mut active.master, 0, vt_col, vt_row, false, enc);
+                        write_mouse_event(&mut active.writer, 0, vt_col, vt_row, false, enc);
                     } else if let Some(pid) = active.child_pid {
                         crate::platform::mouse_inject::send_mouse_event(pid, col, row, 0, 0, true);
                     }
@@ -1363,7 +1360,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                             let vt_col = (col + 1).max(1) as u16;
                             let vt_row = (row + 1).max(1) as u16;
                             // button 0 + 32 = drag modifier
-                            write_mouse_event(&mut active.master, 32, vt_col, vt_row, true, enc);
+                            write_mouse_event(&mut active.writer, 32, vt_col, vt_row, true, enc);
                         } else {
                             if let Some(pid) = active.child_pid {
                                 crate::platform::mouse_inject::send_mouse_event(
@@ -1393,7 +1390,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             }
             let (col, row) = active_area.map_or((1, 1), |area| wheel_cell_for_area(area, me.column, me.row));
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                let _ = write!(active.master, "\x1b[<64;{};{}M", col, row);
+                let _ = write!(active.writer, "\x1b[<64;{};{}M", col, row);
             }
         }
         MouseEventKind::ScrollDown => {
@@ -1407,7 +1404,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             }
             let (col, row) = active_area.map_or((1, 1), |area| wheel_cell_for_area(area, me.column, me.row));
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                let _ = write!(active.master, "\x1b[<65;{};{}M", col, row);
+                let _ = write!(active.writer, "\x1b[<65;{};{}M", col, row);
             }
         }
         _ => {}
@@ -1443,7 +1440,7 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         let win = &mut app.windows[app.active_idx];
         fn write_all_panes(node: &mut Node, text: &[u8]) {
             match node {
-                Node::Leaf(p) => { let _ = p.master.write_all(text); let _ = p.master.flush(); }
+                Node::Leaf(p) => { let _ = p.writer.write_all(text); let _ = p.writer.flush(); }
                 Node::Split { children, .. } => { for c in children { write_all_panes(c, text); } }
             }
         }
@@ -1451,8 +1448,8 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-            let _ = p.master.write_all(text.as_bytes());
-            let _ = p.master.flush();
+            let _ = p.writer.write_all(text.as_bytes());
+            let _ = p.writer.flush();
         }
     }
     Ok(())
@@ -1678,22 +1675,22 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
         match k {
-            "enter" => { let _ = write!(p.master, "\r"); }
-            "tab" => { let _ = write!(p.master, "\t"); }
-            "btab" | "backtab" => { let _ = write!(p.master, "\x1b[Z"); }
-            "backspace" => { let _ = p.master.write_all(&[0x7F]); }
-            "delete" => { let _ = write!(p.master, "\x1b[3~"); }
-            "esc" => { let _ = write!(p.master, "\x1b"); }
-            "left" => { let _ = write!(p.master, "\x1b[D"); }
-            "right" => { let _ = write!(p.master, "\x1b[C"); }
-            "up" => { let _ = write!(p.master, "\x1b[A"); }
-            "down" => { let _ = write!(p.master, "\x1b[B"); }
-            "pageup" => { let _ = write!(p.master, "\x1b[5~"); }
-            "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
-            "home" => { let _ = write!(p.master, "\x1b[H"); }
-            "end" => { let _ = write!(p.master, "\x1b[F"); }
-            "insert" => { let _ = write!(p.master, "\x1b[2~"); }
-            "space" => { let _ = write!(p.master, " "); }
+            "enter" => { let _ = write!(p.writer, "\r"); }
+            "tab" => { let _ = write!(p.writer, "\t"); }
+            "btab" | "backtab" => { let _ = write!(p.writer, "\x1b[Z"); }
+            "backspace" => { let _ = p.writer.write_all(&[0x7F]); }
+            "delete" => { let _ = write!(p.writer, "\x1b[3~"); }
+            "esc" => { let _ = write!(p.writer, "\x1b"); }
+            "left" => { let _ = write!(p.writer, "\x1b[D"); }
+            "right" => { let _ = write!(p.writer, "\x1b[C"); }
+            "up" => { let _ = write!(p.writer, "\x1b[A"); }
+            "down" => { let _ = write!(p.writer, "\x1b[B"); }
+            "pageup" => { let _ = write!(p.writer, "\x1b[5~"); }
+            "pagedown" => { let _ = write!(p.writer, "\x1b[6~"); }
+            "home" => { let _ = write!(p.writer, "\x1b[H"); }
+            "end" => { let _ = write!(p.writer, "\x1b[F"); }
+            "insert" => { let _ = write!(p.writer, "\x1b[2~"); }
+            "space" => { let _ = write!(p.writer, " "); }
             s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
                 if let Ok(n) = s[1..].parse::<u8>() {
                     let seq = match n {
@@ -1711,26 +1708,26 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                         12 => "\x1b[24~",
                         _ => "",
                     };
-                    if !seq.is_empty() { let _ = write!(p.master, "{}", seq); }
+                    if !seq.is_empty() { let _ = write!(p.writer, "{}", seq); }
                 }
             }
             s if s.starts_with("C-") && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('c');
                 let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                let _ = p.master.write_all(&[ctrl_char]);
+                let _ = p.writer.write_all(&[ctrl_char]);
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('a');
-                let _ = write!(p.master, "\x1b{}", c);
+                let _ = write!(p.writer, "\x1b{}", c);
             }
             s if (s.starts_with("C-M-") || s.starts_with("c-m-")) && s.len() == 5 => {
                 let c = s.chars().nth(4).unwrap_or('c');
                 let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                let _ = p.master.write_all(&[0x1b, ctrl_char]);
+                let _ = p.writer.write_all(&[0x1b, ctrl_char]);
             }
             _ => {}
         }
-        let _ = p.master.flush();
+        let _ = p.writer.flush();
     }
     Ok(())
 }

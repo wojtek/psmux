@@ -607,13 +607,13 @@ pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
     if let Some(reg) = app.copy_register.take() {
         if let Some(text) = app.named_registers.get(&reg).cloned() {
             let win = &mut app.windows[app.active_idx];
-            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", text); }
+            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.writer, "{}", text); }
         }
         return Ok(());
     }
     if let Some(buf) = app.paste_buffers.first() {
         let win = &mut app.windows[app.active_idx];
-        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", buf); }
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.writer, "{}", buf); }
     }
     Ok(())
 }

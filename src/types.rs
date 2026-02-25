@@ -10,6 +10,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct Pane {
     pub master: Box<dyn MasterPty>,
+    pub writer: Box<dyn std::io::Write + Send>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
     pub last_rows: u16,
@@ -96,6 +97,7 @@ pub struct Hook {
 /// Interactive PTY for popup window (supports fzf, etc.)
 pub struct PopupPty {
     pub master: Box<dyn portable_pty::MasterPty>,
+    pub writer: Box<dyn std::io::Write + Send>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
 }

@@ -1308,7 +1308,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         let sel_e = rsel_end;
         let status_at_top = status_position_str == "top";
         terminal.draw(|f| {
-            let area = f.size();
+            let area = f.area();
             let constraints = if status_at_top {
                 vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
             } else {
@@ -1513,7 +1513,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                             }
                             let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
                             let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
-                            f.set_cursor(cx, cy);
+                            f.set_cursor_position((cx, cy));
                         }
 
                         // In copy mode, show cursor at copy_pos with a
@@ -1525,7 +1525,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                 let cc = (*cc).min(inner.width.saturating_sub(1));
                                 let cy = inner.y + cr;
                                 let cx = inner.x + cc;
-                                f.set_cursor(cx, cy);
+                                f.set_cursor_position((cx, cy));
                                 // Highlight the cursor cell with reverse video
                                 let buf = f.buffer_mut();
                                 let buf_area = buf.area;
