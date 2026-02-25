@@ -6,8 +6,6 @@
 /// `Start-Process -WindowStyle Hidden` in PowerShell.
 #[cfg(windows)]
 pub fn spawn_server_hidden(exe: &std::path::Path, args: &[String]) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     #[repr(C)]
     #[allow(non_snake_case)]
     struct STARTUPINFOW {

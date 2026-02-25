@@ -1,7 +1,7 @@
 use std::env;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::types::*;
+use crate::types::{AppState, Action, Bind};
 use crate::commands::parse_command_to_action;
 
 pub fn load_config(app: &mut AppState) {

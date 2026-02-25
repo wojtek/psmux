@@ -14,18 +14,21 @@ use ratatui::Terminal;
 use ratatui::style::{Style, Modifier};
 use chrono::Local;
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, CtrlReq, LayoutKind, Mode};
+use crate::tree::{active_pane_mut, compute_rects, resize_all_panes, kill_all_children,
+    find_window_index_by_id, focus_pane_by_id, focus_pane_by_index, reap_children};
 use crate::pane::{create_window, split_active_with_command, kill_active_pane};
-use crate::input::{handle_key, handle_mouse};
-use crate::rendering::{render_window, parse_status, centered_rect, parse_tmux_style, parse_inline_styles, spans_visual_width};
+use crate::input::{handle_key, handle_mouse, send_text_to_active, send_key_to_active};
+use crate::rendering::{render_window, parse_status, centered_rect};
+use crate::style::{parse_tmux_style, parse_inline_styles, spans_visual_width};
 use crate::config::load_config;
 use crate::cli::parse_target;
-use crate::copy_mode::*;
+use crate::copy_mode::{enter_copy_mode, move_copy_cursor, current_prompt_pos, yank_selection,
+    capture_active_pane_text, capture_active_pane_range, capture_active_pane_styled};
 use crate::layout::dump_layout_json;
-use crate::window_ops::*;
-use crate::util::*;
-use crate::input::{send_text_to_active, send_key_to_active};
+use crate::window_ops::{toggle_zoom, remote_mouse_down, remote_mouse_drag, remote_mouse_up,
+    remote_mouse_button, remote_mouse_motion, remote_scroll_up, remote_scroll_down};
+use crate::util::{list_windows_json, list_tree_json};
 
 pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let pty_system = PtySystemSelection::default()

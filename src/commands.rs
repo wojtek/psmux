@@ -1,14 +1,13 @@
 use std::io;
 use std::time::Instant;
 
-use crate::types::*;
-use crate::tree::*;
-use crate::pane::*;
-use crate::copy_mode::*;
+use crate::types::{AppState, Mode, Action, FocusDir, LayoutKind, MenuItem, Menu, PopupPty};
+use crate::tree::{compute_rects, kill_all_children};
+use crate::pane::{create_window, split_active, kill_active_pane};
+use crate::copy_mode::{enter_copy_mode, switch_with_copy_save, paste_latest,
+    capture_active_pane, save_latest_buffer};
 use crate::session::{send_control_to_port, list_all_sessions_tree};
-use crate::layout::cycle_top_layout;
 use crate::window_ops::toggle_zoom;
-use crate::window_ops;
 
 /// Build the choose-tree data for the WindowChooser mode.
 pub fn build_choose_tree(app: &AppState) -> Vec<crate::session::TreeEntry> {

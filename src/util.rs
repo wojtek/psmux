@@ -1,9 +1,8 @@
 use std::io;
-use std::env;
 
 use serde::{Serialize, Deserialize};
 
-use crate::types::*;
+use crate::types::{AppState, Node};
 
 pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> Option<String> {
     // Scan from cursor row (most likely prompt location) then fall back to last non-empty row

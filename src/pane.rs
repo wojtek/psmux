@@ -1,12 +1,12 @@
-use std::io::{self, Write};
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, PtySystemSelection};
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, Pane, Node, LayoutKind, Window};
+use crate::tree::{replace_leaf_with_split, active_pane_mut, kill_leaf};
 
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
 /// Resolved once on first use, reused for all subsequent pane spawns.
@@ -127,7 +127,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
@@ -228,7 +228,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     drop(pair.slave);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
     let term_reader = term.clone();
-    let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
     spawn_reader_thread(reader, term_reader, dv_writer);

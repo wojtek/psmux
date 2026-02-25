@@ -10,8 +10,8 @@
 use std::env;
 use std::cell::Cell;
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, Node, LayoutKind, Pane, Mode, VERSION};
+use crate::tree::{split_with_gaps, get_active_pane_id, active_pane, count_panes};
 use crate::config::format_key_binding;
 
 // Thread-local override for per-pane format expansion in list-panes.
@@ -95,13 +95,24 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     let bytes = fmt.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+
+    // Whether the original format contains strftime %-sequences.
+    // If so, we need to escape '%' in expanded variable content so chrono
+    // only interprets the real strftime codes from the original format.
+    let has_strftime = fmt.contains('%');
+
     while i < len {
         if bytes[i] == b'#' && i + 1 < len {
             if bytes[i + 1] == b'{' {
                 // #{...} expression
                 if let Some(close) = find_matching_brace(fmt, i + 2) {
                     let inner = &fmt[i + 2..close];
-                    result.push_str(&expand_expression(inner, app, win_idx));
+                    let expanded = expand_expression(inner, app, win_idx);
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&expanded));
+                    } else {
+                        result.push_str(&expanded);
+                    }
                     i = close + 1;
                     continue;
                 }
@@ -114,7 +125,14 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
             }
             // Shorthand #X
             match bytes[i + 1] {
-                b'S' => { result.push_str(&app.session_name); i += 2; continue; }
+                b'S' => {
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&app.session_name));
+                    } else {
+                        result.push_str(&app.session_name);
+                    }
+                    i += 2; continue;
+                }
                 b'I' => {
                     let n = if win_idx < app.windows.len() { win_idx + app.window_base_index } else { 0 };
                     result.push_str(&n.to_string());
@@ -122,7 +140,11 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 }
                 b'W' | b'T' => {
                     if let Some(w) = app.windows.get(win_idx) {
-                        result.push_str(&w.name);
+                        if has_strftime {
+                            result.push_str(&escape_strftime_percent(&w.name));
+                        } else {
+                            result.push_str(&w.name);
+                        }
                     }
                     i += 2; continue;
                 }
@@ -140,14 +162,23 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'H' | b'h' => {
-                    result.push_str(&hostname_cached());
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&hostname_cached()));
+                    } else {
+                        result.push_str(&hostname_cached());
+                    }
                     i += 2; continue;
                 }
                 b'D' => {
                     // tmux: #D = unique pane id (like %0, %1)
                     if let Some(w) = app.windows.get(win_idx) {
                         let active_id = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
-                        result.push_str(&format!("%{}", active_id));
+                        if has_strftime {
+                            // Escape the '%' so chrono doesn't misinterpret %0, %1, etc.
+                            result.push_str(&format!("%%{}", active_id));
+                        } else {
+                            result.push_str(&format!("%{}", active_id));
+                        }
                     }
                     i += 2; continue;
                 }
@@ -159,10 +190,10 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
         i += 1;
     }
     // Expand strftime %-sequences only if the ORIGINAL format contained '%'
-    if fmt.contains('%') && result.contains('%') {
+    if has_strftime && result.contains('%') {
         // Use write! to catch chrono format errors instead of panicking.
-        // The result string may contain user content (e.g. pane titles) with stray
-        // '%' characters that chrono can't parse as strftime specifiers.
+        // Expanded variable content has '%' escaped to '%%' above, so chrono
+        // will only interpret the real strftime codes from the original format.
         use std::fmt::Write;
         let formatted = chrono::Local::now().format(&result);
         let mut buf = String::with_capacity(result.len() + 32);
@@ -172,6 +203,18 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
         // On error, keep the pre-strftime result as-is
     }
     result
+}
+
+/// Escape '%' to '%%' in expanded variable content so chrono's strftime
+/// doesn't misinterpret user content (pane titles, pane IDs, etc.) as
+/// format specifiers.
+#[inline]
+fn escape_strftime_percent(s: &str) -> String {
+    if s.contains('%') {
+        s.replace('%', "%%")
+    } else {
+        s.to_string()
+    }
 }
 
 /// Expand format for a specific pane (used by list-panes -F, loops, etc).

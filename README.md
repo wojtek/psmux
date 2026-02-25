@@ -158,6 +158,35 @@ psmux is the most tmux-compatible terminal multiplexer on Windows:
 
 **Your existing `.tmux.conf` works.** psmux reads it automatically. Just install and go.
 
+## Plugins & Themes
+
+psmux has a full plugin ecosystem — ports of the most popular tmux plugins, reimplemented in PowerShell for Windows. Themes, key bindings, session management, clipboard integration, and more.
+
+**Browse available plugins and themes:** [**psmux-plugins**](https://github.com/marlocarlo/psmux-plugins)
+
+| Plugin | Description |
+|--------|-------------|
+| [psmux-sensible](https://github.com/marlocarlo/psmux-plugins/tree/main/psmux-sensible) | Sensible defaults for psmux |
+| [psmux-yank](https://github.com/marlocarlo/psmux-plugins/tree/main/psmux-yank) | Windows clipboard integration |
+| [psmux-resurrect](https://github.com/marlocarlo/psmux-plugins/tree/main/psmux-resurrect) | Save/restore sessions |
+| [psmux-pain-control](https://github.com/marlocarlo/psmux-plugins/tree/main/psmux-pain-control) | Better pane navigation |
+| [psmux-prefix-highlight](https://github.com/marlocarlo/psmux-plugins/tree/main/psmux-prefix-highlight) | Prefix key indicator |
+| [ppm](https://github.com/marlocarlo/psmux-plugins/tree/main/ppm) | Plugin manager (like tpm) |
+
+**Themes:** Catppuccin · Dracula · Nord · Tokyo Night · Gruvbox
+
+Quick start:
+```powershell
+# Install the plugin manager
+git clone https://github.com/marlocarlo/psmux-plugins "$env:USERPROFILE\.psmux\plugins\psmux-plugins"
+```
+Then add to your `~/.psmux.conf`:
+```
+set -g @plugin 'psmux-plugins/ppm'
+set -g @plugin 'psmux-plugins/psmux-sensible'
+run '~/.psmux/plugins/ppm/ppm.ps1'
+```
+
 ## Usage
 
 Use `psmux`, `pmux`, or `tmux`, they're identical:

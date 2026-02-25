@@ -1,14 +1,13 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 
 use portable_pty::{PtySize, PtySystemSelection};
 use ratatui::prelude::*;
 
-use crate::types::*;
-use crate::tree::*;
-use crate::pane::{create_window, detect_shell, build_default_shell, set_tmux_env};
+use crate::types::{AppState, Mode, Pane, Node, LayoutKind, DragState, Window, FocusDir};
+use crate::tree::{active_pane_mut, compute_rects, compute_split_borders,
+    split_sizes_at, adjust_split_sizes, get_split_mut, resize_all_panes};
+use crate::pane::{detect_shell, build_default_shell, set_tmux_env};
 use crate::copy_mode::{scroll_copy_up, scroll_copy_down, yank_selection};
 use crate::platform::mouse_inject;
 
@@ -733,7 +732,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     drop(pair.slave);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
     let term_reader = term.clone();
-    let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();

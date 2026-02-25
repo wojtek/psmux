@@ -1,7 +1,7 @@
-use std::io::{self, Write};
+use std::io;
 use ratatui::prelude::*;
 
-use crate::types::*;
+use crate::types::{AppState, Pane, Node, LayoutKind, DragState};
 use crate::platform::process_kill;
 
 /// Split an area into sub-rects with 1px gaps between them for separator lines.

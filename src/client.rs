@@ -3,75 +3,20 @@ use std::time::{Duration, Instant};
 use std::env;
 
 use chrono::Local;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyModifiers, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::layout::LayoutJson;
 use crate::help;
-use crate::util::*;
-use crate::session::*;
-use crate::rendering::*;
+use crate::util::{WinTree, base64_encode};
+use crate::session::read_session_key;
+use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect};
+use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
-
-/// Parse a tmux-style color name to a ratatui Color.
-/// Supports: "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-/// "default", "colour0"-"colour255", "#rrggbb", and "brightX" variants.
-fn parse_tmux_color(s: &str) -> Option<Color> {
-    match s.trim().to_lowercase().as_str() {
-        "default" | "" => None,
-        "black" => Some(Color::Black),
-        "red" => Some(Color::Red),
-        "green" => Some(Color::Green),
-        "yellow" => Some(Color::Yellow),
-        "blue" => Some(Color::Blue),
-        "magenta" => Some(Color::Magenta),
-        "cyan" => Some(Color::Cyan),
-        "white" => Some(Color::White),
-        "brightblack" => Some(Color::DarkGray),
-        "brightred" => Some(Color::LightRed),
-        "brightgreen" => Some(Color::LightGreen),
-        "brightyellow" => Some(Color::LightYellow),
-        "brightblue" => Some(Color::LightBlue),
-        "brightmagenta" => Some(Color::LightMagenta),
-        "brightcyan" => Some(Color::LightCyan),
-        "brightwhite" => Some(Color::Gray),
-        s if s.starts_with("colour") || s.starts_with("color") => {
-            let num_part = if s.starts_with("colour") { &s[6..] } else { &s[5..] };
-            num_part.parse::<u8>().ok().map(Color::Indexed)
-        }
-        s if s.starts_with('#') && s.len() == 7 => {
-            let r = u8::from_str_radix(&s[1..3], 16).ok()?;
-            let g = u8::from_str_radix(&s[3..5], 16).ok()?;
-            let b = u8::from_str_radix(&s[5..7], 16).ok()?;
-            Some(Color::Rgb(r, g, b))
-        }
-        _ => None,
-    }
-}
-
-/// Parse a tmux status-style string like "fg=white,bg=blue,bold" into (fg, bg, bold).
-fn parse_tmux_style(style: &str) -> (Option<Color>, Option<Color>, bool) {
-    let mut fg = None;
-    let mut bg = None;
-    let mut bold = false;
-    for part in style.split(',') {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix("fg=") {
-            fg = parse_tmux_color(val);
-        } else if let Some(val) = part.strip_prefix("bg=") {
-            bg = parse_tmux_color(val);
-        } else if part == "bold" {
-            bold = true;
-        } else if part == "nobold" {
-            bold = false;
-        }
-    }
-    (fg, bg, bold)
-}
 
 /// Extract selected text from the layout tree given absolute terminal coordinates.
 /// Computes pane areas via the same Layout splitting render_json uses, then reads
@@ -453,7 +398,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         std::fs::File::create(&path).ok()
     } else { None };
     let mut loop_count: u64 = 0;
-    let mut last_key_char: Option<char> = None;
+    let mut _last_key_char: Option<char> = None;
     let mut key_send_instant: Option<Instant> = None; // when the key was SENT to server
 
     // Text selection state (client-side only, left-click drag like pwsh)
@@ -471,12 +416,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // ── STEP 0: Receive latest frame from reader thread (non-blocking) ──
         // Drain channel, keeping only the most recent frame.
         let mut got_frame = false;
-        let mut nc_count = 0u32;
+        let mut _nc_count = 0u32;
         loop {
             match frame_rx.try_recv() {
                 Ok(line) => {
                     if line.trim() == "NC" {
-                        nc_count += 1;
+                        _nc_count += 1;
                         // Server says nothing changed — release dump_in_flight
                         // without touching dump_buf (saves 50-100KB clone + parse).
                         dump_in_flight = false;
@@ -1291,7 +1236,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // Update status-style from server config (if provided)
         if let Some(ref ss) = state.status_style {
             if !ss.is_empty() {
-                let (fg, bg, bold) = parse_tmux_style(ss);
+                let (fg, bg, bold) = parse_tmux_style_components(ss);
                 status_fg = fg.unwrap_or(Color::Black);
                 status_bg = bg.unwrap_or(Color::Green);
                 status_bold = bold;
@@ -1322,13 +1267,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // Update pane border styles
         if let Some(ref pbs) = state.pane_border_style {
             if !pbs.is_empty() {
-                let (fg, _bg, _bold) = parse_tmux_style(pbs);
+                let (fg, _bg, _bold) = parse_tmux_style_components(pbs);
                 if let Some(c) = fg { pane_border_fg = c; }
             }
         }
         if let Some(ref pabs) = state.pane_active_border_style {
             if !pabs.is_empty() {
-                let (fg, _bg, _bold) = parse_tmux_style(pabs);
+                let (fg, _bg, _bold) = parse_tmux_style_components(pabs);
                 if let Some(c) = fg { pane_active_border_fg = c; }
             }
         }
@@ -1339,12 +1284,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // Update window-status styles
         if let Some(ref s) = state.ws_style {
             if !s.is_empty() {
-                win_status_style = Some(parse_tmux_style(s));
+                win_status_style = Some(parse_tmux_style_components(s));
             }
         }
         if let Some(ref s) = state.wsc_style {
             if !s.is_empty() {
-                win_status_current_style = Some(parse_tmux_style(s));
+                win_status_current_style = Some(parse_tmux_style_components(s));
             }
         }
         // Update mode-style, status-position, status-justify from server
@@ -1783,7 +1728,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 let max_scroll = keys_viewer_lines.len().saturating_sub(visible_h);
                 if keys_viewer_scroll > max_scroll { keys_viewer_scroll = max_scroll; }
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, entry) in keys_viewer_lines.iter().enumerate().skip(keys_viewer_scroll).take(visible_h) {
+                for (_i, entry) in keys_viewer_lines.iter().enumerate().skip(keys_viewer_scroll).take(visible_h) {
                     // Highlight section headers, "bind-key" keyword, and plain text differently
                     if entry.starts_with("──") || entry.starts_with("── ") {
                         lines.push(Line::from(Span::styled(entry.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));

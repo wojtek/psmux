@@ -1,8 +1,13 @@
+// Multi-binary crate (psmux, pmux, tmux) sharing all modules —
+// suppress dead_code warnings for functions only used by a subset of binaries.
+#![allow(dead_code)]
+
 mod types;
 mod platform;
 mod cli;
 mod session;
 mod tree;
+mod style;
 mod rendering;
 mod config;
 mod commands;
@@ -30,15 +35,15 @@ use crossterm::{execute};
 use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
-use crate::types::*;
 use crate::platform::enable_virtual_terminal_processing;
-use crate::cli::*;
-use crate::session::*;
+use crate::cli::{print_help, print_version, print_commands, extract_session_from_target};
+use crate::session::{cleanup_stale_port_files, read_session_key, send_control,
+    send_control_with_response, resolve_last_session_name, resolve_default_session_name,
+    kill_remaining_server_processes};
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
 use crate::ssh_input::{is_ssh_session, send_mouse_enable, InputSource};
-use crate::util::*;
 
 fn main() {
     if let Err(e) = run_main() {
@@ -1487,7 +1492,7 @@ fn run_main() -> io::Result<()> {
             }
             // if-shell - Conditional execution
             "if-shell" | "if" => {
-                let mut background = false;
+                let mut _background = false;
                 let mut condition: Option<String> = None;
                 let mut cmd_true: Option<String> = None;
                 let mut cmd_false: Option<String> = None;
@@ -1496,7 +1501,7 @@ fn run_main() -> io::Result<()> {
                 
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
-                        "-b" => { background = true; }
+                        "-b" => { _background = true; }
                         "-F" => { format_mode = true; }
                         "-t" => { i += 1; } // Skip target
                         s if !s.starts_with('-') => {

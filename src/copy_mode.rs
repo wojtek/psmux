@@ -10,8 +10,8 @@ use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, G
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, Mode, CopyModeState};
+use crate::tree::{active_pane, active_pane_mut};
 
 pub fn enter_copy_mode(app: &mut AppState) { 
     app.mode = Mode::CopyMode; 

@@ -3,8 +3,8 @@ use std::io;
 use serde::{Serialize, Deserialize};
 use unicode_width::UnicodeWidthStr;
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, Node, LayoutKind, Mode};
+use crate::tree::get_split_mut;
 use crate::util::infer_title_from_prompt;
 
 pub fn cycle_top_layout(app: &mut AppState) {
@@ -894,7 +894,7 @@ pub fn parse_tmux_layout_string(layout_str: &str, panes: &mut Vec<Node>) -> Opti
 /// Parse a single node from position in the string, returns (Node, chars_consumed)
 fn parse_node(s: &str, panes: &mut Vec<Node>) -> Option<(Node, usize)> {
     // Parse WxH,X,Y first
-    let (w, h, consumed_dims) = parse_dimensions(s)?;
+    let (_w, _h, consumed_dims) = parse_dimensions(s)?;
     let rest = &s[consumed_dims..];
     
     // After dimensions, we have either:

@@ -5,12 +5,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use portable_pty::PtySystemSelection;
 use ratatui::prelude::*;
 
-use crate::types::*;
-use crate::tree::*;
-use crate::pane::*;
-use crate::commands::*;
+use crate::types::{AppState, Mode, FocusDir, LayoutKind, DragState, Node};
+use crate::tree::{active_pane, active_pane_mut, compute_rects, compute_split_borders,
+    split_sizes_at, adjust_split_sizes, path_exists, resize_all_panes};
+use crate::pane::{create_window, split_active};
+use crate::commands::{execute_action, execute_command_prompt, execute_command_string};
 use crate::config::normalize_key_for_binding;
-use crate::copy_mode::*;
+use crate::copy_mode::{enter_copy_mode, exit_copy_mode, switch_with_copy_save, move_copy_cursor,
+    scroll_copy_up, scroll_copy_down, paste_latest, yank_selection,
+    search_copy_mode, search_next, search_prev, scroll_to_top, scroll_to_bottom,
+    save_copy_state_to_pane, restore_copy_state_from_pane};
 use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 
@@ -913,7 +917,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             
             Ok(false)
         }
-        Mode::ConfirmMode { ref prompt, ref command, ref mut input } => {
+        Mode::ConfirmMode { prompt: _, ref command, ref mut input } => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     app.mode = Mode::Passthrough;

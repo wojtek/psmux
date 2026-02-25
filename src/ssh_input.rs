@@ -1080,7 +1080,6 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
     ssh_debug_log("=== psmux SSH input module starting ===");
     // Log Windows version
     {
-        use std::ffi::c_void;
         #[repr(C)]
         struct OSVERSIONINFOW {
             os_version_info_size: u32,
