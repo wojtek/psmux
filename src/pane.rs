@@ -8,6 +8,19 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use crate::types::{AppState, Pane, Node, LayoutKind, Window};
 use crate::tree::{replace_leaf_with_split, active_pane_mut, kill_leaf};
 
+/// Send a preemptive cursor-position report (\x1b[1;1R) to the ConPTY input pipe.
+///
+/// Windows ConPTY sends a Device Status Report (\x1b[6n]) during initialization
+/// and **blocks** until the host responds with a cursor-position report.  In
+/// portable-pty ≤0.2 this was handled internally, but 0.9+ exposes raw handles
+/// and the host must respond.  Writing the response preemptively (before the
+/// reader thread even starts) is safe because the data sits in the pipe buffer
+/// and ConPTY reads it when ready.
+pub fn conpty_preemptive_dsr_response(writer: &mut dyn std::io::Write) {
+    let _ = writer.write_all(b"\x1b[1;1R");
+    let _ = writer.flush();
+}
+
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
 /// Resolved once on first use, reused for all subsequent pane spawns.
 static CACHED_SHELL_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -90,8 +103,9 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
-    let pty_writer = pair.master.take_writer()
+    let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    conpty_preemptive_dsr_response(&mut *pty_writer);
     let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
@@ -137,8 +151,9 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     spawn_reader_thread(reader, term_reader, dv_writer);
 
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
-    let pty_writer = pair.master.take_writer()
+    let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    conpty_preemptive_dsr_response(&mut *pty_writer);
     let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
@@ -237,8 +252,9 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let dv_writer = data_version.clone();
     spawn_reader_thread(reader, term_reader, dv_writer);
     let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
-    let pty_writer = pair.master.take_writer()
+    let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    conpty_preemptive_dsr_response(&mut *pty_writer);
     let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];

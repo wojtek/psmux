@@ -1664,7 +1664,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         }
                                     });
                                 }
-                                let pty_writer = pair.master.take_writer().ok()?;
+                                let mut pty_writer = pair.master.take_writer().ok()?;
+                                crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
                                 Some(PopupPty { master: pair.master, writer: pty_writer, child, term })
                             });
                         
