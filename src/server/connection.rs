@@ -1,19 +1,19 @@
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::time::Duration;
-use std::net::TcpStream;
 
+use crate::pipe::PipeStream;
 use crate::types::{CtrlReq, LayoutKind, WaitForOp};
 use crate::cli::parse_target;
 use crate::util::base64_decode;
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
 
-/// Handle a single TCP connection from a client.
+/// Handle a single named pipe connection from a client.
 /// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
 /// to the main server event loop via the `tx` channel.
 pub(crate) fn handle_connection(
-    stream: TcpStream,
+    stream: PipeStream,
     tx: mpsc::Sender<CtrlReq>,
     session_key: &str,
     aliases: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
@@ -24,7 +24,7 @@ let mut write_stream = match stream.try_clone() {
     Err(_) => return,
 };
 
-// Set initial long timeout for auth
+// Named pipes use blocking reads — no timeout needed for auth
 let _ = stream.set_read_timeout(Some(Duration::from_millis(5000)));
 let mut r = io::BufReader::new(stream);
 

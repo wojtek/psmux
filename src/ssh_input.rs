@@ -84,7 +84,7 @@ pub fn send_mouse_enable() {
         extern "system" {
             fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
             fn WriteFile(
-                hFile: *mut std::ffi::c_void,
+                hFile: isize,
                 lpBuffer: *const u8,
                 nNumberOfBytesToWrite: u32,
                 lpNumberOfBytesWritten: *mut u32,
@@ -96,7 +96,7 @@ pub fn send_mouse_enable() {
         if !h.is_null() && h != (-1isize) as *mut std::ffi::c_void {
             let mut written: u32 = 0;
             let ok = WriteFile(
-                h,
+                h as isize,
                 MOUSE_ENABLE.as_ptr(),
                 MOUSE_ENABLE.len() as u32,
                 &mut written,

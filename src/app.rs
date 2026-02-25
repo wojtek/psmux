@@ -2,7 +2,6 @@ use std::io::{self, Write, BufRead as _};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::net::TcpListener;
 use std::env;
 
 use crossterm::event::{self, Event, KeyEventKind};
@@ -45,19 +44,38 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     app.control_rx = Some(rx);
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    app.control_port = Some(port);
+    let pipe_base = app.port_file_base();
+    let first_pipe = crate::pipe::create_server_pipe(&pipe_base, true)?;
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let dir = format!("{}\\.psmux", home);
     let _ = std::fs::create_dir_all(&dir);
-    let regpath = format!("{}\\{}.port", dir, app.port_file_base());
-    let _ = std::fs::write(&regpath, port.to_string());
+    let keypath = format!("{}\\{}.key", dir, app.port_file_base());
+    // Generate a session key for auth
+    let session_key: String = {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let s = RandomState::new();
+        let mut h = s.build_hasher();
+        h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64);
+        h.write_u64(std::process::id() as u64);
+        format!("{:016x}", h.finish())
+    };
+    let _ = std::fs::write(&keypath, &session_key);
+    let pipe_base_clone = pipe_base.clone();
     thread::spawn(move || {
-        for conn in listener.incoming() {
-            if let Ok(mut stream) = conn {
+        let mut current_pipe = first_pipe;
+        loop {
+            if crate::pipe::wait_for_connection(current_pipe).is_err() { break; }
+            let mut stream = crate::pipe::PipeStream::from_handle(current_pipe);
+            // Create next pipe instance before handling this connection
+            match crate::pipe::create_server_pipe(&pipe_base_clone, false) {
+                Ok(h) => current_pipe = h,
+                Err(_) => break,
+            }
+            {
                 let mut line = String::new();
-                let mut r = io::BufReader::new(stream.try_clone().unwrap());
+                let read_stream = stream.try_clone().unwrap();
+                let mut r = io::BufReader::new(read_stream);
                 let _ = r.read_line(&mut line);
                 
                 // Check for optional TARGET line (for session:window.pane addressing)
@@ -685,9 +703,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         kill_all_children(&mut win.root);
                     }
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}/.psmux/{}.port", home, app.port_file_base());
-                    let keypath = format!("{}/.psmux/{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
+                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                     let _ = std::fs::remove_file(&keypath);
                     std::process::exit(0);
                 }

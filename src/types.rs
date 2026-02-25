@@ -234,7 +234,6 @@ pub struct AppState {
     /// Current key table for switch-client -T (None = normal mode)
     pub current_key_table: Option<String>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
-    pub control_port: Option<u16>,
     pub session_name: String,
     /// Numeric session ID (tmux-compatible: $0, $1, $2...).
     pub session_id: usize,
@@ -409,7 +408,6 @@ impl AppState {
             key_tables: std::collections::HashMap::new(),
             current_key_table: None,
             control_rx: None,
-            control_port: None,
             session_name,
             session_id: {
                 static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

@@ -4,6 +4,7 @@
 
 mod types;
 mod platform;
+mod pipe;
 mod cli;
 mod session;
 mod tree;
@@ -201,12 +202,12 @@ fn run_main() -> io::Result<()> {
             let psmux_dir = format!("{}\\.psmux", home);
             // Compute namespace prefix for -L filtering (matches list-sessions behavior)
             let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
-            let mut streams: Vec<std::net::TcpStream> = Vec::new();
-            let mut stale_ports: Vec<std::path::PathBuf> = Vec::new();
+            let mut streams: Vec<crate::pipe::PipeStream> = Vec::new();
+            let mut stale_keys: Vec<std::path::PathBuf> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map(|e| e == "port").unwrap_or(false) {
+                    if path.extension().map(|e| e == "key").unwrap_or(false) {
                         if let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) {
                             // Apply -L namespace filtering:
                             // With -L: only kill sessions under that namespace
@@ -214,54 +215,37 @@ fn run_main() -> io::Result<()> {
                             if let Some(ref pfx) = ns_prefix {
                                 if !session_name.starts_with(pfx.as_str()) { continue; }
                             }
-                            if let Ok(port_str) = std::fs::read_to_string(&path) {
-                                if let Ok(port) = port_str.trim().parse::<u16>() {
-                                    let addr = format!("127.0.0.1:{}", port);
-                                    let sess_key = read_session_key(session_name).unwrap_or_default();
-                                    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                                        &addr.parse().unwrap(),
-                                        Duration::from_millis(1000),
-                                    ) {
-                                        let _ = stream.set_nodelay(true);
-                                        let _ = write!(stream, "AUTH {}\n", sess_key);
-                                        let _ = stream.flush();
-                                        let _ = std::io::Write::write_all(&mut stream, b"kill-server\n");
-                                        let _ = stream.flush();
-                                        // Shutdown write half to signal we're done sending.
-                                        // Keep read half open to detect server exit.
-                                        let _ = stream.shutdown(std::net::Shutdown::Write);
-                                        streams.push(stream);
-                                    } else {
-                                        // Server not reachable — stale port file
-                                        stale_ports.push(path.clone());
-                                    }
-                                }
+                            let sess_key = read_session_key(session_name).unwrap_or_default();
+                            if let Ok(handle) = crate::pipe::connect_to_pipe(session_name, 1000) {
+                                let mut stream = crate::pipe::PipeStream::from_handle(handle);
+                                let _ = write!(stream, "AUTH {}\n", sess_key);
+                                let _ = stream.flush();
+                                let _ = std::io::Write::write_all(&mut stream, b"kill-server\n");
+                                let _ = stream.flush();
+                                streams.push(stream);
                             } else {
-                                stale_ports.push(path.clone());
+                                // Server not reachable — stale key file
+                                stale_keys.push(path.clone());
                             }
                         }
                     }
                 }
             }
-            // Wait for each server to exit (connection close = server exited)
+            // Wait for each server to exit (pipe broken = server exited)
             for mut stream in streams {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
                 let mut buf = [0u8; 64];
-                // Read until EOF or error — server closing connection means it processed kill-server
+                // Read until EOF (broken pipe) or error — server closing means it processed kill-server
                 loop {
                     match std::io::Read::read(&mut stream, &mut buf) {
-                        Ok(0) => break,  // EOF — server closed connection
-                        Err(_) => break, // timeout or error
+                        Ok(0) => break,  // EOF — server closed pipe
+                        Err(_) => break, // broken pipe or error
                         Ok(_) => continue, // drain any response
                     }
                 }
             }
-            // Clean up stale port/key files
-            for path in &stale_ports {
+            // Clean up stale key files
+            for path in &stale_keys {
                 let _ = std::fs::remove_file(path);
-                // Also remove the corresponding .key file
-                let key_path = path.with_extension("key");
-                let _ = std::fs::remove_file(&key_path);
             }
             // Brief sleep then verify no processes remain; if any do, force-kill them.
             // Only do the nuclear fallback when not using -L namespace filtering,
@@ -281,7 +265,7 @@ fn run_main() -> io::Result<()> {
                     for e in entries.flatten() {
                         if let Some(name) = e.file_name().to_str() {
                             if let Some((base, ext)) = name.rsplit_once('.') {
-                                if ext == "port" {
+                                if ext == "key" {
                                     // Filter by -L namespace: when -L is given, only show
                                     // sessions with that prefix; when no -L, only show
                                     // sessions without any namespace prefix
@@ -290,38 +274,30 @@ fn run_main() -> io::Result<()> {
                                     } else {
                                         if base.contains("__") { continue; }
                                     }
-                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
-                                            let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
-                                                Duration::from_millis(50)
-                                            ) {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-                                                // Read session key and authenticate
-                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
-                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
-                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
-                                                }
-                                                let _ = std::io::Write::write_all(&mut s, b"session-info\n");
-                                                let mut br = std::io::BufReader::new(s);
-                                                let mut line = String::new();
-                                                // Skip "OK" response from AUTH
+                                    if crate::pipe::pipe_exists(base) {
+                                        let sess_key = read_session_key(base).unwrap_or_default();
+                                        if let Ok(handle) = crate::pipe::connect_to_pipe(base, 1000) {
+                                            let mut s = crate::pipe::PipeStream::from_handle(handle);
+                                            let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", sess_key).as_bytes());
+                                            let _ = std::io::Write::write_all(&mut s, b"session-info\n");
+                                            let _ = std::io::Write::flush(&mut s);
+                                            let mut br = std::io::BufReader::new(s);
+                                            let mut line = String::new();
+                                            // Skip "OK" response from AUTH
+                                            let _ = br.read_line(&mut line);
+                                            if line.trim() == "OK" {
+                                                line.clear();
                                                 let _ = br.read_line(&mut line);
-                                                if line.trim() == "OK" {
-                                                    line.clear();
-                                                    let _ = br.read_line(&mut line);
-                                                }
-                                                if !line.trim().is_empty() && line.trim() != "ERROR: Authentication required" { 
-                                                    println!("{}", line.trim_end()); 
-                                                } else { 
-                                                    println!("{}", base); 
-                                                }
+                                            }
+                                            if !line.trim().is_empty() && line.trim() != "ERROR: Authentication required" {
+                                                println!("{}", line.trim_end());
                                             } else {
-                                                // stale port file - remove it
-                                                let _ = std::fs::remove_file(e.path());
+                                                println!("{}", base);
                                             }
                                         }
+                                    } else {
+                                        // stale key file - remove it
+                                        let _ = std::fs::remove_file(e.path());
                                     }
                                 }
                             }
@@ -424,26 +400,13 @@ fn run_main() -> io::Result<()> {
                 
                 // Check if session already exists AND is actually running
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
-                if std::path::Path::new(&port_path).exists() {
-                    // Verify server is actually running
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
-                    
-                    if server_alive {
-                        eprintln!("psmux: session '{}' already exists", name);
-                        return Ok(());
-                    } else {
-                        // Stale port file - remove it and continue
-                        let _ = std::fs::remove_file(&port_path);
-                    }
+                let key_path = format!("{}\\.psmux\\{}.key", home, port_file_base);
+                if crate::pipe::pipe_exists(&port_file_base) {
+                    eprintln!("psmux: session '{}' already exists", name);
+                    return Ok(());
+                } else if std::path::Path::new(&key_path).exists() {
+                    // Stale key file - remove it and continue
+                    let _ = std::fs::remove_file(&key_path);
                 }
                 
                 // Always spawn a background server first
@@ -502,35 +465,26 @@ fn run_main() -> io::Result<()> {
                     let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 }
                 
-                // Wait for server to create port file (up to 5 seconds)
-                // Poll fast (10ms) — the server writes the port file early,
+                // Wait for server to create key file and pipe (up to 5 seconds)
+                // Poll fast (10ms) — the server writes the key file early,
                 // before spawning ConPTY/pwsh, so it should appear quickly.
                 for _ in 0..500 {
-                    if std::path::Path::new(&port_path).exists() {
+                    if std::path::Path::new(&key_path).exists() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
 
-                // Verify the server is actually alive — the TCP listener is
-                // already active when the port file appears (we moved file write
-                // before create_window), so this connect should succeed instantly.
-                if !std::path::Path::new(&port_path).exists() {
+                // Verify the server is actually alive — the named pipe is
+                // already active when the key file appears (we create the pipe
+                // before create_window), so pipe_exists should succeed instantly.
+                if !std::path::Path::new(&key_path).exists() {
                     eprintln!("psmux: failed to create session '{}'", name);
                     std::process::exit(1);
                 }
                 {
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
-                    if !server_alive {
-                        let _ = std::fs::remove_file(&port_path);
+                    if !crate::pipe::pipe_exists(&port_file_base) {
+                        let _ = std::fs::remove_file(&key_path);
                         eprintln!("psmux: session '{}' exited immediately (check shell command)", name);
                         std::process::exit(1);
                     }
@@ -923,10 +877,10 @@ fn run_main() -> io::Result<()> {
                 }
                 // Try to send kill command to server
                 if send_control("kill-session\n".to_string()).is_err() {
-                    // Server not responding - clean up stale port file
+                    // Server not responding - clean up stale key file
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
-                    let _ = std::fs::remove_file(&port_path);
+                    let key_path = format!("{}\\.psmux\\{}.key", home, session_name);
+                    let _ = std::fs::remove_file(&key_path);
                 }
                 return Ok(());
             }
@@ -954,39 +908,15 @@ fn run_main() -> io::Result<()> {
                         t
                     }
                 });
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let path = format!("{}\\.psmux\\{}.port", home, target);
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        // Actually authenticate and query the server to ensure it's healthy
-                        let session_key = read_session_key(&target).unwrap_or_default();
-                        if let Ok(mut s) = std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            Duration::from_millis(500)
-                        ) {
-                            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                            let _ = write!(s, "AUTH {}\n", session_key);
-                            let _ = write!(s, "session-info\n");
-                            let _ = s.flush();
-                            let mut buf = [0u8; 256];
-                            if let Ok(n) = std::io::Read::read(&mut s, &mut buf) {
-                                if n > 0 {
-                                    let resp = String::from_utf8_lossy(&buf[..n]);
-                                    if resp.contains("OK") {
-                                        std::process::exit(0);
-                                    }
-                                }
-                            }
-                            // Fallback: connection succeeded so session likely exists
-                            std::process::exit(0);
-                        } else {
-                            // Stale port file - clean it up
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
+                if crate::pipe::pipe_exists(&target) {
+                    std::process::exit(0);
+                } else {
+                    // Clean up stale key file if it exists
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let key_path = format!("{}\\.psmux\\{}.key", home, target);
+                    let _ = std::fs::remove_file(&key_path);
+                    std::process::exit(1);
                 }
-                std::process::exit(1);
             }
             // rename-session - Rename a session
             "rename-session" | "rename" => {
@@ -2151,30 +2081,14 @@ fn run_main() -> io::Result<()> {
     if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() != Some("1") {
         let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
         let session_name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
-        let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
-        
-        // Check if port file exists AND server is actually alive
-        let server_alive = if std::path::Path::new(&port_path).exists() {
-            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    let addr = format!("127.0.0.1:{}", port);
-                    std::net::TcpStream::connect_timeout(
-                        &addr.parse().unwrap(),
-                        Duration::from_millis(50)
-                    ).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        
+        let key_path = format!("{}\\.psmux\\{}.key", home, session_name);
+
+        // Check if named pipe exists (server is actually alive)
+        let server_alive = crate::pipe::pipe_exists(&session_name);
+
         if !server_alive {
-            // Clean up stale port file if it exists
-            let _ = std::fs::remove_file(&port_path);
+            // Clean up stale key file if it exists
+            let _ = std::fs::remove_file(&key_path);
             // No existing session - create one in background
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
             let server_args: Vec<String> = vec!["server".into(), "-s".into(), session_name.clone()];
@@ -2189,10 +2103,10 @@ fn run_main() -> io::Result<()> {
                 cmd.stderr(std::process::Stdio::null());
                 let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
             }
-            
-            // Wait for server to start (fast polling — port file is written early)
+
+            // Wait for server to start (fast polling — key file is written early)
             for _ in 0..500 {
-                if std::path::Path::new(&port_path).exists() {
+                if std::path::Path::new(&key_path).exists() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));

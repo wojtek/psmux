@@ -6,7 +6,7 @@ use crate::tree::{compute_rects, kill_all_children};
 use crate::pane::{create_window, split_active, kill_active_pane};
 use crate::copy_mode::{enter_copy_mode, switch_with_copy_save, paste_latest,
     capture_active_pane, save_latest_buffer};
-use crate::session::{send_control_to_port, list_all_sessions_tree};
+use crate::session::{send_control_to_session, list_all_sessions_tree};
 use crate::window_ops::toggle_zoom;
 
 /// Build the choose-tree data for the WindowChooser mode.
@@ -375,14 +375,14 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
     
     match parts[0] {
         "new-window" | "neww" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "new-window\n");
+            {
+                let _ = send_control_to_session(&app.port_file_base(), "new-window\n");
             }
         }
         "split-window" | "splitw" => {
             let flag = if parts.iter().any(|p| *p == "-h") { "-h" } else { "-v" };
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("split-window {}\n", flag));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("split-window {}\n", flag));
             }
         }
         "kill-pane" => {
@@ -568,31 +568,25 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                 toggle_zoom(app);
             } else {
                 // Forward to server for actual resize
-                if let Some(port) = app.control_port {
-                    let _ = send_control_to_port(port, &format!("{}\n", cmd));
-                }
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "swap-pane" | "swapp" => {
-            if let Some(port) = app.control_port {
-                let dir = if parts.iter().any(|p| *p == "-U") { "-U" } else { "-D" };
-                let _ = send_control_to_port(port, &format!("swap-pane {}\n", dir));
-            }
+            let dir = if parts.iter().any(|p| *p == "-U") { "-U" } else { "-D" };
+            let _ = send_control_to_session(&app.port_file_base(), &format!("swap-pane {}\n", dir));
         }
         "rotate-window" | "rotatew" => {
-            if let Some(port) = app.control_port {
-                let flag = if parts.iter().any(|p| *p == "-D") { "-D" } else { "" };
-                let _ = send_control_to_port(port, &format!("rotate-window {}\n", flag));
-            }
+            let flag = if parts.iter().any(|p| *p == "-D") { "-D" } else { "" };
+            let _ = send_control_to_session(&app.port_file_base(), &format!("rotate-window {}\n", flag));
         }
         "break-pane" | "breakp" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "break-pane\n");
+            {
+                let _ = send_control_to_session(&app.port_file_base(), "break-pane\n");
             }
         }
         "respawn-pane" | "respawnp" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "respawn-pane\n");
+            {
+                let _ = send_control_to_session(&app.port_file_base(), "respawn-pane\n");
             }
         }
         "toggle-sync" => {
@@ -600,28 +594,28 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
         }
         "set-option" | "set" | "set-window-option" | "setw" => {
             // Forward to server for option handling
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "bind-key" | "bind" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "unbind-key" | "unbind" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "source-file" | "source" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "send-keys" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "detach-client" | "detach" => {
@@ -633,18 +627,18 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
             }
         }
         "select-layout" | "selectl" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "next-layout" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "next-layout\n");
+            {
+                let _ = send_control_to_session(&app.port_file_base(), "next-layout\n");
             }
         }
         "pipe-pane" | "pipep" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
         "choose-tree" | "choose-window" => {
@@ -670,19 +664,19 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
             if !app.paste_buffers.is_empty() { app.paste_buffers.remove(0); }
         }
         "clear-history" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "clear-history\n");
+            {
+                let _ = send_control_to_session(&app.port_file_base(), "clear-history\n");
             }
         }
         "kill-session" => {
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "kill-session\n");
+            {
+                let _ = send_control_to_session(&app.port_file_base(), "kill-session\n");
             }
         }
         _ => {
             // Forward unknown commands to server (catch-all for tmux compat)
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd));
+            {
+                let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
             }
         }
     }

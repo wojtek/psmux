@@ -190,19 +190,16 @@ fn compute_active_rect_json(node: &LayoutJson, area: Rect) -> Option<Rect> {
 pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let path = format!("{}\\.psmux\\{}.port", home, name);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("can't find session '{}' (no server running)", name)))?;
-    let addr = format!("127.0.0.1:{}", port);
     let session_key = read_session_key(&name).unwrap_or_default();
     let last_path = format!("{}\\.psmux\\last_session", home);
     let _ = std::fs::write(&last_path, &name);
 
-    // ── Open persistent TCP connection ───────────────────────────────────
-    let stream = std::net::TcpStream::connect(&addr)?;
-    stream.set_nodelay(true)?; // Disable Nagle's algorithm for low latency
+    // ── Open persistent named pipe connection ────────────────────────────
+    let handle = crate::pipe::connect_to_pipe(&name, 5000)?;
+    let stream = crate::pipe::PipeStream::from_handle(handle);
+    let _ = stream.set_nodelay(true); // no-op for pipes
     let mut writer = stream.try_clone()?;
-    writer.set_nodelay(true)?;
+    let _ = writer.set_nodelay(true);
     let mut reader = BufReader::new(stream);
 
     // AUTH handshake
@@ -612,33 +609,26 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                         for e in entries.flatten() {
                                             if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
                                                 if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                    if ext == "port" {
-                                                        if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                            if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                                let sess_addr = format!("127.0.0.1:{}", p);
-                                                                let sess_key = read_session_key(base).unwrap_or_default();
-                                                                if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
-                                                                    &sess_addr.parse().unwrap(), Duration::from_millis(50)
-                                                                ) {
-                                                                    let _ = ss.set_read_timeout(Some(Duration::from_millis(100)));
-                                                                    let _ = write!(ss, "AUTH {}\n", sess_key);
-                                                                    let _ = ss.write_all(b"list-tree\n");
-                                                                    let _ = ss.flush();
-                                                                    let mut br = BufReader::new(ss);
-                                                                    let mut al = String::new();
-                                                                    let _ = br.read_line(&mut al); // AUTH OK
-                                                                    let mut tree_line = String::new();
-                                                                    if br.read_line(&mut tree_line).is_ok() {
-                                                                        // Parse JSON array of WinTree
-                                                                        if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(&tree_line.trim()) {
-                                                                            let mut win_data = Vec::new();
-                                                                            for w in &wins {
-                                                                                let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
-                                                                                win_data.push((w.id, w.name.clone(), panes));
-                                                                            }
-                                                                            sessions.push((base.to_string(), win_data));
-                                                                        }
+                                                    if ext == "key" && crate::pipe::pipe_exists(base) {
+                                                        let sess_key = read_session_key(base).unwrap_or_default();
+                                                        if let Ok(handle) = crate::pipe::connect_to_pipe(base, 1000) {
+                                                            let mut ss = crate::pipe::PipeStream::from_handle(handle);
+                                                            let _ = write!(ss, "AUTH {}\n", sess_key);
+                                                            let _ = ss.write_all(b"list-tree\n");
+                                                            let _ = ss.flush();
+                                                            let mut br = BufReader::new(ss);
+                                                            let mut al = String::new();
+                                                            let _ = br.read_line(&mut al); // AUTH OK
+                                                            let mut tree_line = String::new();
+                                                            if br.read_line(&mut tree_line).is_ok() {
+                                                                // Parse JSON array of WinTree
+                                                                if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(&tree_line.trim()) {
+                                                                    let mut win_data = Vec::new();
+                                                                    for w in &wins {
+                                                                        let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
+                                                                        win_data.push((w.id, w.name.clone(), panes));
                                                                     }
+                                                                    sessions.push((base.to_string(), win_data));
                                                                 }
                                                             }
                                                         }
@@ -707,32 +697,26 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                         for e in entries.flatten() {
                                             if let Some(fname) = e.file_name().to_str() {
                                                 if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                    if ext == "port" {
-                                                        if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                            if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                                let sess_addr = format!("127.0.0.1:{}", p);
-                                                                let sess_key = read_session_key(base).unwrap_or_default();
-                                                                let info = if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
-                                                                    &sess_addr.parse().unwrap(), Duration::from_millis(25)
-                                                                ) {
-                                                                    let _ = ss.set_read_timeout(Some(Duration::from_millis(25)));
-                                                                    let _ = write!(ss, "AUTH {}\n", sess_key);
-                                                                    let _ = ss.write_all(b"session-info\n");
-                                                                    let mut br = BufReader::new(ss);
-                                                                    let mut al = String::new();
-                                                                    let _ = br.read_line(&mut al);
-                                                                    let mut line = String::new();
-                                                                    if br.read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                                                                        line.trim().to_string()
-                                                                    } else {
-                                                                        format!("{}: (no info)", base)
-                                                                    }
-                                                                } else {
-                                                                    format!("{}: (not responding)", base)
-                                                                };
-                                                                session_entries.push((base.to_string(), info));
+                                                    if ext == "key" && crate::pipe::pipe_exists(base) {
+                                                        let sess_key = read_session_key(base).unwrap_or_default();
+                                                        let info = if let Ok(handle) = crate::pipe::connect_to_pipe(base, 1000) {
+                                                            let mut ss = crate::pipe::PipeStream::from_handle(handle);
+                                                            let _ = write!(ss, "AUTH {}\n", sess_key);
+                                                            let _ = ss.write_all(b"session-info\n");
+                                                            let _ = ss.flush();
+                                                            let mut br = BufReader::new(ss);
+                                                            let mut al = String::new();
+                                                            let _ = br.read_line(&mut al);
+                                                            let mut line = String::new();
+                                                            if br.read_line(&mut line).is_ok() && !line.trim().is_empty() {
+                                                                line.trim().to_string()
+                                                            } else {
+                                                                format!("{}: (no info)", base)
                                                             }
-                                                        }
+                                                        } else {
+                                                            format!("{}: (not responding)", base)
+                                                        };
+                                                        session_entries.push((base.to_string(), info));
                                                     }
                                                 }
                                             }
@@ -758,17 +742,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                         for e in entries.flatten() {
                                             if let Some(fname) = e.file_name().to_str() {
                                                 if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                    if ext == "port" {
-                                                        if let Ok(ps) = std::fs::read_to_string(e.path()) {
-                                                            if let Ok(p) = ps.trim().parse::<u16>() {
-                                                                let a = format!("127.0.0.1:{}", p);
-                                                                if std::net::TcpStream::connect_timeout(
-                                                                    &a.parse().unwrap(), Duration::from_millis(25)
-                                                                ).is_ok() {
-                                                                    names.push(base.to_string());
-                                                                }
-                                                            }
-                                                        }
+                                                    if ext == "key" && crate::pipe::pipe_exists(base) {
+                                                        names.push(base.to_string());
                                                     }
                                                 }
                                             }
@@ -829,20 +804,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                             quit = true;
                                         } else {
                                             // Kill another session by connecting to it
-                                            let h = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                                            let port_path = format!("{}\\.psmux\\{}.port", h, sname);
-                                            let key_path = format!("{}\\.psmux\\{}.key", h, sname);
-                                            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                                                if let Ok(port) = port_str.trim().parse::<u16>() {
-                                                    let addr = format!("127.0.0.1:{}", port);
-                                                    let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
-                                                    if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
-                                                        &addr.parse().unwrap(), Duration::from_millis(100)
-                                                    ) {
-                                                        let _ = write!(ss, "AUTH {}\n", sess_key.trim());
-                                                        let _ = ss.write_all(b"kill-session\n");
-                                                    }
-                                                }
+                                            let sess_key = read_session_key(&sname).unwrap_or_default();
+                                            if let Ok(handle) = crate::pipe::connect_to_pipe(&sname, 1000) {
+                                                let mut ss = crate::pipe::PipeStream::from_handle(handle);
+                                                let _ = write!(ss, "AUTH {}\n", sess_key.trim());
+                                                let _ = ss.write_all(b"kill-session\n");
+                                                let _ = ss.flush();
                                             }
                                             // Remove the killed session from the list
                                             session_entries.remove(session_selected);

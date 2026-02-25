@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::env;
-use std::net::TcpListener;
+use crate::pipe::{self, PipeStream};
 
 use portable_pty::native_pty_system;
 use ratatui::prelude::Rect;
@@ -59,16 +59,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Server starts detached with a reasonable default window size
     app.attached_clients = 0;
     load_config(&mut app);
-    // Bind the control listener BEFORE creating the initial window so that
-    // the first pane's $TMUX env var contains the real port (not 0).
+    // Set up the control channel BEFORE creating the initial window.
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     app.control_rx = Some(rx);
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    app.control_port = Some(port);
 
-    // Write port and key files IMMEDIATELY after binding, BEFORE creating the
-    // initial window.  The client polls for the port file to know the server is
+    // Create the first named pipe instance to claim the pipe name.
+    let pipe_base = app.port_file_base();
+    let first_pipe = pipe::create_server_pipe(&pipe_base, true)?;
+
+    // Write key file IMMEDIATELY after binding, BEFORE creating the
+    // initial window.  The client polls for the key file to know the server is
     // ready to accept connections.  Writing early (before the slow ConPTY +
     // pwsh spawn) shaves 200-400ms off first-start latency.
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
@@ -86,8 +86,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         format!("{:016x}", h.finish())
     };
 
-    let regpath = format!("{}\\{}.port", dir, app.port_file_base());
-    let _ = std::fs::write(&regpath, port.to_string());
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
     let _ = std::fs::write(&keypath, &session_key);
 
@@ -118,14 +116,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let shared_aliases_main = shared_aliases.clone();
 
     thread::spawn(move || {
-        for conn in listener.incoming() {
-            if let Ok(stream) = conn {
-                let tx = tx.clone();
-                let session_key_clone = session_key.clone();
-                let aliases = shared_aliases.clone();
-                thread::spawn(move || {
-                    connection::handle_connection(stream, tx, &session_key_clone, aliases);
-                }); // end per-connection thread
+        // The first pipe instance was already created above.
+        let mut current_pipe = first_pipe;
+        loop {
+            // Wait for a client to connect to this pipe instance
+            if pipe::wait_for_connection(current_pipe).is_err() {
+                break;
+            }
+            let stream = PipeStream::from_handle(current_pipe);
+            let tx = tx.clone();
+            let session_key_clone = session_key.clone();
+            let aliases = shared_aliases.clone();
+            thread::spawn(move || {
+                connection::handle_connection(stream, tx, &session_key_clone, aliases);
+            });
+            // Create a new pipe instance for the next client
+            match pipe::create_server_pipe(&pipe_base, false) {
+                Ok(h) => current_pipe = h,
+                Err(_) => break,
             }
         }
     });
@@ -999,9 +1007,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Brief delay to let child processes fully terminate
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
                     std::process::exit(0);
                 }
@@ -1010,23 +1016,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::RenameSession(name) => {
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let old_path = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let old_keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    // Compute new port file base with socket_name prefix
+                    // Compute new key file base with socket_name prefix
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {
                         name.clone()
                     };
-                    let new_path = format!("{}\\.psmux\\{}.port", home, new_base);
                     let new_keypath = format!("{}\\.psmux\\{}.key", home, new_base);
-                    if let Some(port) = app.control_port {
-                        let _ = std::fs::remove_file(&old_path);
-                        let _ = std::fs::write(&new_path, port.to_string());
-                        if let Ok(key) = std::fs::read_to_string(&old_keypath) {
-                            let _ = std::fs::remove_file(&old_keypath);
-                            let _ = std::fs::write(&new_keypath, key);
-                        }
+                    if let Ok(key) = std::fs::read_to_string(&old_keypath) {
+                        let _ = std::fs::remove_file(&old_keypath);
+                        let _ = std::fs::write(&new_keypath, key);
                     }
                     app.session_name = name;
                     hook_event = Some("after-rename-session");
@@ -1595,9 +1595,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Brief delay to let child processes fully terminate
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
                     std::process::exit(0);
                 }
@@ -1726,10 +1724,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.session_name,
                         app.windows.len(),
                         (chrono::Local::now() - app.created_at).num_seconds(),
-                        {
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            format!("{}\\.psmux\\{}.port", home, app.port_file_base())
-                        }
+                        pipe::pipe_name_for_session(&app.port_file_base())
                     );
                     let _ = resp.send(info);
                 }
@@ -1823,9 +1818,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         }
         if all_empty {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
             let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-            let _ = std::fs::remove_file(&regpath);
             let _ = std::fs::remove_file(&keypath);
             break;
         }

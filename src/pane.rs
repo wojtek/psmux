@@ -79,7 +79,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     } else {
         build_command(None)
     };
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.socket_name.as_deref());
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -130,7 +130,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
 
     let mut shell_cmd = build_raw_command(raw_args);
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.socket_name.as_deref());
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -241,7 +241,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     } else {
         build_command(None)
     };
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref());
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.socket_name.as_deref());
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     // Close the slave handle immediately – see create_window() comment.
     drop(pair.slave);
@@ -285,13 +285,13 @@ pub fn detect_shell() -> CommandBuilder {
 /// TMUX format: /tmp/psmux-{server_pid}/{socket_name},{port},0
 /// TMUX_PANE format: %{pane_id}
 /// The socket_name component encodes the -L namespace for child process resolution.
-pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: Option<u16>, socket_name: Option<&str>) {
+pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, socket_name: Option<&str>) {
     let server_pid = std::process::id();
-    let port = control_port.unwrap_or(0);
     let sn = socket_name.unwrap_or("default");
     // Format compatible with tmux: <socket_path>,<pid>,<session_idx>
     // We encode the socket name in the path component for -L namespace resolution
-    builder.env("TMUX", format!("/tmp/psmux-{}/{},{},0", server_pid, sn, port));
+    // Port is 0 since we use named pipes instead of TCP
+    builder.env("TMUX", format!("/tmp/psmux-{}/{},0,0", server_pid, sn));
     builder.env("TMUX_PANE", format!("%{}", pane_id));
 }
 
