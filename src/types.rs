@@ -538,7 +538,7 @@ pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repe
 pub enum CtrlReq {
     NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
     NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>),  // cmd, name, detached, start_dir, format, resp
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>),  // kind, cmd, detached, start_dir, size_percent
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size_percent, error_resp
     SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<u16>, Option<String>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size_percent, format, resp
     KillPane,
     CapturePane(mpsc::Sender<String>),

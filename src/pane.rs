@@ -50,8 +50,8 @@ fn default_shell_name(command: Option<&str>, configured_shell: Option<&str>) -> 
 pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>) -> io::Result<()> {
     // Use actual terminal size if known, otherwise fall back to defaults
     let area = app.last_window_area;
-    let rows = if area.height > 1 { area.height } else { 30 };
-    let cols = if area.width > 1 { area.width } else { 120 };
+    let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
+    let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system
         .openpty(size)
@@ -144,7 +144,44 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     Ok(())
 }
 
+/// Minimum pane dimension (rows or cols) — ConPTY on Windows crashes
+/// the child process if either dimension is less than 2.
+pub const MIN_PANE_DIM: u16 = 2;
+
+/// Minimum rows for a split to be allowed — each resulting pane needs at
+/// least this many rows to run a shell prompt.
+const MIN_SPLIT_ROWS: u16 = 4;
+/// Minimum cols for a split to be allowed.
+const MIN_SPLIT_COLS: u16 = 10;
+
 pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: Option<&str>, pty_system_ref: Option<&dyn portable_pty::PtySystem>) -> io::Result<()> {
+    // ── Guard: refuse split if the active pane is too small ──────────
+    // After splitting, each half gets roughly (dim / 2) - 1 (for the divider).
+    // If that would be below MIN_PANE_DIM, deny the split to avoid crashing
+    // the child process (ConPTY cannot function below ~2 rows or cols).
+    {
+        let win = &app.windows[app.active_idx];
+        if let Some(p) = crate::tree::active_pane(&win.root, &win.active_path) {
+            let (cur_rows, cur_cols) = (p.last_rows, p.last_cols);
+            match kind {
+                LayoutKind::Vertical => {
+                    // Splitting vertically divides height; need room for 2 panes + 1 divider
+                    if cur_rows < MIN_SPLIT_ROWS * 2 + 1 {
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("pane too small to split vertically ({cur_rows} rows, need {})", MIN_SPLIT_ROWS * 2 + 1)));
+                    }
+                }
+                LayoutKind::Horizontal => {
+                    // Splitting horizontally divides width; need room for 2 panes + 1 divider
+                    if cur_cols < MIN_SPLIT_COLS * 2 + 1 {
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("pane too small to split horizontally ({cur_cols} cols, need {})", MIN_SPLIT_COLS * 2 + 1)));
+                    }
+                }
+            }
+        }
+    }
+
     // Reuse provided PTY system or create one as fallback
     let owned_pty;
     let pty_system: &dyn portable_pty::PtySystem = if let Some(ps) = pty_system_ref {
@@ -153,11 +190,27 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
         owned_pty = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
         &*owned_pty
     };
-    // Compute target pane size from current window area and split direction
-    let area = app.last_window_area;
+    // Compute target pane size from the *active pane's* actual dimensions,
+    // not the full window area — ensures we don't over-estimate and then
+    // immediately resize to a tiny rect.
+    let (pane_rows, pane_cols) = {
+        let win = &app.windows[app.active_idx];
+        if let Some(p) = crate::tree::active_pane(&win.root, &win.active_path) {
+            (p.last_rows, p.last_cols)
+        } else {
+            let area = app.last_window_area;
+            (if area.height > 1 { area.height } else { 30 }, if area.width > 1 { area.width } else { 120 })
+        }
+    };
     let (rows, cols) = match kind {
-        LayoutKind::Vertical => (if area.height > 2 { area.height / 2 } else { 15 }, if area.width > 1 { area.width } else { 120 }),
-        LayoutKind::Horizontal => (if area.height > 1 { area.height } else { 30 }, if area.width > 2 { area.width / 2 } else { 60 }),
+        LayoutKind::Vertical => {
+            let half = (pane_rows.saturating_sub(1)) / 2; // subtract 1 for divider
+            (half.max(MIN_PANE_DIM), pane_cols.max(MIN_PANE_DIM))
+        }
+        LayoutKind::Horizontal => {
+            let half = (pane_cols.saturating_sub(1)) / 2;
+            (pane_rows.max(MIN_PANE_DIM), half.max(MIN_PANE_DIM))
+        }
     };
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;

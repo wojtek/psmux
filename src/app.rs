@@ -18,7 +18,7 @@ use crate::types::*;
 use crate::tree::*;
 use crate::pane::{create_window, split_active_with_command, kill_active_pane};
 use crate::input::{handle_key, handle_mouse};
-use crate::rendering::{render_window, parse_status, centered_rect, parse_tmux_style};
+use crate::rendering::{render_window, parse_status, centered_rect, parse_tmux_style, parse_inline_styles, spans_visual_width};
 use crate::config::load_config;
 use crate::cli::parse_target;
 use crate::copy_mode::*;
@@ -127,7 +127,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let cmd_str: Option<String> = args.iter()
                             .find(|a| !a.starts_with('-'))
                             .map(|s| s.trim_matches('"').to_string());
-                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, false, None, None));
+                        let (rtx, _rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, false, None, None, rtx));
                     }
                     "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" => {
@@ -160,13 +161,25 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     loop {
         terminal.draw(|f| {
             let area = f.size();
+            let status_at_top = app.status_position == "top";
+            let constraints = if status_at_top {
+                vec![Constraint::Length(1), Constraint::Min(1)]
+            } else {
+                vec![Constraint::Min(1), Constraint::Length(1)]
+            };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
+                .constraints(constraints)
                 .split(area);
 
-            app.last_window_area = chunks[0];
-            render_window(f, &mut app, chunks[0]);
+            let (content_chunk, status_chunk) = if status_at_top {
+                (chunks[1], chunks[0])
+            } else {
+                (chunks[0], chunks[1])
+            };
+
+            app.last_window_area = content_chunk;
+            render_window(f, &mut app, content_chunk);
 
             let _mode_str = match app.mode { 
                 Mode::Passthrough => "", 
@@ -260,13 +273,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     &app.window_status_format
                 };
                 let label = crate::format::expand_format_for_window(fmt, &app, i);
-                let start_x = cursor_x;
-                cursor_x += label.len() as u16;
-                tab_pos.push((i, start_x, cursor_x));
                 
                 // Choose style based on window state
                 let win = &app.windows[i];
-                let style = if i == app.active_idx {
+                let fallback_style = if i == app.active_idx {
                     wsc_style
                 } else if win.bell_flag {
                     wsb_style
@@ -277,7 +287,13 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 } else {
                     ws_style
                 };
-                combined.push(Span::styled(label, style));
+                // Parse inline #[fg=...,bg=...] style directives from theme format strings
+                let tab_spans = parse_inline_styles(&label, fallback_style);
+                let start_x = cursor_x;
+                let visual_w = spans_visual_width(&tab_spans) as u16;
+                cursor_x += visual_w;
+                tab_pos.push((i, start_x, cursor_x));
+                combined.extend(tab_spans);
             }
             app.tab_positions = tab_pos;
 
@@ -296,14 +312,14 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 }
             }
             let status_bar = Paragraph::new(Line::from(combined)).style(base_status_style);
-            f.render_widget(Clear, chunks[1]);
-            f.render_widget(status_bar, chunks[1]);
+            f.render_widget(Clear, status_chunk);
+            f.render_widget(status_bar, status_chunk);
 
             // Command prompt — render at bottom (tmux style), not centered popup
             if let Mode::CommandPrompt { input, cursor } = &app.mode {
                 let msg_style = parse_tmux_style(&app.message_command_style);
                 let prompt_text = format!(":{}", input);
-                let prompt_area = chunks[1]; // Replace the status bar line
+                let prompt_area = status_chunk; // Replace the status bar line
                 let para = Paragraph::new(prompt_text).style(msg_style);
                 f.render_widget(Clear, prompt_area);
                 f.render_widget(para, prompt_area);
@@ -574,8 +590,9 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         let win = &mut app.windows[app.active_idx];
                         if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
                             let _ = pane.master.resize(PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 });
-                            let mut parser = pane.term.lock().unwrap();
-                            parser.screen_mut().set_size(rows, cols);
+                            if let Ok(mut parser) = pane.term.lock() {
+                                parser.screen_mut().set_size(rows, cols);
+                            }
                         }
                         last_resize = Instant::now();
                     }
@@ -594,7 +611,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     if let Some(n) = name { app.windows.last_mut().map(|w| w.name = n); }
                     resize_all_panes(&mut app);
                 }
-                CtrlReq::SplitWindow(k, cmd, _detached, _start_dir, _size_pct) => { let _ = split_active_with_command(&mut app, k, cmd.as_deref(), None); resize_all_panes(&mut app); }
+                CtrlReq::SplitWindow(k, cmd, _detached, _start_dir, _size_pct, resp) => { let _ = resp.send(if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), None) { format!("{e}") } else { String::new() }); resize_all_panes(&mut app); }
                 CtrlReq::KillPane => { let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); }
                 CtrlReq::CapturePane(resp) => {
                     if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }

@@ -665,7 +665,11 @@ fn run_main() -> io::Result<()> {
                     let resp = send_control_with_response(cmd_line)?;
                     print!("{}", resp);
                 } else {
-                    send_control(cmd_line)?;
+                    let resp = send_control_with_response(cmd_line)?;
+                    if !resp.is_empty() {
+                        eprint!("{}", resp);
+                        std::process::exit(1);
+                    }
                 }
                 return Ok(());
             }

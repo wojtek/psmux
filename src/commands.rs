@@ -546,7 +546,7 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                                 let mut buf = [0u8; 8192];
                                 loop {
                                     match std::io::Read::read(&mut reader, &mut buf) {
-                                        Ok(n) if n > 0 => { let mut p = term_reader.lock().unwrap(); p.process(&buf[..n]); }
+                                        Ok(n) if n > 0 => { if let Ok(mut p) = term_reader.lock() { p.process(&buf[..n]); } }
                                         _ => break,
                                     }
                                 }

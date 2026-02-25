@@ -83,12 +83,14 @@ pub fn render_node(
             let target_cols = inner.width.max(1);
             if pane.last_rows != target_rows || pane.last_cols != target_cols {
                 let _ = pane.master.resize(PtySize { rows: target_rows, cols: target_cols, pixel_width: 0, pixel_height: 0 });
-                let mut parser = pane.term.lock().unwrap();
-                parser.screen_mut().set_size(target_rows, target_cols);
+                if let Ok(mut parser) = pane.term.lock() {
+                    parser.screen_mut().set_size(target_rows, target_cols);
+                }
                 pane.last_rows = target_rows;
                 pane.last_cols = target_cols;
             }
-            let parser = pane.term.lock().unwrap();
+            let parser_guard = pane.term.lock();
+            let Ok(parser) = parser_guard else { return; };
             let screen = parser.screen();
             let (cur_r, cur_c) = screen.cursor_position();
             let mut lines: Vec<Line> = Vec::with_capacity(target_rows as usize);
@@ -322,6 +324,66 @@ pub fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'stat
         i = j;
     }
     spans
+}
+
+/// Parse inline `#[fg=...,bg=...,bold]` style directives from pre-expanded text.
+/// Unlike `parse_status()`, this does NOT re-expand status variables like `#S`, `%H:%M` etc.
+/// Use this for text that has already been expanded by the format engine (e.g., window tab labels).
+pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur_style = base_style;
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            if let Some(end) = text[i + 2..].find(']') {
+                let token = &text[i + 2..i + 2 + end];
+                for part in token.split(',') {
+                    let p = part.trim();
+                    if p.starts_with("fg=") { cur_style = cur_style.fg(map_color(&p[3..])); }
+                    else if p.starts_with("bg=") { cur_style = cur_style.bg(map_color(&p[3..])); }
+                    else if p == "bold" { cur_style = cur_style.add_modifier(Modifier::BOLD); }
+                    else if p == "dim" { cur_style = cur_style.add_modifier(Modifier::DIM); }
+                    else if p == "italic" || p == "italics" { cur_style = cur_style.add_modifier(Modifier::ITALIC); }
+                    else if p == "underline" || p == "underscore" { cur_style = cur_style.add_modifier(Modifier::UNDERLINED); }
+                    else if p == "blink" { cur_style = cur_style.add_modifier(Modifier::SLOW_BLINK); }
+                    else if p == "reverse" { cur_style = cur_style.add_modifier(Modifier::REVERSED); }
+                    else if p == "hidden" { cur_style = cur_style.add_modifier(Modifier::HIDDEN); }
+                    else if p == "strikethrough" { cur_style = cur_style.add_modifier(Modifier::CROSSED_OUT); }
+                    else if p == "overline" { /* ratatui doesn't support overline natively */ }
+                    else if p == "double-underscore" || p == "curly-underscore" || p == "dotted-underscore" || p == "dashed-underscore" {
+                        cur_style = cur_style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    else if p == "default" || p == "none" { cur_style = base_style; }
+                    else if p == "nobold" { cur_style = cur_style.remove_modifier(Modifier::BOLD); }
+                    else if p == "nodim" { cur_style = cur_style.remove_modifier(Modifier::DIM); }
+                    else if p == "noitalics" || p == "noitalic" { cur_style = cur_style.remove_modifier(Modifier::ITALIC); }
+                    else if p == "nounderline" || p == "nounderscore" { cur_style = cur_style.remove_modifier(Modifier::UNDERLINED); }
+                    else if p == "noblink" { cur_style = cur_style.remove_modifier(Modifier::SLOW_BLINK); }
+                    else if p == "noreverse" { cur_style = cur_style.remove_modifier(Modifier::REVERSED); }
+                    else if p == "nohidden" { cur_style = cur_style.remove_modifier(Modifier::HIDDEN); }
+                    else if p == "nostrikethrough" { cur_style = cur_style.remove_modifier(Modifier::CROSSED_OUT); }
+                }
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        let mut j = i;
+        while j < bytes.len() && !(bytes[j] == b'#' && j + 1 < bytes.len() && bytes[j + 1] == b'[') {
+            j += 1;
+        }
+        let chunk = &text[i..j];
+        if !chunk.is_empty() {
+            spans.push(Span::styled(chunk.to_string(), cur_style));
+        }
+        i = j;
+    }
+    spans
+}
+
+/// Calculate the visual display width of styled spans (sum of text content widths).
+pub fn spans_visual_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.len()).sum()
 }
 
 pub fn map_color(name: &str) -> Color {

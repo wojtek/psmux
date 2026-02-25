@@ -226,8 +226,10 @@ pub fn resize_all_panes(app: &mut AppState) {
                     if rect.width == 0 || rect.height == 0 {
                         return;
                     }
-                    let inner_height = rect.height;
-                    let inner_width = rect.width;
+                    // Clamp to MIN_PANE_DIM so ConPTY never receives a
+                    // dimension small enough to crash the child process.
+                    let inner_height = rect.height.max(crate::pane::MIN_PANE_DIM);
+                    let inner_width = rect.width.max(crate::pane::MIN_PANE_DIM);
                     
                     if pane.last_rows != inner_height || pane.last_cols != inner_width {
                         let _ = pane.master.resize(portable_pty::PtySize { 

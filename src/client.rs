@@ -337,6 +337,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     let mut win_status_sep: String = " ".to_string();
     let mut win_status_style: Option<(Option<Color>, Option<Color>, bool)> = None;
     let mut win_status_current_style: Option<(Option<Color>, Option<Color>, bool)> = None;
+    let mut mode_style_str: String = "bg=yellow,fg=black".to_string();
+    let mut status_position_str: String = "bottom".to_string();
+    let mut _status_justify_str: String = "left".to_string();
     // Synced bindings from server (updated each frame from DumpState)
     let mut synced_bindings: Vec<BindingEntry> = Vec::new();
 
@@ -425,6 +428,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         /// Custom format strings for additional status lines
         #[serde(default)]
         status_format: Vec<String>,
+        /// mode-style for copy mode selection highlighting
+        #[serde(default)]
+        mode_style: Option<String>,
+        /// status-position: "top" or "bottom"
+        #[serde(default)]
+        status_position: Option<String>,
+        /// status-justify: "left", "centre", or "right"
+        #[serde(default)]
+        status_justify: Option<String>,
     }
 
     let mut cmd_batch: Vec<String> = Vec::new();
@@ -1335,14 +1347,35 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 win_status_current_style = Some(parse_tmux_style(s));
             }
         }
+        // Update mode-style, status-position, status-justify from server
+        if let Some(ref ms) = state.mode_style {
+            if !ms.is_empty() { mode_style_str = ms.clone(); }
+        }
+        if let Some(ref sp) = state.status_position {
+            if !sp.is_empty() { status_position_str = sp.clone(); }
+        }
+        if let Some(ref sj) = state.status_justify {
+            if !sj.is_empty() { _status_justify_str = sj.clone(); }
+        }
 
         // ── STEP 3: Render ───────────────────────────────────────────────
         let sel_s = rsel_start;
         let sel_e = rsel_end;
+        let status_at_top = status_position_str == "top";
         terminal.draw(|f| {
             let area = f.size();
+            let constraints = if status_at_top {
+                vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
+            } else {
+                vec![Constraint::Min(1), Constraint::Length(status_lines as u16)]
+            };
             let chunks = Layout::default().direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(status_lines as u16)].as_ref()).split(area);
+                .constraints(constraints).split(area);
+            let (content_chunk, status_chunk) = if status_at_top {
+                (chunks[1], chunks[0])
+            } else {
+                (chunks[0], chunks[1])
+            };
 
             /// Render a large ASCII clock overlay (tmux clock-mode)
             fn render_clock_overlay(f: &mut Frame, area: Rect) {
@@ -1390,7 +1423,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 }
             }
 
-            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, active_rect: Option<Rect>) {
+            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, active_rect: Option<Rect>, mode_style_str: &str) {
                 match node {
                     LayoutJson::Leaf {
                         id: _,
@@ -1455,7 +1488,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     }
                                     let mut style = Style::default().fg(fg).bg(bg);
                                     if in_selection {
-                                        style = style.fg(Color::Black).bg(Color::LightYellow);
+                                        // Apply mode-style from theme/config instead of hardcoded colors
+                                        let ms = crate::rendering::parse_tmux_style(&mode_style_str);
+                                        style = ms;
                                     }
                                     if cell.dim { style = style.add_modifier(Modifier::DIM); }
                                     if cell.bold { style = style.add_modifier(Modifier::BOLD); }
@@ -1573,7 +1608,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
 
                         // Render children first
                         for (i, child) in children.iter().enumerate() {
-                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, active_rect); }
+                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, active_rect, mode_style_str); }
                         }
 
                         // Draw separator lines between children using direct buffer access.
@@ -1667,8 +1702,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 }
             }
 
-            let active_rect = compute_active_rect_json(&root, chunks[0]);
-            render_json(f, &root, chunks[0], dim_preds, pane_border_fg, pane_active_border_fg, clock_active, active_rect);
+            let active_rect = compute_active_rect_json(&root, content_chunk);
+            render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, active_rect, &mode_style_str);
 
             // ── Left-click drag text selection overlay ────────────────
             if let (Some(s), Some(e)) = (sel_s, sel_e) {
@@ -1697,7 +1732,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
 
             if session_chooser {
                 let overlay = Block::default().borders(Borders::ALL).title("choose-session (enter=switch, x=kill, esc=close)");
-                let oa = centered_rect(70, 20, chunks[0]);
+                let oa = centered_rect(70, 20, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let mut lines: Vec<Line> = Vec::new();
@@ -1715,7 +1750,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
             }
             if tree_chooser {
                 let overlay = Block::default().borders(Borders::ALL).title("choose-tree");
-                let oa = centered_rect(60, 30, chunks[0]);
+                let oa = centered_rect(60, 30, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let mut lines: Vec<Line> = Vec::new();
@@ -1735,11 +1770,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
             }
             if keys_viewer {
                 // Proportional overlay: 90% width, up to 80% height
-                let avail_h = chunks[0].height;
+                let avail_h = content_chunk.height;
                 let overlay_h = (avail_h * 80 / 100).max(5).min(avail_h.saturating_sub(2));
                 let overlay = Block::default().borders(Borders::ALL)
                     .title(" list-keys (q/Esc=close, Up/Down/PgUp/PgDn=scroll) ");
-                let oa = centered_rect(90, overlay_h, chunks[0]);
+                let oa = centered_rect(90, overlay_h, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
@@ -1803,7 +1838,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         }
                     }
                 }
-                rec(&root, chunks[0], &mut rects);
+                rec(&root, content_chunk, &mut rects);
                 choices.clear();
                 for (i, (pid, r)) in rects.iter().enumerate() {
                     if i < 10 {
@@ -1833,13 +1868,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 Style::default().fg(sb_fg).bg(sb_bg)
             };
             // Left portion: custom status_left or default [session] prefix
+            // Parse inline #[...] style directives for theme support
             let left_prefix = match custom_status_left {
                 Some(ref sl) => sl.clone(),
                 None => format!("[{}] ", name),
             };
-            let mut status_spans: Vec<Span> = vec![
-                Span::styled(left_prefix, sb_base),
-            ];
+            let mut status_spans: Vec<Span> = crate::rendering::parse_inline_styles(&left_prefix, sb_base);
             for (i, w) in windows.iter().enumerate() {
                 // Use pre-expanded tab_text from server (full format expansion)
                 let tab_text = if !w.tab_text.is_empty() {
@@ -1855,29 +1889,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 if i > 0 {
                     status_spans.push(Span::styled(win_status_sep.clone(), sb_base));
                 }
-                if w.active {
-                    let active_style = if let Some((fg, bg, bold)) = win_status_current_style {
+                // Determine fallback style based on window state
+                let fallback_style = if w.active {
+                    if let Some((fg, bg, bold)) = win_status_current_style {
                         let mut s = Style::default();
                         if let Some(c) = fg { s = s.fg(c); }
                         if let Some(c) = bg { s = s.bg(c); }
                         if bold { s = s.add_modifier(Modifier::BOLD); }
                         s
                     } else {
-                        // tmux default: inherit from status-style (no special highlight)
                         sb_base
-                    };
-                    status_spans.push(Span::styled(tab_text, active_style));
+                    }
                 } else if w.activity {
-                    // Activity visual notification: reverse video for windows with activity
-                    status_spans.push(Span::styled(
-                        tab_text,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    let inactive_style = if let Some((fg, bg, bold)) = win_status_style {
+                    if let Some((fg, bg, bold)) = win_status_style {
                         let mut s = Style::default();
                         if let Some(c) = fg { s = s.fg(c); }
                         if let Some(c) = bg { s = s.bg(c); }
@@ -1885,31 +1914,35 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         s
                     } else {
                         sb_base
-                    };
-                    status_spans.push(Span::styled(tab_text, inactive_style));
-                }
+                    }
+                };
+                // Parse inline #[fg=...,bg=...] style directives from theme format strings
+                let tab_spans = crate::rendering::parse_inline_styles(&tab_text, fallback_style);
+                status_spans.extend(tab_spans);
             }
             // Right portion: custom status_right (already expanded by server)
+            // Parse inline #[...] style directives for theme support
             let right_text = custom_status_right.as_deref().unwrap_or("").to_string();
+            let right_spans = crate::rendering::parse_inline_styles(&right_text, sb_base);
             // Compute how many columns are used by left + window tabs
             let left_used: usize = status_spans.iter().map(|s| s.content.len()).sum();
-            let right_len = right_text.len();
-            let total_width = chunks[1].width as usize;
+            let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
+            let total_width = status_chunk.width as usize;
             if left_used + right_len < total_width {
                 let pad = total_width - left_used - right_len;
                 status_spans.push(Span::styled(" ".repeat(pad), sb_base));
-                status_spans.push(Span::styled(right_text, sb_base));
+                status_spans.extend(right_spans);
             }
             let status_bar = Paragraph::new(Line::from(status_spans)).style(sb_base);
-            f.render_widget(Clear, chunks[1]);
+            f.render_widget(Clear, status_chunk);
             // Render the first status line (line 0)
-            let line0_area = Rect { x: chunks[1].x, y: chunks[1].y, width: chunks[1].width, height: 1.min(chunks[1].height) };
+            let line0_area = Rect { x: status_chunk.x, y: status_chunk.y, width: status_chunk.width, height: 1.min(status_chunk.height) };
             f.render_widget(status_bar, line0_area);
             // Render additional status lines (index 1+) from status_format
             for line_idx in 1..status_lines {
-                let line_y = chunks[1].y + line_idx as u16;
-                if line_y >= chunks[1].y + chunks[1].height { break; }
-                let line_area = Rect { x: chunks[1].x, y: line_y, width: chunks[1].width, height: 1 };
+                let line_y = status_chunk.y + line_idx as u16;
+                if line_y >= status_chunk.y + status_chunk.height { break; }
+                let line_area = Rect { x: status_chunk.x, y: line_y, width: status_chunk.width, height: 1 };
                 let text = if line_idx < status_format.len() && !status_format[line_idx].is_empty() {
                     status_format[line_idx].clone()
                 } else {

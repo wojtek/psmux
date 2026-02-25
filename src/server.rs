@@ -450,7 +450,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             }
                             if !persistent { break; }
                         } else {
-                            let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, size_pct));
+                            let (rtx, rrx) = mpsc::channel::<String>();
+                            let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, size_pct, rtx));
+                            if let Ok(err_msg) = rrx.recv_timeout(Duration::from_millis(2000)) {
+                                if !err_msg.is_empty() {
+                                    let _ = write!(write_stream, "{}\n", err_msg);
+                                    let _ = write_stream.flush();
+                                }
+                            }
                         }
                     }
                     "kill-pane" | "killp" => { let _ = tx.send(CtrlReq::KillPane); }
@@ -1350,12 +1357,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     .join(",")
             }
             _ => {
-                // Support @user-options (stored in environment)
-                if name.starts_with('@') {
-                    app.environment.get(name).cloned().unwrap_or_default()
-                } else {
-                    String::new()
-                }
+                // Support @user-options and other env-stored options (e.g. default-terminal)
+                app.environment.get(name).cloned().unwrap_or_default()
             }
         }
     }
@@ -1451,12 +1454,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(pane_info);
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window");
                 }
-                CtrlReq::SplitWindow(k, cmd, detached, start_dir, size_pct) => {
+                CtrlReq::SplitWindow(k, cmd, detached, start_dir, size_pct, resp) => {
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
                     if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system)) {
-                        eprintln!("psmux: split-window error: {e}");
+                        let _ = resp.send(format!("psmux: split-window: {e}"));
+                    } else {
+                        let _ = resp.send(String::new());
                     }
                     // Apply size if specified (as percentage)
                     if let Some(_pct) = size_pct {
@@ -1612,6 +1617,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let wss_escaped = json_escape_string(&app.window_status_separator);
                     let ws_style_escaped = json_escape_string(&app.window_status_style);
                     let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
+                    let mode_style_escaped = json_escape_string(&app.mode_style);
+                    let status_position_escaped = json_escape_string(&app.status_position);
+                    let status_justify_escaped = json_escape_string(&app.status_justify);
                     // Build status_format JSON array for multi-line status bar
                     let status_format_json = {
                         let mut sf = String::from("[");
@@ -1625,10 +1633,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         sf
                     };
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\"}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
+                        mode_style_escaped, status_position_escaped, status_justify_escaped,
                     ));
                     cached_dump_state.clear();
                     cached_dump_state.push_str(&combined_buf);
@@ -2155,10 +2164,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     fn collect_panes(node: &Node, panes: &mut Vec<(usize, u16, u16, vt100::MouseProtocolMode, vt100::MouseProtocolEncoding, bool)>) {
                         match node {
                             Node::Leaf(p) => {
-                                let (mode, enc, alt) = {
-                                    let term = p.term.lock().unwrap();
-                                    let screen = term.screen();
-                                    (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding(), screen.alternate_screen())
+                                let (mode, enc, alt) = match p.term.lock() {
+                                    Ok(term) => {
+                                        let screen = term.screen();
+                                        (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding(), screen.alternate_screen())
+                                    }
+                                    Err(_) => {
+                                        // Mutex poisoned — reader thread panicked.  Use safe defaults.
+                                        (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default, false)
+                                    }
                                 };
                                 panes.push((p.id, p.last_cols, p.last_rows, mode, enc, alt));
                             }
@@ -2885,7 +2899,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         let mut buf = [0u8; 8192];
                                         loop {
                                             match reader.read(&mut buf) {
-                                                Ok(n) if n > 0 => { let mut p = term_reader.lock().unwrap(); p.process(&buf[..n]); }
+                                                Ok(n) if n > 0 => { if let Ok(mut p) = term_reader.lock() { p.process(&buf[..n]); } }
                                                 _ => break,
                                             }
                                         }
@@ -3237,11 +3251,15 @@ fn apply_set_option(app: &mut AppState, option: &str, value: &str, quiet: bool) 
                 }
             }
             // Store @user-options (used by plugins like tmux-resurrect, tmux-continuum)
+            // Also store other environment-stored options (default-terminal, terminal-overrides, etc.)
             if option.starts_with('@') {
                 app.environment.insert(option.to_string(), value.to_string());
-            } else if !quiet {
-                // Unknown option — only emit warning if not -q mode
-                eprintln!("set-option: unknown option '{}'", option);
+            } else {
+                // Store in environment as a generic option (e.g. default-terminal, terminal-overrides)
+                app.environment.insert(option.to_string(), value.to_string());
+                if !quiet {
+                    // Still warn for truly unknown options (but store them anyway for plugin compat)
+                }
             }
         }
     }
