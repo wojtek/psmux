@@ -1107,7 +1107,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Backspace => b"\x08".to_vec(),
+        KeyCode::Backspace => b"\x7f".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
         KeyCode::Left => b"\x1b[D".to_vec(),
         KeyCode::Right => b"\x1b[C".to_vec(),
