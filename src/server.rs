@@ -505,7 +505,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     "dump-state" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::DumpState(rtx));
+                        let _ = tx.send(CtrlReq::DumpState(rtx, persistent));
                         if let Some(ref rtx_bg) = resp_tx_opt {
                             // Persistent mode: hand off to writer thread (non-blocking).
                             // This lets the read loop keep processing keys immediately.
@@ -1414,12 +1414,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // This ensures ConPTY receives keystrokes before we serialize
                 // the screen, reducing stale-frame responses.
                 pending.sort_by_key(|r| match r {
-                    CtrlReq::DumpState(_) => 1,
+                    CtrlReq::DumpState(..) => 1,
                     CtrlReq::DumpLayout(_) => 1,
                     _ => 0,
                 });
                 for req in pending {
-                    let mutates_state = !matches!(&req, CtrlReq::DumpState(_));
+                    let mutates_state = !matches!(&req, CtrlReq::DumpState(..));
                     let mut hook_event: Option<&str> = None;
                     match req {
                 CtrlReq::NewWindow(cmd, name, detached, start_dir) => {
@@ -1543,7 +1543,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let json = dump_layout_json(&mut app)?;
                     let _ = resp.send(json);
                 }
-                CtrlReq::DumpState(resp) => {
+                CtrlReq::DumpState(resp, allow_nc) => {
                     // ── Automatic rename: resolve foreground process ──
                     {
                         let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
@@ -1576,7 +1576,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     // Fast-path: nothing changed at all → 2-byte "NC" marker
                     // instead of cloning 50-100KB of JSON.
-                    if !state_dirty
+                    // Only allowed for persistent connections that already have
+                    // the previous frame; one-shot connections always need full state.
+                    if allow_nc
+                        && !state_dirty
                         && !cached_dump_state.is_empty()
                         && cached_data_version == combined_data_version(&app)
                     {

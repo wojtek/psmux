@@ -361,6 +361,9 @@ Write-Pass "swap-pane executed"
 
 # --- Test 6.12: kill-pane ---
 Write-Test "6.12 kill-pane reduces pane count"
+# Ensure the active window has ≥2 panes so kill-pane doesn't destroy the window
+Psmux split-window -t $SESSION -h | Out-Null
+Start-Sleep -Milliseconds 500
 $beforeKill = ((& $PSMUX list-panes -t $SESSION 2>&1) | Out-String).Split("`n").Count
 Psmux kill-pane -t $SESSION | Out-Null
 Start-Sleep -Milliseconds 500

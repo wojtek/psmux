@@ -551,7 +551,7 @@ pub enum CtrlReq {
     ClientAttach,
     ClientDetach,
     DumpLayout(mpsc::Sender<String>),
-    DumpState(mpsc::Sender<String>),
+    DumpState(mpsc::Sender<String>, bool),  // (resp, allow_nc)
     SendText(String),
     SendKey(String),
     SendPaste(String),
