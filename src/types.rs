@@ -695,15 +695,14 @@ pub enum CtrlReq {
 /// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
 pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Tracked persistent client TCP streams.
+/// Tracked persistent client pipe streams.
 /// Connection handlers register clones here so the server can explicitly
-/// `shutdown()` them before `process::exit(0)`.  Without this, Windows
-/// does not reliably deliver TCP RST on loopback sockets when a process
-/// exits, leaving the client's blocking `read_line()` stuck forever.
-static PERSISTENT_STREAMS: std::sync::Mutex<Vec<std::net::TcpStream>> = std::sync::Mutex::new(Vec::new());
+/// drop them before `process::exit(0)`, forcing client readers to observe
+/// disconnection promptly.
+static PERSISTENT_STREAMS: std::sync::Mutex<Vec<crate::pipe::PipeStream>> = std::sync::Mutex::new(Vec::new());
 
 /// Register a persistent client stream (call from connection handler).
-pub fn register_persistent_stream(stream: &std::net::TcpStream) {
+pub fn register_persistent_stream(stream: &crate::pipe::PipeStream) {
     if let Ok(cloned) = stream.try_clone() {
         if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
             v.push(cloned);
@@ -714,9 +713,7 @@ pub fn register_persistent_stream(stream: &std::net::TcpStream) {
 /// Shut down all tracked persistent client streams so their readers get EOF.
 pub fn shutdown_persistent_streams() {
     if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
-        for s in v.drain(..) {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-        }
+        v.clear();
     }
 }
 

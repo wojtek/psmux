@@ -24,6 +24,7 @@ const GENERIC_WRITE: u32 = 0x40000000;
 const INVALID_HANDLE_VALUE: isize = -1;
 const ERROR_PIPE_BUSY: u32 = 231;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_SEM_TIMEOUT: u32 = 121;
 const NMPWAIT_USE_DEFAULT_WAIT: u32 = 0;
 const SDDL_REVISION_1: u32 = 1;
 const DUPLICATE_SAME_ACCESS: u32 = 0x00000002;
@@ -426,31 +427,19 @@ pub fn connect_to_pipe(session_name: &str, timeout_ms: u32) -> io::Result<isize>
 }
 
 /// Quick check whether a named pipe exists for a session.
-/// Tries to open the pipe; if it gets ERROR_PIPE_BUSY or succeeds, the pipe exists.
-/// Returns false if ERROR_FILE_NOT_FOUND.
+/// Uses WaitNamedPipeW with zero timeout so we never consume a pipe instance.
+/// Returns false only when the pipe name does not exist.
 pub fn pipe_exists(session_name: &str) -> bool {
     let pipe_path = pipe_name_for_session(session_name);
     let wide_name = to_wide(&pipe_path);
-
-    let handle = unsafe {
-        CreateFileW(
-            wide_name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null(),
-        )
-    };
-
-    if handle != INVALID_HANDLE_VALUE {
-        // Successfully opened — pipe exists and was available. Close it.
-        unsafe { CloseHandle(handle); }
-        true
-    } else {
-        let err = unsafe { GetLastError() };
-        // PIPE_BUSY means the pipe exists but all instances are in use
-        err == ERROR_PIPE_BUSY
+    let ok = unsafe { WaitNamedPipeW(wide_name.as_ptr(), 0) };
+    if ok != 0 {
+        return true;
+    }
+    match unsafe { GetLastError() } {
+        ERROR_FILE_NOT_FOUND => false,
+        ERROR_PIPE_BUSY | ERROR_SEM_TIMEOUT => true,
+        // Treat any other error as "exists but unavailable" to avoid false negatives.
+        _ => true,
     }
 }
