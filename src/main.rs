@@ -9,6 +9,7 @@ mod cli;
 mod session;
 mod tree;
 mod style;
+mod debug_log;
 mod rendering;
 mod config;
 mod commands;
@@ -68,6 +69,7 @@ fn run_main() -> io::Result<()> {
     // IMPORTANT: Only recognize -L as a global flag when it appears BEFORE the subcommand.
     // This avoids conflict with subcommand flags (e.g. select-pane -L, resize-pane -L).
     let mut l_socket_name: Option<String> = None;
+    let mut f_config_file: Option<String> = None;
     {
         let mut i = 1; // skip binary name
         while i < args.len() {
@@ -75,7 +77,10 @@ fn run_main() -> io::Result<()> {
             if arg == "-L" && i + 1 < args.len() {
                 l_socket_name = Some(args[i + 1].clone());
                 i += 2;
-            } else if (arg == "-S" || arg == "-f" || arg == "-t") && i + 1 < args.len() {
+            } else if arg == "-f" && i + 1 < args.len() {
+                f_config_file = Some(args[i + 1].clone());
+                i += 2;
+            } else if (arg == "-S" || arg == "-t") && i + 1 < args.len() {
                 i += 2; // skip other global flag-value pairs
             } else if arg.starts_with('-') {
                 i += 1; // skip single global flags (e.g. -v, -V)
@@ -83,6 +88,12 @@ fn run_main() -> io::Result<()> {
                 break; // hit the subcommand name — stop scanning for global flags
             }
         }
+    }
+
+    // If -f was specified, export it so the server/app loads that config file
+    // instead of the default search path.
+    if let Some(ref config_file) = f_config_file {
+        env::set_var("PSMUX_CONFIG_FILE", config_file);
     }
 
     // Parse -t flag early to set target session for all commands
@@ -137,10 +148,12 @@ fn run_main() -> io::Result<()> {
         }
     }
     
-    // Find the actual command by skipping global -t/-L and their arguments.
+    // Find the actual command by skipping global -t/-L/-f/-S and their arguments.
     // -t is stripped everywhere (the global handler already set PSMUX_TARGET_SESSION).
     // -L is only stripped BEFORE the subcommand (global socket namespace flag);
     // after the subcommand, -L is kept (e.g. select-pane -L, resize-pane -L).
+    // -f is stripped BEFORE the subcommand (global config file flag).
+    // -S is stripped BEFORE the subcommand (global socket path flag).
     let cmd_args: Vec<&String> = {
         let mut result = Vec::new();
         let mut i = 1; // skip binary name
@@ -148,7 +161,7 @@ fn run_main() -> io::Result<()> {
         while i < args.len() {
             if !found_subcommand {
                 // Before subcommand: skip global flags with values
-                if (args[i] == "-t" || args[i] == "-L") && i + 1 < args.len() {
+                if (args[i] == "-t" || args[i] == "-L" || args[i] == "-f" || args[i] == "-S") && i + 1 < args.len() {
                     i += 2; // skip flag and its value
                     continue;
                 } else if args[i] == "-h" || args[i] == "--help"
@@ -325,13 +338,35 @@ fn run_main() -> io::Result<()> {
                 let server_socket_name = args.iter().position(|a| a == "-L").and_then(|i| args.get(i+1)).map(|s| s.clone());
                 // Check for initial command via -c flag (shell-wrapped)
                 let initial_cmd = args.iter().position(|a| a == "-c").and_then(|i| args.get(i+1)).map(|s| s.clone());
+                // Parse start directory via -d flag
+                let srv_start_dir = args.iter().position(|a| a == "-d").and_then(|i| args.get(i+1)).map(|s| s.clone());
+                // Parse window name via -n flag
+                let srv_window_name = args.iter().position(|a| a == "-n").and_then(|i| args.get(i+1)).map(|s| s.clone());
+                // Parse initial dimensions via -x / -y flags
+                let srv_init_width = args.iter().position(|a| a == "-x").and_then(|i| args.get(i+1)).and_then(|s| s.parse::<u16>().ok());
+                let srv_init_height = args.iter().position(|a| a == "-y").and_then(|i| args.get(i+1)).and_then(|s| s.parse::<u16>().ok());
+                let srv_init_size = match (srv_init_width, srv_init_height) {
+                    (Some(w), Some(h)) => Some((w, h)),
+                    (Some(w), None) => Some((w, 24)),
+                    (None, Some(h)) => Some((80, h)),
+                    _ => None,
+                };
                 // Check for raw command after -- (direct execution)
                 let raw_cmd: Option<Vec<String>> = args.iter().position(|a| a == "--").map(|pos| {
                     args.iter().skip(pos + 1).cloned().collect()
                 }).filter(|v: &Vec<String>| !v.is_empty());
-                return run_server(name, server_socket_name, initial_cmd, raw_cmd);
+                return run_server(name, server_socket_name, initial_cmd, raw_cmd, srv_start_dir, srv_window_name, srv_init_size);
             }
             "new-session" | "new" => {
+                // Prevent nesting — block new-session inside an existing psmux session
+                if env::var("PSMUX_ALLOW_NESTING").ok().as_deref() != Some("1") {
+                    if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1")
+                        || env::var("PSMUX_SESSION").ok().as_deref() == Some("1")
+                    {
+                        eprintln!("psmux: sessions should be nested with care, unset PSMUX_SESSION to force");
+                        return Ok(());
+                    }
+                }
                 // Strict getopt-style parsing for new-session flags.
                 // tmux template: "Ac:dDe:EF:f:n:Ps:t:x:Xy:"
                 // Flags that take a value (letter followed by ':'):
@@ -343,9 +378,11 @@ fn run_main() -> io::Result<()> {
                 let mut detached = false;
                 let mut print_info = false;
                 let mut format_str: Option<String> = None;
-                let mut _window_name: Option<String> = None;
-                let mut _start_dir: Option<String> = None;
-                let mut _attach_if_exists = false;
+                let mut window_name: Option<String> = None;
+                let mut start_dir: Option<String> = None;
+                let mut attach_if_exists = false;
+                let mut init_width: Option<u16> = None;
+                let mut init_height: Option<u16> = None;
                 let mut positional_args: Vec<String> = Vec::new();
                 let mut raw_cmd_after_dd: Option<Vec<String>> = None;
 
@@ -362,14 +399,16 @@ fn run_main() -> io::Result<()> {
                             // Flags that consume the next argument (strict getopt:
                             // always consume, even if it looks like a flag)
                             "-s" => { i += 1; if i < cmd_args.len() { session_name = Some(cmd_args[i].to_string()); } }
-                            "-n" => { i += 1; if i < cmd_args.len() { _window_name = Some(cmd_args[i].to_string()); } }
+                            "-n" => { i += 1; if i < cmd_args.len() { window_name = Some(cmd_args[i].to_string()); } }
                             "-F" => { i += 1; if i < cmd_args.len() { format_str = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-c" => { i += 1; if i < cmd_args.len() { _start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-x" | "-y" | "-e" | "-f" | "-t" => { i += 1; /* skip value, not used yet */ }
+                            "-c" => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-x" => { i += 1; if i < cmd_args.len() { init_width = cmd_args[i].parse::<u16>().ok(); } }
+                            "-y" => { i += 1; if i < cmd_args.len() { init_height = cmd_args[i].parse::<u16>().ok(); } }
+                            "-e" | "-f" | "-t" => { i += 1; /* skip value, not used yet */ }
                             // Boolean flags
                             "-d" => { detached = true; }
                             "-P" => { print_info = true; }
-                            "-A" => { _attach_if_exists = true; }
+                            "-A" => { attach_if_exists = true; }
                             "-D" | "-E" | "-X" => { /* ignored for compatibility */ }
                             _ if a.starts_with('-') => { /* unknown flag, skip */ }
                             _ => {
@@ -402,13 +441,25 @@ fn run_main() -> io::Result<()> {
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let key_path = format!("{}\\.psmux\\{}.key", home, port_file_base);
                 if crate::pipe::pipe_exists(&port_file_base) {
-                    eprintln!("psmux: session '{}' already exists", name);
-                    return Ok(());
+                    if attach_if_exists {
+                        // -A flag: attach to existing session instead of erroring
+                        env::set_var("PSMUX_SESSION_NAME", &port_file_base);
+                        env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                        // Skip server creation, jump straight to attach
+                        // (handled at the bottom of this match block)
+                    } else {
+                        eprintln!("psmux: session '{}' already exists", name);
+                        return Ok(());
+                    }
                 } else if std::path::Path::new(&key_path).exists() {
                     // Stale key file - remove it and continue
                     let _ = std::fs::remove_file(&key_path);
                 }
                 
+                // If -A attached to an existing session, skip server creation
+                if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() == Some("1") {
+                    // Already set up for attach — skip server spawn
+                } else {
                 // Always spawn a background server first
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
                 let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), name.clone()];
@@ -421,6 +472,25 @@ fn run_main() -> io::Result<()> {
                 if let Some(ref init_cmd) = initial_cmd {
                     server_args.push("-c".into());
                     server_args.push(init_cmd.clone());
+                }
+                // Pass start directory to server
+                if let Some(ref dir) = start_dir {
+                    server_args.push("-d".into());
+                    server_args.push(dir.clone());
+                }
+                // Pass window name to server
+                if let Some(ref wn) = window_name {
+                    server_args.push("-n".into());
+                    server_args.push(wn.clone());
+                }
+                // Pass initial dimensions to server
+                if let Some(w) = init_width {
+                    server_args.push("-x".into());
+                    server_args.push(w.to_string());
+                }
+                if let Some(h) = init_height {
+                    server_args.push("-y".into());
+                    server_args.push(h.to_string());
                 }
                 // Pass raw command args (direct execution) if -- was used
                 if let Some(ref raw_args) = raw_cmd_args {
@@ -464,6 +534,7 @@ fn run_main() -> io::Result<()> {
                     cmd.stderr(std::process::Stdio::null());
                     let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
                 }
+                } // end else (not PSMUX_REMOTE_ATTACH)
                 
                 // Wait for server to create key file and pipe (up to 5 seconds)
                 // Poll fast (10ms) — the server writes the key file early,
@@ -1422,7 +1493,7 @@ fn run_main() -> io::Result<()> {
             }
             // if-shell - Conditional execution
             "if-shell" | "if" => {
-                let mut _background = false;
+                let mut background = false;
                 let mut condition: Option<String> = None;
                 let mut cmd_true: Option<String> = None;
                 let mut cmd_false: Option<String> = None;
@@ -1431,7 +1502,7 @@ fn run_main() -> io::Result<()> {
                 
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
-                        "-b" => { _background = true; }
+                        "-b" => { background = true; }
                         "-F" => { format_mode = true; }
                         "-t" => { i += 1; } // Skip target
                         s if !s.starts_with('-') => {
@@ -1449,6 +1520,43 @@ fn run_main() -> io::Result<()> {
                 }
                 
                 if let (Some(cond), Some(true_cmd)) = (condition, cmd_true) {
+                    if background && !format_mode {
+                        // -b flag: run the condition check in a background thread
+                        // and dispatch the result command asynchronously (like tmux)
+                        let cmd_false_bg = cmd_false.clone();
+                        std::thread::spawn(move || {
+                            let success = {
+                                #[cfg(windows)]
+                                {
+                                    std::process::Command::new("pwsh")
+                                        .args(["-NoProfile", "-Command", &cond])
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status()
+                                        .map(|s| s.success())
+                                        .unwrap_or(false)
+                                }
+                                #[cfg(not(windows))]
+                                {
+                                    std::process::Command::new("sh")
+                                        .args(["-c", &cond])
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status()
+                                        .map(|s| s.success())
+                                        .unwrap_or(false)
+                                }
+                            };
+                            let cmd_to_run = if success { Some(true_cmd) } else { cmd_false_bg };
+                            if let Some(cmd) = cmd_to_run {
+                                let tcp_cmd = format!("{}\n", cmd);
+                                let _ = send_control_with_response(tcp_cmd);
+                            }
+                        });
+                        // Return immediately — condition runs in background
+                        return Ok(());
+                    }
+
                     let success = if format_mode {
                         // Treat condition as format string - non-empty and non-zero is true
                         !cond.is_empty() && cond != "0"
@@ -2118,30 +2226,50 @@ fn run_main() -> io::Result<()> {
         env::set_var("PSMUX_REMOTE_ATTACH", "1");
     }
     
-    if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1") {
-        eprintln!("psmux: nested sessions are not allowed");
-        return Ok(());
+    // Prevent nesting — similar to tmux checking $TMUX.
+    // PSMUX_ACTIVE is set on the client process itself.
+    // PSMUX_SESSION is set on child panes spawned by the server.
+    // Both indicate we're already inside psmux.
+    // Override with PSMUX_ALLOW_NESTING=1 if nesting is intentional.
+    if env::var("PSMUX_ALLOW_NESTING").ok().as_deref() != Some("1") {
+        if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1")
+            || env::var("PSMUX_SESSION").ok().as_deref() == Some("1")
+        {
+            eprintln!("psmux: sessions should be nested with care, unset PSMUX_SESSION to force");
+            return Ok(());
+        }
     }
     env::set_var("PSMUX_ACTIVE", "1");
 
-    let mut stdout = io::stdout();
+    // Use Utf16ConsoleWriter on Windows (WriteConsoleW) so multi-byte
+    // UTF-8 characters (▶, ◀, etc.) render correctly regardless of the
+    // console codepage.  On other platforms this is just io::stdout().
+    let mut writer = crate::platform::create_writer();
     enable_virtual_terminal_processing();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
-    apply_cursor_style(&mut stdout)?;
-    let backend = CrosstermBackend::new(stdout);
+
+    // Detect terminal type for input handling.
+    let is_ssh = is_ssh_session();
+    let use_vt_input = is_ssh;
+
+    // For standard terminals (not SSH), clear VTI flag from stdin if
+    // crossterm or another layer set it — keeps normal ReadConsoleInputW
+    // behavior via proper INPUT_RECORDs.
+    if !use_vt_input {
+        crate::platform::disable_vti_on_stdin();
+    }
+
+    execute!(writer, EnterAlternateScreen, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
+    apply_cursor_style(&mut writer)?;
+    let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend)?;
 
-    // Set up input source — detects SSH and enables VT mouse parsing if needed.
-    let is_ssh = is_ssh_session();
-    let input = InputSource::new(is_ssh)?;
+    let input = InputSource::new(use_vt_input)?;
 
-    // Over SSH, explicitly (re-)send mouse-enable escape sequences.
-    // ConPTY may have consumed crossterm's EnableMouseCapture output
-    // without forwarding it to sshd → the remote terminal never got told
-    // to enable mouse reporting.  This sends it again via WriteFile and
-    // stdout write to maximize the chance it reaches the client.
-    if is_ssh {
+    // For VT input mode (SSH), explicitly (re-)send mouse-enable escape
+    // sequences.  ConPTY may have consumed crossterm's EnableMouseCapture
+    // output without forwarding it.
+    if use_vt_input {
         send_mouse_enable();
     }
 

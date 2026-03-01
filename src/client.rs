@@ -11,10 +11,11 @@ use crate::layout::LayoutJson;
 use crate::help;
 use crate::util::{WinTree, base64_encode};
 use crate::session::read_session_key;
-use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect};
+use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect, fix_border_intersections};
 use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
+use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
 
@@ -118,6 +119,26 @@ fn extract_selection_text(
     result
 }
 
+/// Check if the active pane is running a fullscreen TUI app (alternate screen).
+/// Used to decide whether right-click should paste (shell prompt) or forward
+/// as a mouse event to the child (TUI app like htop, Claude Code, etc.).
+fn active_pane_in_alt_screen(layout: &LayoutJson) -> bool {
+    match layout {
+        LayoutJson::Leaf { active, alternate_screen, .. } => *active && *alternate_screen,
+        LayoutJson::Split { children, .. } => children.iter().any(|c| active_pane_in_alt_screen(c)),
+    }
+}
+
+/// Check if the active pane is in server-side copy mode.
+/// When true, the client should NOT start its own text selection —
+/// the server handles cursor positioning and selection in copy mode.
+fn active_pane_in_copy_mode(layout: &LayoutJson) -> bool {
+    match layout {
+        LayoutJson::Leaf { active, copy_mode, .. } => *active && *copy_mode,
+        LayoutJson::Split { children, .. } => children.iter().any(|c| active_pane_in_copy_mode(c)),
+    }
+}
+
 /// Check if screen coordinates (x, y) fall on a separator line in the layout.
 /// Used to distinguish border-drag (resize) from text selection on left-click.
 fn is_on_separator(layout: &LayoutJson, area: Rect, x: u16, y: u16) -> bool {
@@ -187,7 +208,7 @@ fn compute_active_rect_json(node: &LayoutJson, area: Rect) -> Option<Rect> {
     }
 }
 
-pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
+pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::PsmuxWriter>>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let session_key = read_session_key(&name).unwrap_or_default();
@@ -218,21 +239,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
 
     // Spawn a dedicated reader thread so the event loop never blocks on I/O.
     // The reader thread reads lines from the server and sends them via channel.
-    let _ = reader.get_ref().set_read_timeout(None); // blocking reads in reader thread
+    // Use a 2-second read timeout so the thread unblocks periodically.
+    // Without this, process::exit(0) on the server side may not deliver a
+    // TCP RST promptly on Windows, leaving read_line() blocked forever and
+    // the client stuck after the last pane exits.
+    let _ = reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = String::with_capacity(64 * 1024);
         loop {
             buf.clear();
-            match reader.read_line(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let line = std::mem::take(&mut buf);
-                    buf = String::with_capacity(64 * 1024);
-                    if frame_tx.send(line).is_err() { break; }
+            loop {
+                match reader.read_line(&mut buf) {
+                    Ok(0) => return, // EOF — server closed connection
+                    Ok(_) => break,  // Got a complete line, send it
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        // Timeout: buf may contain a partial line from a
+                        // previous fill_buf.  Do NOT clear it — read_line
+                        // will resume appending on the next call.  This
+                        // keeps the protocol stream intact.
+                        continue;
+                    }
+                    Err(_) => return, // Real error — connection died
                 }
             }
+            let line = std::mem::take(&mut buf);
+            buf = String::with_capacity(64 * 1024);
+            if frame_tx.send(line).is_err() { return; }
         }
     });
 
@@ -250,6 +286,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     let mut tree_chooser = false;
     let mut tree_entries: Vec<(bool, usize, usize, String, String)> = Vec::new();  // (is_win, id, sub_id, label, session_name)
     let mut tree_selected: usize = 0;
+    let mut tree_scroll: usize = 0;
     let mut session_chooser = false;
     let mut session_entries: Vec<(String, String)> = Vec::new();
     let mut session_selected: usize = 0;
@@ -281,9 +318,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     let mut win_status_current_style: Option<(Option<Color>, Option<Color>, bool)> = None;
     let mut mode_style_str: String = "bg=yellow,fg=black".to_string();
     let mut status_position_str: String = "bottom".to_string();
-    let mut _status_justify_str: String = "left".to_string();
+    let mut status_justify_str: String = "left".to_string();
     // Synced bindings from server (updated each frame from DumpState)
     let mut synced_bindings: Vec<BindingEntry> = Vec::new();
+
+    // ── Windows paste detection state ──────────────────────────────────
+    // On Windows, Ctrl+V paste injects individual Key events BEFORE the
+    // Ctrl+V Release event arrives (~184ms later).  We buffer ALL printable
+    // chars for a short 20ms window.  If ≥3 chars arrive within 20ms, it's
+    // almost certainly a paste — hold the buffer until Ctrl+V Release confirms
+    // (up to 300ms), then send as a single bracketed paste (send-paste).
+    // If <3 chars arrive within 20ms, flush them as normal send-text.
+    // Pending chars being examined for paste detection.
+    #[cfg(windows)]
+    let mut paste_pend: String = String::new();
+    // When the first char of the current pending group arrived.
+    #[cfg(windows)]
+    let mut paste_pend_start: Option<Instant> = None;
+    // True once the 20ms window showed ≥3 chars — waiting for Ctrl+V Release.
+    #[cfg(windows)]
+    let mut paste_stage2: bool = false;
+    // Set to true when Ctrl+V Release is seen — confirms the burst was a paste.
+    #[cfg(windows)]
+    let mut paste_confirmed: bool = false;
 
     // list-keys overlay state (C-b ?)
     let mut keys_viewer = false;
@@ -298,6 +355,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     fn default_status_left_length() -> usize { 10 }
     fn default_status_right_length() -> usize { 40 }
     fn default_status_lines() -> usize { 1 }
+    fn default_status_visible() -> bool { true }
 
     /// A single key binding synced from the server.
     #[derive(serde::Deserialize, Clone, Debug)]
@@ -379,6 +437,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         /// status-justify: "left", "centre", or "right"
         #[serde(default)]
         status_justify: Option<String>,
+        /// Whether the status bar is visible (true) or hidden (false).
+        /// Corresponds to `set-option status on/off`.
+        #[serde(default = "default_status_visible")]
+        status_visible: bool,
+        /// Configured cursor style as DECSCUSR code (0-6) from server.
+        /// Used as fallback when no child process has set a cursor shape.
+        #[serde(default)]
+        cursor_style_code: Option<u8>,
+        /// One-shot clipboard text (base64-encoded) for OSC 52 delivery.
+        #[serde(default)]
+        clipboard_osc52: Option<String>,
     }
 
     let mut cmd_batch: Vec<String> = Vec::new();
@@ -386,6 +455,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     let mut prev_dump_buf = String::new();
     let mut last_key_send_time: Option<Instant> = None;
     let mut dump_in_flight = false;
+    let mut dump_flight_start: Instant = Instant::now();
 
     // Diagnostic latency log: set PSMUX_LATENCY_LOG=1 to enable
     let latency_log_enabled = env::var("PSMUX_LATENCY_LOG").unwrap_or_default() == "1";
@@ -404,11 +474,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     let mut rsel_dragged = false;
     let mut selection_changed = false; // forces redraw for selection overlay
     let mut border_drag = false; // true when dragging a pane separator (resize)
+    // Buffered OSC 52 clipboard text — written AFTER terminal.draw() to
+    // avoid corrupting ratatui's output buffer.
+    let mut pending_osc52: Option<String> = None;
+    // SSH mode: periodically re-send mouse-enable escape sequences.
+    let is_ssh_mode = crate::ssh_input::is_ssh_session();
+    let mut last_mouse_enable = Instant::now();
     loop {
         // Expire stale key_send_instant after 30ms — ConPTY echo should
         // have arrived by then; stop force-dumping to save CPU.
         if let Some(ks) = key_send_instant {
             if ks.elapsed().as_millis() > 30 { key_send_instant = None; }
+        }
+        // Safety valve: if dump_in_flight is stuck for >500ms (e.g. server
+        // did not respond), release it so the client doesn't spin at 1ms.
+        if dump_in_flight && dump_flight_start.elapsed().as_millis() > 500 {
+            dump_in_flight = false;
         }
         // ── STEP 0: Receive latest frame from reader thread (non-blocking) ──
         // Drain channel, keeping only the most recent frame.
@@ -430,6 +511,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                             force_dump = true;
                         }
                     } else {
+                        if client_log_enabled() {
+                            client_log("frame", &format!("received {} bytes", line.len()));
+                        }
                         dump_buf = line; got_frame = true; dump_in_flight = false;
                     }
                 }
@@ -449,8 +533,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // When typing: cap at ~100fps to avoid flooding the server with
         // dump-state requests (each one is ~50-100KB of JSON over TCP).
         // When idle: 50ms refresh (20fps) saves CPU.
-        let poll_ms = if got_frame { 0 }
-            else if dump_in_flight { 1 }
+        // Use fast poll when paste chars are pending (need timely detection)
+        #[cfg(windows)]
+        let paste_pend_active = !paste_pend.is_empty();
+        #[cfg(not(windows))]
+        let paste_pend_active = false;
+
+        let poll_ms = if paste_pend_active { 1 }
+            else if got_frame { 0 }
+            else if dump_in_flight { 5 }
             else if force_dump { 0 }
             else if typing_active {
                 // Rate-limit to ~100fps (10ms) when typing.  The snapshot-
@@ -469,11 +560,159 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
             };
 
         cmd_batch.clear();
+
+        // ── Windows paste pending-buffer management ────────────────────
+        // Flush or promote chars based on how long they've been buffered.
+        #[cfg(windows)]
+        {
+            if let Some(start) = paste_pend_start {
+                let elapsed = start.elapsed();
+                if paste_confirmed {
+                    // Ctrl+V Release already seen — send as paste now
+                    if !paste_pend.is_empty() {
+                        if input_log_enabled() {
+                            input_log("paste", &format!("paste CONFIRMED (top), sending {} chars as send-paste: {:?}",
+                                paste_pend.len(), &paste_pend[..paste_pend.len().min(200)]));
+                        }
+                        let encoded = base64_encode(&paste_pend);
+                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                    }
+                    paste_pend.clear();
+                    paste_pend_start = None;
+                    paste_stage2 = false;
+                    paste_confirmed = false;
+                } else if !paste_stage2 && elapsed > Duration::from_millis(20) {
+                    // 20ms window expired
+                    if paste_pend.len() >= 3 {
+                        // ≥3 chars in 20ms → likely paste, enter stage 2
+                        paste_stage2 = true;
+                        if input_log_enabled() {
+                            input_log("paste", &format!("stage2: {} chars in 20ms, waiting for Ctrl+V Release", paste_pend.len()));
+                        }
+                    } else {
+                        // <3 chars → normal typing, flush as send-text
+                        if input_log_enabled() {
+                            input_log("paste", &format!("flush {} chars as normal (< 3 in 20ms)", paste_pend.len()));
+                        }
+                        for c in paste_pend.chars() {
+                            match c {
+                                '\n' => { cmd_batch.push("send-key enter\n".into()); }
+                                '\t' => { cmd_batch.push("send-key tab\n".into()); }
+                                ' '  => { cmd_batch.push("send-key space\n".into()); }
+                                _ => {
+                                    let escaped = match c {
+                                        '"' => "\\\"".to_string(),
+                                        '\\' => "\\\\".to_string(),
+                                        _ => c.to_string(),
+                                    };
+                                    cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                                }
+                            }
+                        }
+                        paste_pend.clear();
+                        paste_pend_start = None;
+                    }
+                } else if paste_stage2 && elapsed > Duration::from_millis(300) {
+                    // Stage 2 timeout — no Ctrl+V Release arrived, flush as text
+                    if input_log_enabled() {
+                        input_log("paste", &format!("stage2 timeout, flushing {} chars as normal", paste_pend.len()));
+                    }
+                    for c in paste_pend.chars() {
+                        match c {
+                            '\n' => { cmd_batch.push("send-key enter\n".into()); }
+                            '\t' => { cmd_batch.push("send-key tab\n".into()); }
+                            ' '  => { cmd_batch.push("send-key space\n".into()); }
+                            _ => {
+                                let escaped = match c {
+                                    '"' => "\\\"".to_string(),
+                                    '\\' => "\\\\".to_string(),
+                                    _ => c.to_string(),
+                                };
+                                cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                            }
+                        }
+                    }
+                    paste_pend.clear();
+                    paste_pend_start = None;
+                    paste_stage2 = false;
+                }
+            }
+        }
+
         {
             let mut _pending_evt = input.read_timeout(Duration::from_millis(poll_ms))?;
             while let Some(_cur_evt) = _pending_evt {
+                // Input debug: log every raw event BEFORE filtering
+                if input_log_enabled() {
+                    match &_cur_evt {
+                        Event::Key(key) => {
+                            input_log("event", &format!(
+                                "Key code={:?} mods={:?} kind={:?} state={:?}",
+                                key.code, key.modifiers, key.kind, key.state
+                            ));
+                        }
+                        Event::Mouse(me) => {
+                            input_log("event", &format!("Mouse {:?}", me.kind));
+                        }
+                        Event::Resize(w, h) => {
+                            input_log("event", &format!("Resize {}x{}", w, h));
+                        }
+                        Event::Paste(d) => {
+                            input_log("event", &format!("Paste ({} bytes)", d.len()));
+                        }
+                        other => {
+                            input_log("event", &format!("Other {:?}", other));
+                        }
+                    }
+                }
                 match _cur_evt {
+                    // ── Windows Ctrl+V paste interception ────────────────
+                    // On Windows, Windows Terminal intercepts Ctrl+V Press,
+                    // reads the clipboard, and injects the paste content as
+                    // a byte stream into the ConPTY input pipe — bypassing
+                    // the console input buffer that crossterm reads via
+                    // ReadConsoleInputW.  Only the Ctrl+V *Release* event
+                    // leaks through.  We use that Release as a trigger to
+                    // read the clipboard ourselves and forward the content
+                    // as a bracketed-paste so child apps (Claude CLI, etc.)
+                    // can distinguish paste from typed input.
+                    #[cfg(windows)]
+                    Event::Key(key) if key.kind == KeyEventKind::Release
+                        && matches!(key.code, KeyCode::Char('v'))
+                        && key.modifiers == KeyModifiers::CONTROL =>
+                    {
+                        if input_log_enabled() {
+                            input_log("paste", &format!("Ctrl+V Release detected, paste_pend len={}", paste_pend.len()));
+                        }
+                        paste_confirmed = true;
+                    }
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                        // Flush pending paste buffer before processing any non-bufferable key.
+                        // Bufferable keys are: plain Char, Space, Enter (if pend non-empty), Tab (if pend non-empty).
+                        #[cfg(windows)]
+                        {
+                            if !paste_pend.is_empty() {
+                                let is_bufferable = match key.code {
+                                    KeyCode::Char(' ') => true,
+                                    KeyCode::Char(c) => {
+                                        // AltGr on Windows is reported as Ctrl+Alt.
+                                        // Non-letter chars with Ctrl+Alt are AltGr-produced
+                                        // (e.g. \ @ { } on German/Czech keyboards) and
+                                        // should be bufferable like normal text.
+                                        let is_altgr = key.modifiers.contains(KeyModifiers::CONTROL)
+                                            && key.modifiers.contains(KeyModifiers::ALT)
+                                            && !c.is_ascii_lowercase();
+                                        is_altgr || (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                                  && !key.modifiers.contains(KeyModifiers::ALT))
+                                    }
+                                    KeyCode::Enter | KeyCode::Tab => true, // buffered when pend non-empty
+                                    _ => false,
+                                };
+                                if !is_bufferable {
+                                    flush_paste_pend_as_text(&mut paste_pend, &mut paste_pend_start, &mut paste_stage2, &mut cmd_batch);
+                                }
+                            }
+                        }
                         // Dynamic prefix key check (default: Ctrl+B, configurable via .psmux.conf)
                         let is_prefix = (key.code, key.modifiers) == prefix_key
                             || prefix_raw_char.map_or(false, |c| matches!(key.code, KeyCode::Char(ch) if ch == c))
@@ -602,6 +841,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     tree_chooser = true;
                                     tree_entries.clear();
                                     tree_selected = 0;
+                                    tree_scroll = 0;
                                     // Query ALL sessions (like tmux choose-tree)
                                     let dir = format!("{}\\.psmux", home);
                                     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -730,7 +970,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     }
                                 }
                                 KeyCode::Char('q') => { chooser = true; }
-                                KeyCode::Char('v') => { cmd_batch.push("copy-anchor\n".into()); }
+                                KeyCode::Char('v') => { cmd_batch.push("rectangle-toggle\n".into()); }
                                 KeyCode::Char('y') => { cmd_batch.push("copy-yank\n".into()); }
                                 // Session navigation (like tmux prefix+( and prefix+))
                                 KeyCode::Char('(') | KeyCode::Char(')') => {
@@ -905,7 +1145,43 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     }
                                 }
                                 KeyCode::Esc if chooser => { chooser = false; }
-                                KeyCode::Char(' ') => { cmd_batch.push("send-key space\n".into()); }
+                                KeyCode::Char(' ') => {
+                                    #[cfg(windows)]
+                                    {
+                                        paste_pend.push(' ');
+                                        if paste_pend_start.is_none() {
+                                            paste_pend_start = Some(Instant::now());
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    {
+                                        cmd_batch.push("send-key space\n".into());
+                                    }
+                                }
+                                // AltGr detection: On Windows, AltGr is reported as
+                                // Ctrl+Alt.  Non-lowercase-letter chars with Ctrl+Alt
+                                // are AltGr-produced (e.g. \ @ { } [ ] | ~ on
+                                // German/Czech keyboards) — treat as plain text.
+                                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && key.modifiers.contains(KeyModifiers::ALT)
+                                    && !c.is_ascii_lowercase() => {
+                                    #[cfg(windows)]
+                                    {
+                                        paste_pend.push(c);
+                                        if paste_pend_start.is_none() {
+                                            paste_pend_start = Some(Instant::now());
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    {
+                                        let escaped = match c {
+                                            '"' => "\\\"".to_string(),
+                                            '\\' => "\\\\".to_string(),
+                                            _ => c.to_string(),
+                                        };
+                                        cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                                    }
+                                }
                                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT) => {
                                     cmd_batch.push(format!("send-key C-M-{}\n", c.to_ascii_lowercase()));
                                 }
@@ -915,20 +1191,52 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     cmd_batch.push(format!("send-key C-{}\n", c.to_ascii_lowercase()));
                                 }
-                                KeyCode::Char(c) if (c as u8) >= 0x01 && (c as u8) <= 0x1A => {
+                                KeyCode::Char(c) if (c as u32) >= 0x01 && (c as u32) <= 0x1A => {
                                     let ctrl_letter = ((c as u8) + b'a' - 1) as char;
                                     cmd_batch.push(format!("send-key C-{}\n", ctrl_letter));
                                 }
                                 KeyCode::Char(c) => {
-                                    let escaped = match c {
-                                        '"' => "\\\"".to_string(),
-                                        '\\' => "\\\\".to_string(),
-                                        _ => c.to_string(),
-                                    };
-                                    cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                                    #[cfg(windows)]
+                                    {
+                                        paste_pend.push(c);
+                                        if paste_pend_start.is_none() {
+                                            paste_pend_start = Some(Instant::now());
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    {
+                                        let escaped = match c {
+                                            '"' => "\\\"".to_string(),
+                                            '\\' => "\\\\".to_string(),
+                                            _ => c.to_string(),
+                                        };
+                                        cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                                    }
                                 }
-                                KeyCode::Enter => { cmd_batch.push("send-key enter\n".into()); }
-                                KeyCode::Tab => { cmd_batch.push("send-key tab\n".into()); }
+                                KeyCode::Enter => {
+                                    #[cfg(windows)]
+                                    {
+                                        if !paste_pend.is_empty() {
+                                            paste_pend.push('\n');
+                                        } else {
+                                            cmd_batch.push("send-key enter\n".into());
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    { cmd_batch.push("send-key enter\n".into()); }
+                                }
+                                KeyCode::Tab => {
+                                    #[cfg(windows)]
+                                    {
+                                        if !paste_pend.is_empty() {
+                                            paste_pend.push('\t');
+                                        } else {
+                                            cmd_batch.push("send-key tab\n".into());
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    { cmd_batch.push("send-key tab\n".into()); }
+                                }
                                 KeyCode::BackTab => { cmd_batch.push("send-key btab\n".into()); }
                                 KeyCode::Backspace => { cmd_batch.push("send-key backspace\n".into()); }
                                 KeyCode::Delete => { cmd_batch.push("send-key delete\n".into()); }
@@ -955,6 +1263,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         use crossterm::event::{MouseEventKind, MouseButton};
                         match me.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
+                                // Check if server-side copy mode is active
+                                let server_copy = if !prev_dump_buf.is_empty() {
+                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
+                                        .map(|s| active_pane_in_copy_mode(&s.layout))
+                                        .unwrap_or(false)
+                                } else { false };
+
                                 // Detect if click is on a separator line (for border resize)
                                 let on_sep = if !prev_dump_buf.is_empty() {
                                     if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
@@ -963,10 +1278,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     } else { false }
                                 } else { false };
 
-                                // Always forward to server for pane focus, tab clicks, border resize
+                                // Always forward to server for pane focus, tab clicks, border resize, copy-mode cursor positioning
                                 cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row));
 
-                                if on_sep {
+                                if server_copy {
+                                    // Server handles copy-mode selection — suppress client-side selection
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                } else if on_sep {
                                     // Border resize mode — server handles drag
                                     border_drag = true;
                                     rsel_start = None;
@@ -982,10 +1302,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                 }
                             }
                             MouseEventKind::Down(MouseButton::Right) => {
-                                // pwsh-style: right-click with active selection → copy + clear
-                                // right-click without selection → paste from clipboard
-                                if rsel_start.is_some() && rsel_dragged {
-                                    // Copy selection to clipboard and clear it
+                                // Check if active pane is running a TUI app (alternate screen).
+                                // TUI apps (htop, Claude Code, etc.) expect right-click as a
+                                // mouse event, NOT clipboard paste.
+                                let tui_active = if !prev_dump_buf.is_empty() {
+                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
+                                        .map(|s| active_pane_in_alt_screen(&s.layout))
+                                        .unwrap_or(false)
+                                } else { false };
+
+                                if tui_active {
+                                    // Forward right-click to server → inject_mouse_combined
+                                    // handles Win32 MOUSE_EVENT injection to ConPTY.
+                                    cmd_batch.push(format!("mouse-down-right {} {}\n", me.column, me.row));
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    selection_changed = true;
+                                } else if rsel_start.is_some() && rsel_dragged {
+                                    // pwsh-style: right-click with active selection → copy + clear
                                     if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
                                         if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
                                             let text = extract_selection_text(
@@ -996,6 +1330,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
+                                                pending_osc52 = Some(text);
                                             }
                                         }
                                     }
@@ -1004,7 +1339,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     rsel_dragged = false;
                                     selection_changed = true;
                                 } else {
-                                    // No selection — paste from clipboard
+                                    // No selection, no TUI — paste from clipboard (pwsh-style)
                                     rsel_start = None;
                                     rsel_end = None;
                                     selection_changed = true;
@@ -1020,6 +1355,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 if border_drag {
                                     // Forward drag to server for border resize
+                                    cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
+                                } else if rsel_start.is_none() {
+                                    // No client selection in progress (copy mode or suppressed)
+                                    // — forward to server for copy-mode drag selection
                                     cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
                                 } else {
                                     // Left-drag: extend text selection (pwsh behavior)
@@ -1049,6 +1388,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
+                                                pending_osc52 = Some(text);
                                             }
                                         }
                                     }
@@ -1058,6 +1398,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                     rsel_start = None;
                                     rsel_end = None;
                                     selection_changed = true;
+                                    // Always forward to server (finalises copy-mode click)
                                     cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
                                 }
                             }
@@ -1066,8 +1407,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                             MouseEventKind::Moved => {
                                 // Don't send bare mouse-move to server - wasteful and server ignores it
                             }
-                            MouseEventKind::ScrollUp => { cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row)); }
-                            MouseEventKind::ScrollDown => { cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row)); }
+                            MouseEventKind::ScrollUp => {
+                                // Clear client-side selection when scrolling — server may
+                                // enter copy mode, and the blue overlay would hide it.
+                                crate::debug_log::client_log("scroll", &format!(
+                                    "ScrollUp col={} row={} rsel_start={:?} rsel_end={:?} rsel_dragged={}",
+                                    me.column, me.row, rsel_start, rsel_end, rsel_dragged));
+                                if rsel_start.is_some() {
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                }
+                                cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row));
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if rsel_start.is_some() {
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                }
+                                cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row));
+                            }
                             _ => {}
                         }
                     }
@@ -1085,6 +1447,37 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         }
         if quit { break; }
 
+        // ── Windows paste buffer flush (post-event) ────────────────────
+        // If Ctrl+V Release was seen in this iteration AND we have pending
+        // chars, immediately send as send-paste (don't wait for top-of-loop).
+        #[cfg(windows)]
+        {
+            if paste_confirmed && !paste_pend.is_empty() {
+                if input_log_enabled() {
+                    input_log("paste", &format!("paste CONFIRMED (post-event), sending {} chars as send-paste: {:?}",
+                        paste_pend.len(), &paste_pend[..paste_pend.len().min(200)]));
+                }
+                let encoded = base64_encode(&paste_pend);
+                cmd_batch.push(format!("send-paste {}\n", encoded));
+                paste_pend.clear();
+                paste_pend_start = None;
+                paste_stage2 = false;
+                paste_confirmed = false;
+            } else if paste_confirmed && paste_pend.is_empty() {
+                // Ctrl+V with no buffered chars — read clipboard as fallback
+                if let Some(text) = read_from_system_clipboard() {
+                    if !text.is_empty() {
+                        if input_log_enabled() {
+                            input_log("paste", &format!("paste CONFIRMED (no buffer), clipboard read len={}", text.len()));
+                        }
+                        let encoded = base64_encode(&text);
+                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                    }
+                }
+                paste_confirmed = false;
+            }
+        }
+
         // ── STEP 2: Send commands immediately, refresh screen at capped rate ──
         // Send client-size if changed
         let mut size_changed = false;
@@ -1097,6 +1490,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 if writer.write_all(format!("client-size {} {}\n", new_size.0, new_size.1).as_bytes()).is_err() {
                     break; // Connection lost
                 }
+                // SSH: re-send mouse-enable on resize — terminal may reset
+                // mouse reporting mode after a window size change.
+                if is_ssh_mode {
+                    crate::ssh_input::send_mouse_enable();
+                    last_mouse_enable = Instant::now();
+                }
             }
         }
 
@@ -1104,6 +1503,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // without waiting for a dump-state round-trip
         let sent_keys_this_iter = !cmd_batch.is_empty();
         if sent_keys_this_iter {
+            if input_log_enabled() {
+                for cmd in &cmd_batch {
+                    input_log("send", &format!("→ {}", cmd.trim()));
+                }
+            }
             for cmd in &cmd_batch {
                 if writer.write_all(cmd.as_bytes()).is_err() {
                     break; // Connection lost
@@ -1134,12 +1538,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
             if writer.write_all(b"dump-state\n").is_err() { break; }
             if writer.flush().is_err() { break; }
             dump_in_flight = true;
+            dump_flight_start = Instant::now();
         }
 
         // ── STEP 3: Render if we have a frame ────────────────────────────
         // Also render if selection changed (for highlight overlay) even without new frame
         // Always render when overlays are active (command prompt, rename, choosers)
-        if !got_frame && !selection_changed && !overlays_active { continue; }
+        if !got_frame && !selection_changed && !overlays_active {
+            continue;
+        }
 
         // Skip parse + render when the raw JSON is identical to the previous
         // frame AND selection hasn't changed AND no overlays are active.
@@ -1153,13 +1560,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         let _t_parse = Instant::now();
         let state: DumpState = match serde_json::from_str(frame_to_parse) {
             Ok(s) => s,
-            Err(_) => {
+            Err(_e) => {
+                client_log("parse", &format!("JSON parse error: {} (len={})", _e, frame_to_parse.len()));
                 force_dump = true;
                 selection_changed = false;
                 continue;
             }
         };
         let _parse_us = _t_parse.elapsed().as_micros();
+        if client_log_enabled() {
+            client_log("parse", &format!("OK in {}us, {} windows", _parse_us, state.windows.len()));
+        }
 
         let root = state.layout;
         let windows = state.windows;
@@ -1167,6 +1578,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         let base_index = state.base_index;
         let dim_preds = state.prediction_dimming;
         let clock_active = state.clock_mode;
+        let state_cursor_style_code = state.cursor_style_code;
+
+        // ── OSC 52: propagate server-side clipboard to local terminal ────
+        // When the server copies text (yank_selection / copy mode),
+        // it includes a one-shot clipboard_osc52 field in the dump.
+        // Buffer for emission after terminal.draw() to avoid corrupting
+        // ratatui's output.
+        if let Some(ref clip_b64) = state.clipboard_osc52 {
+            if let Some(clip_text) = crate::util::base64_decode(clip_b64) {
+                // Also set the local Win32 clipboard for non-SSH scenarios
+                copy_to_system_clipboard(&clip_text);
+                pending_osc52 = Some(clip_text);
+            }
+        }
 
         // Update prefix key from server config (if provided)
         if let Some(ref prefix_str) = state.prefix {
@@ -1217,19 +1642,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             if !sl.is_empty() {
-                // Truncate to status_left_length (Unicode-aware, char count)
-                let truncated: String = sl.chars().take(state.status_left_length).collect();
-                custom_status_left = Some(truncated);
+                // Pass full string — visual truncation is handled by ratatui
+                // when rendering into the allocated status bar area.
+                // Do NOT naively truncate by char count as that can split
+                // inside #[...] style directives, causing parse failures.
+                custom_status_left = Some(sl);
             }
         }
         if let Some(sr) = state.status_right {
             if !sr.is_empty() {
-                // Truncate to status_right_length (Unicode-aware, char count)
-                let truncated: String = sr.chars().take(state.status_right_length).collect();
-                custom_status_right = Some(truncated);
+                custom_status_right = Some(sr);
             }
         }
-        let status_lines = state.status_lines;
+        let status_lines = if state.status_visible { state.status_lines } else { 0 };
         let status_format = state.status_format;
         // Update pane border styles
         if let Some(ref pbs) = state.pane_border_style {
@@ -1267,13 +1692,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
             if !sp.is_empty() { status_position_str = sp.clone(); }
         }
         if let Some(ref sj) = state.status_justify {
-            if !sj.is_empty() { _status_justify_str = sj.clone(); }
+            if !sj.is_empty() { status_justify_str = sj.clone(); }
         }
 
         // ── STEP 3: Render ───────────────────────────────────────────────
         let sel_s = rsel_start;
         let sel_e = rsel_end;
         let status_at_top = status_position_str == "top";
+        if client_log_enabled() {
+            let sz = terminal.size().unwrap_or_default();
+            client_log("draw", &format!("pre-draw terminal_size={}x{}", sz.width, sz.height));
+        }
         terminal.draw(|f| {
             let area = f.area();
             let constraints = if status_at_top {
@@ -1344,6 +1773,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         cursor_row,
                         cursor_col,
                         alternate_screen,
+                        hide_cursor,
+                        cursor_shape: _,
                         active,
                         copy_mode,
                         scroll_offset,
@@ -1370,8 +1801,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                 while c < max_c {
                                     let cell = &row[c as usize];
                                     let mut fg = map_color(&cell.fg);
-                                    let mut bg = map_color(&cell.bg);
-                                    if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
+                                    let bg = map_color(&cell.bg);
                                     let in_selection = if *copy_mode && *active {
                                         if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
                                             let mode = sel_mode.as_deref().unwrap_or("char");
@@ -1404,6 +1834,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                         let ms = crate::rendering::parse_tmux_style(&mode_style_str);
                                         style = ms;
                                     }
+                                    if cell.inverse { style = style.add_modifier(Modifier::REVERSED); }
                                     if cell.dim { style = style.add_modifier(Modifier::DIM); }
                                     if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                     if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
@@ -1426,18 +1857,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                                 for run in &rows_v2[r as usize].runs {
                                     if c >= inner.width { break; }
                                     let mut fg = map_color(&run.fg);
-                                    let mut bg = map_color(&run.bg);
-                                    if run.flags & 16 != 0 { std::mem::swap(&mut fg, &mut bg); }
+                                    let bg = map_color(&run.bg);
                                     if *active && dim_preds && !*alternate_screen
                                         && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
                                     {
                                         fg = dim_color(fg);
                                     }
                                     let mut style = Style::default().fg(fg).bg(bg);
+                                    if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
                                     if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
                                     if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
                                     if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
                                     if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                                    if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
+                                    if run.flags & 64 != 0 { style = style.add_modifier(Modifier::HIDDEN); }
                                     let text: &str = if run.text.is_empty() { " " } else { &run.text };
                                     spans.push(Span::styled(text, style));
                                     c = c.saturating_add(run.width.max(1));
@@ -1478,9 +1911,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                             if clock_mode {
                                 render_clock_overlay(f, inner);
                             }
-                            let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
-                            let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
-                            f.set_cursor_position((cx, cy));
+                            // Respect the child's cursor-visibility state.
+                            // TUI apps like Claude draw their own cursor via
+                            // cell inverse-video and hide the real terminal
+                            // cursor — honour that so we don't place a stray
+                            // cursor at ConPTY's parking position.
+                            if !*hide_cursor {
+                                let cy = inner.y + (*cursor_row).min(inner.height.saturating_sub(1));
+                                let cx = inner.x + (*cursor_col).min(inner.width.saturating_sub(1));
+                                f.set_cursor_position((cx, cy));
+                            }
                         }
 
                         // In copy mode, show cursor at copy_pos with a
@@ -1616,9 +2056,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
 
             let active_rect = compute_active_rect_json(&root, content_chunk);
             render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, active_rect, &mode_style_str);
+            fix_border_intersections(f.buffer_mut());
 
             // ── Left-click drag text selection overlay ────────────────
+            // Suppress the client-side blue selection overlay when the
+            // server is in copy mode – the server draws its own themed
+            // selection and the blue overlay would hide everything.
             if let (Some(s), Some(e)) = (sel_s, sel_e) {
+            if !active_pane_in_copy_mode(&root) {
                 // Normalise so (r0,c0) <= (r1,c1) in reading order
                 let (r0, c0, r1, c1) = if (s.1, s.0) <= (e.1, e.0) {
                     (s.1, s.0, e.1, e.0)
@@ -1640,10 +2085,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         }
                     }
                 }
-            }
+            } // !active_pane_in_copy_mode
+            } // if let sel_s, sel_e
 
             if session_chooser {
-                let overlay = Block::default().borders(Borders::ALL).title("choose-session (enter=switch, x=kill, esc=close)");
+                let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let overlay = Block::default().borders(Borders::ALL).title("choose-session (enter=switch, x=kill, esc=close)").border_style(sel_style);
                 let oa = centered_rect(70, 20, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
@@ -1651,7 +2098,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 for (i, (sname, info)) in session_entries.iter().enumerate() {
                     let marker = if sname == &current_session { "*" } else { " " };
                     let line = if i == session_selected {
-                        Line::from(Span::styled(format!("{} {}", marker, info), Style::default().bg(Color::Yellow).fg(Color::Black)))
+                        Line::from(Span::styled(format!("{} {}", marker, info), sel_style))
                     } else {
                         Line::from(format!("{} {}", marker, info))
                     };
@@ -1661,14 +2108,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 f.render_widget(para, overlay.inner(oa));
             }
             if tree_chooser {
-                let overlay = Block::default().borders(Borders::ALL).title("choose-tree");
-                let oa = centered_rect(60, 30, content_chunk);
+                let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let overlay = Block::default().borders(Borders::ALL).title("choose-tree").border_style(sel_style);
+                // Use dynamic height: content lines + 2 (borders), capped to
+                // available space so the overlay never exceeds the terminal.
+                let tree_h = ((tree_entries.len() as u16).saturating_add(2))
+                    .max(5)
+                    .min(content_chunk.height.saturating_sub(2));
+                let oa = centered_rect(60, tree_h, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
+                let inner = overlay.inner(oa);
+                let visible_h = inner.height as usize;
+                // Keep tree_selected in view
+                if tree_selected >= tree_scroll + visible_h {
+                    tree_scroll = tree_selected.saturating_sub(visible_h - 1);
+                }
+                if tree_selected < tree_scroll {
+                    tree_scroll = tree_selected;
+                }
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (is_win, wid, _pid, label, _sess)) in tree_entries.iter().enumerate() {
+                for (i, (is_win, wid, _pid, label, _sess)) in tree_entries.iter().enumerate().skip(tree_scroll).take(visible_h) {
                     let line = if i == tree_selected {
-                        Line::from(Span::styled(label.clone(), Style::default().bg(Color::Yellow).fg(Color::Black)))
+                        Line::from(Span::styled(label.clone(), sel_style))
                     } else if *is_win && *wid == usize::MAX {
                         // Session header — bold
                         Line::from(Span::styled(label.clone(), Style::default().add_modifier(Modifier::BOLD)))
@@ -1678,7 +2140,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                     lines.push(line);
                 }
                 let para = Paragraph::new(Text::from(lines));
-                f.render_widget(para, overlay.inner(oa));
+                f.render_widget(para, inner);
             }
             if keys_viewer {
                 // Proportional overlay: 90% width, up to 80% height
@@ -1759,12 +2221,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         let bx = r.x + r.width.saturating_sub(bw) / 2;
                         let by = r.y + r.height.saturating_sub(bh) / 2;
                         let b = Rect { x: bx, y: by, width: bw, height: bh };
-                        let block = Block::default().borders(Borders::ALL).style(Style::default().bg(Color::Yellow).fg(Color::Black));
+                        let pane_sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                        let block = Block::default().borders(Borders::ALL).style(pane_sel_style);
                         let inner = block.inner(b);
                         let disp = if i + 1 == 10 { 0 } else { i + 1 };
                         let para = Paragraph::new(Line::from(Span::styled(
                             format!(" {} ", disp),
-                            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            pane_sel_style.add_modifier(Modifier::BOLD),
                         ))).alignment(Alignment::Center);
                         f.render_widget(Clear, b);
                         f.render_widget(block, b);
@@ -1779,19 +2242,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
             } else {
                 Style::default().fg(sb_fg).bg(sb_bg)
             };
+            // ── Build three separate span groups: left, tabs, right ──
+            use unicode_width::UnicodeWidthStr;
             // Left portion: custom status_left or default [session] prefix
-            // Parse inline #[...] style directives for theme support
             let left_prefix = match custom_status_left {
                 Some(ref sl) => sl.clone(),
                 None => format!("[{}] ", name),
             };
-            let mut status_spans: Vec<Span> = crate::rendering::parse_inline_styles(&left_prefix, sb_base);
+            if client_log_enabled() {
+                client_log("status", &format!("parsing left_prefix ({} chars): [{}]",
+                    left_prefix.len(), left_prefix.chars().take(100).collect::<String>()));
+            }
+            let left_spans: Vec<Span> = crate::rendering::parse_inline_styles(&left_prefix, sb_base);
+
+            // Window tabs (the window list)
+            let mut tab_spans_all: Vec<Span> = Vec::new();
             for (i, w) in windows.iter().enumerate() {
-                // Use pre-expanded tab_text from server (full format expansion)
                 let tab_text = if !w.tab_text.is_empty() {
                     w.tab_text.clone()
                 } else {
-                    // Fallback for old server: naive expansion
                     let display_idx = i + base_index;
                     let fmt = if w.active { &win_status_current_fmt } else { &win_status_fmt };
                     fmt.replace("#I", &display_idx.to_string())
@@ -1799,9 +2268,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                        .replace("#F", if w.active { "*" } else { "" })
                 };
                 if i > 0 {
-                    status_spans.push(Span::styled(win_status_sep.clone(), sb_base));
+                    // Parse inline styles in separator (e.g. "#[fg=#44475a]|")
+                    let sep_spans = crate::rendering::parse_inline_styles(&win_status_sep, sb_base);
+                    tab_spans_all.extend(sep_spans);
                 }
-                // Determine fallback style based on window state
                 let fallback_style = if w.active {
                     if let Some((fg, bg, bold)) = win_status_current_style {
                         let mut s = Style::default();
@@ -1828,22 +2298,69 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                         sb_base
                     }
                 };
-                // Parse inline #[fg=...,bg=...] style directives from theme format strings
-                let tab_spans = crate::rendering::parse_inline_styles(&tab_text, fallback_style);
-                status_spans.extend(tab_spans);
+                let parsed = crate::rendering::parse_inline_styles(&tab_text, fallback_style);
+                tab_spans_all.extend(parsed);
             }
-            // Right portion: custom status_right (already expanded by server)
-            // Parse inline #[...] style directives for theme support
+
+            // Right portion
             let right_text = custom_status_right.as_deref().unwrap_or("").to_string();
+            if client_log_enabled() {
+                client_log("status", &format!("parsing right_text ({} chars): [{}]",
+                    right_text.len(), right_text.chars().take(100).collect::<String>()));
+            }
             let right_spans = crate::rendering::parse_inline_styles(&right_text, sb_base);
-            // Compute how many columns are used by left + window tabs
-            let left_used: usize = status_spans.iter().map(|s| s.content.len()).sum();
-            let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
+
+            // Measure widths using Unicode display width
+            let left_w: usize = left_spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+            let tabs_w: usize = tab_spans_all.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+            let right_w: usize = right_spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
             let total_width = status_chunk.width as usize;
-            if left_used + right_len < total_width {
-                let pad = total_width - left_used - right_len;
-                status_spans.push(Span::styled(" ".repeat(pad), sb_base));
-                status_spans.extend(right_spans);
+
+            // Assemble final spans based on status-justify
+            let mut status_spans: Vec<Span> = Vec::new();
+            match status_justify_str.as_str() {
+                "centre" | "center" => {
+                    // Centre: [left] [pad1] [tabs] [pad2] [right]
+                    // Tabs are centred in the space between left and right.
+                    let avail = total_width.saturating_sub(left_w).saturating_sub(right_w);
+                    let pad_before = avail.saturating_sub(tabs_w) / 2;
+                    let pad_after = avail.saturating_sub(tabs_w).saturating_sub(pad_before);
+                    status_spans.extend(left_spans);
+                    if pad_before > 0 { status_spans.push(Span::styled(" ".repeat(pad_before), sb_base)); }
+                    status_spans.extend(tab_spans_all);
+                    if pad_after > 0 { status_spans.push(Span::styled(" ".repeat(pad_after), sb_base)); }
+                    status_spans.extend(right_spans);
+                }
+                "absolute-centre" | "absolute-center" => {
+                    // Absolute-centre: tabs centred on the total terminal width
+                    let tabs_start = total_width.saturating_sub(tabs_w) / 2;
+                    status_spans.extend(left_spans);
+                    let pad_before = tabs_start.saturating_sub(left_w);
+                    if pad_before > 0 { status_spans.push(Span::styled(" ".repeat(pad_before), sb_base)); }
+                    status_spans.extend(tab_spans_all);
+                    let used = left_w + pad_before + tabs_w;
+                    let pad_after = total_width.saturating_sub(used).saturating_sub(right_w);
+                    if pad_after > 0 { status_spans.push(Span::styled(" ".repeat(pad_after), sb_base)); }
+                    status_spans.extend(right_spans);
+                }
+                "right" => {
+                    // Right: [left] [pad] [tabs] [right]
+                    status_spans.extend(left_spans);
+                    let used = left_w + tabs_w + right_w;
+                    let pad = total_width.saturating_sub(used);
+                    if pad > 0 { status_spans.push(Span::styled(" ".repeat(pad), sb_base)); }
+                    status_spans.extend(tab_spans_all);
+                    status_spans.extend(right_spans);
+                }
+                _ => {
+                    // Left (default): [left] [tabs] [pad] [right]
+                    status_spans.extend(left_spans);
+                    status_spans.extend(tab_spans_all);
+                    let used = left_w + tabs_w + right_w;
+                    let pad = total_width.saturating_sub(used);
+                    if pad > 0 { status_spans.push(Span::styled(" ".repeat(pad), sb_base)); }
+                    status_spans.extend(right_spans);
+                }
             }
             let status_bar = Paragraph::new(Line::from(status_spans)).style(sb_base);
             f.render_widget(Clear, status_chunk);
@@ -1901,7 +2418,58 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
                 let para = Paragraph::new(format!("{}? (y/n)", cmd));
                 f.render_widget(para, overlay.inner(oa));
             }
+
         })?;
+        if client_log_enabled() {
+            client_log("draw", &format!("draw OK, render={}us",
+                _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128)));
+        }
+
+        // ── Post-draw: emit buffered OSC 52 clipboard ────────────────
+        // Written AFTER terminal.draw() so it doesn't interfere with
+        // ratatui's VT output buffer.
+        if let Some(clip_text) = pending_osc52.take() {
+            crate::copy_mode::emit_osc52(&mut std::io::stdout(), &clip_text);
+        }
+
+        // ── SSH: periodic mouse-enable refresh ───────────────────────
+        // ConPTY or terminal resize can silently disable mouse reporting.
+        // Re-send every 30 seconds to keep mouse working reliably.
+        if is_ssh_mode && last_mouse_enable.elapsed().as_secs() >= 30 {
+            crate::ssh_input::send_mouse_enable();
+            last_mouse_enable = Instant::now();
+        }
+
+        // Forward active pane's cursor shape (DECSCUSR) to the real terminal.
+        // If no child DECSCUSR was received (ConPTY ate it on Win10), fall
+        // back to the user-configured cursor-style option.
+        {
+            fn find_active_cursor_shape(node: &LayoutJson) -> Option<u8> {
+                match node {
+                    LayoutJson::Leaf { active, cursor_shape, .. } => {
+                        if *active && *cursor_shape >= 1 && *cursor_shape <= 6 { Some(*cursor_shape) } else { None }
+                    }
+                    LayoutJson::Split { children, .. } => {
+                        children.iter().find_map(find_active_cursor_shape)
+                    }
+                }
+            }
+            let effective = find_active_cursor_shape(&root)
+                .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
+            use crossterm::cursor::SetCursorStyle;
+            let style = match effective {
+                0 => SetCursorStyle::DefaultUserShape,
+                1 => SetCursorStyle::BlinkingBlock,
+                2 => SetCursorStyle::SteadyBlock,
+                3 => SetCursorStyle::BlinkingUnderScore,
+                4 => SetCursorStyle::SteadyUnderScore,
+                5 => SetCursorStyle::BlinkingBar,
+                6 => SetCursorStyle::SteadyBar,
+                _ => SetCursorStyle::DefaultUserShape,
+            };
+            let _ = crossterm::execute!(std::io::stdout(), style);
+        }
+
         let _render_us = _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128);
         last_dump_time = Instant::now();
         // Latency log: measure full cycle from key-send to render-complete
@@ -1938,4 +2506,37 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, input: 
     let _ = writer.write_all(b"client-detach\n");
     let _ = writer.flush();
     Ok(())
+}
+
+/// Flush the paste-pending buffer as individual send-text / send-key commands.
+/// Called when a non-bufferable key (Backspace, Delete, Esc, BackTab) interrupts
+/// a potential paste burst, so we emit whatever we had as normal keystrokes.
+#[cfg(windows)]
+fn flush_paste_pend_as_text(
+    paste_pend: &mut String,
+    paste_pend_start: &mut Option<Instant>,
+    paste_stage2: &mut bool,
+    cmd_batch: &mut Vec<String>,
+) {
+    if paste_pend.is_empty() {
+        return;
+    }
+    for c in paste_pend.chars() {
+        match c {
+            '\n' => { cmd_batch.push("send-key enter\n".into()); }
+            '\t' => { cmd_batch.push("send-key tab\n".into()); }
+            ' '  => { cmd_batch.push("send-key space\n".into()); }
+            _ => {
+                let escaped = match c {
+                    '"' => "\\\"".to_string(),
+                    '\\' => "\\\\".to_string(),
+                    _ => c.to_string(),
+                };
+                cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+            }
+        }
+    }
+    paste_pend.clear();
+    *paste_pend_start = None;
+    *paste_stage2 = false;
 }

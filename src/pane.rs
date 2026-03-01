@@ -8,6 +8,13 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use crate::types::{AppState, Pane, Node, LayoutKind, Window};
 use crate::tree::{replace_leaf_with_split, active_pane_mut, kill_leaf};
 
+/// Sentinel value for cursor_shape: means "no DECSCUSR received from child yet".
+/// When ConPTY passthrough mode is unavailable, DECSCUSR sequences from child
+/// processes are consumed by ConPTY and never forwarded.  Using this sentinel
+/// lets the rendering code skip emitting any cursor-shape override, so the
+/// real terminal keeps its user-configured default cursor.
+pub const CURSOR_SHAPE_UNSET: u8 = 255;
+
 /// Send a preemptive cursor-position report (\x1b[1;1R) to the ConPTY input pipe.
 ///
 /// Windows ConPTY sends a Device Status Report (\x1b[6n]) during initialization
@@ -94,19 +101,22 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CURSOR_SHAPE_UNSET));
+    let cs_writer = cursor_shape.clone();
     let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    spawn_reader_thread(reader, term_reader, dv_writer);
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer);
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-    let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
+    let epoch = std::time::Instant::now() - Duration::from_secs(2);
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, copy_state: None };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0 });
@@ -143,18 +153,21 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CURSOR_SHAPE_UNSET));
+    let cs_writer = cursor_shape.clone();
     let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
-    spawn_reader_thread(reader, term_reader, dv_writer);
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer);
 
-    let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None };
+    let epoch = std::time::Instant::now() - Duration::from_secs(2);
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, copy_state: None };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0 });
@@ -250,12 +263,15 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
-    spawn_reader_thread(reader, term_reader, dv_writer);
-    let child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*child) };
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CURSOR_SHAPE_UNSET));
+    let cs_writer = cursor_shape.clone();
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer);
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: std::time::Instant::now(), last_infer_title: std::time::Instant::now(), dead: false, vt_bridge_cache: None, copy_state: None });
+    let epoch = std::time::Instant::now() - Duration::from_secs(2);
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id), child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, copy_state: None });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -296,12 +312,17 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, socket_name: O
 }
 
 pub fn build_command(command: Option<&str>) -> CommandBuilder {
+    // Capture CWD early — portable_pty on Windows defaults to USERPROFILE
+    // (home dir) when no cwd is set on CommandBuilder, so we must set it
+    // explicitly to honour the caller's working directory.
+    let cwd = std::env::current_dir().ok();
     if let Some(cmd) = command {
         let shell = cached_shell().map(|s| s.to_string());
         
         match shell {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -315,6 +336,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             }
             None => {
                 let mut builder = CommandBuilder::new("pwsh.exe");
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -337,6 +359,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
         match shell {
             Some(path) => {
                 let mut builder = CommandBuilder::new(&path);
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -347,6 +370,7 @@ pub fn build_command(command: Option<&str>) -> CommandBuilder {
             }
             None => {
                 let mut builder = CommandBuilder::new("pwsh.exe");
+                if let Some(ref dir) = cwd { builder.cwd(dir); }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
                 builder.env("PSMUX_SESSION", "1");
@@ -390,6 +414,9 @@ pub fn build_default_shell(shell_path: &str) -> CommandBuilder {
 
     let lower = resolved.to_lowercase();
     let mut builder = CommandBuilder::new(&resolved);
+    // Set CWD explicitly — portable_pty on Windows defaults to USERPROFILE
+    // (home dir) when no cwd is set on CommandBuilder.
+    if let Ok(dir) = std::env::current_dir() { builder.cwd(dir); }
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     builder.env("PSMUX_SESSION", "1");
@@ -423,6 +450,9 @@ pub fn build_raw_command(raw_args: &[String]) -> CommandBuilder {
     }
     let program = &raw_args[0];
     let mut builder = CommandBuilder::new(program);
+    // Set CWD explicitly — portable_pty on Windows defaults to USERPROFILE
+    // (home dir) when no cwd is set on CommandBuilder.
+    if let Ok(dir) = std::env::current_dir() { builder.cwd(dir); }
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     builder.env("PSMUX_SESSION", "1");
@@ -439,18 +469,58 @@ pub fn build_raw_command(raw_args: &[String]) -> CommandBuilder {
 ///
 /// Uses an 8KB read buffer (down from 64KB) to reduce mutex hold time during
 /// `parser.process()`, which improves DumpState latency under heavy output.
+
+/// Scan raw ConPTY output for DECSCUSR cursor shape sequences (`\x1b[N q`).
+/// Returns the last cursor shape value found, or None.
+///
+/// We accept all DECSCUSR cursor shape values (0-6) from child processes.
+/// Value 0 resets to default, 1-2 = block, 3-4 = underline, 5-6 = bar.
+fn scan_cursor_shape(data: &[u8]) -> Option<u8> {
+    let mut last_shape: Option<u8> = None;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            let mut j = i + 2;
+            let mut param: u8 = 0;
+            while j < data.len() && data[j].is_ascii_digit() {
+                param = param.saturating_mul(10).saturating_add(data[j] - b'0');
+                j += 1;
+            }
+            // Check for SP q (space 0x20 + 'q') = DECSCUSR
+            if j + 1 < data.len() && data[j] == b' ' && data[j + 1] == b'q' {
+                if param <= 6 {
+                    last_shape = Some(param);
+                }
+                i = j + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    last_shape
+}
+
 pub fn spawn_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
     term_reader: Arc<Mutex<vt100::Parser>>,
     dv_writer: Arc<std::sync::atomic::AtomicU64>,
+    cursor_shape: Arc<std::sync::atomic::AtomicU8>,
 ) {
     thread::spawn(move || {
-        let mut local = [0u8; 8192];
+        // 64KB buffer: captures most full-screen TUI paints in a single
+        // read(), preventing partial-frame rendering ("curtain effect")
+        // that occurs when ConPTY output is split across multiple small reads.
+        let mut local = vec![0u8; 65536];
         let mut zero_reads: u32 = 0;
         loop {
             match reader.read(&mut local) {
                 Ok(n) if n > 0 => {
                     zero_reads = 0;
+                    // Scan for DECSCUSR cursor shape before vt100 parser consumes data.
+                    // All valid DECSCUSR values (0-6) are accepted.
+                    if let Some(shape) = scan_cursor_shape(&local[..n]) {
+                        cursor_shape.store(shape, std::sync::atomic::Ordering::Release);
+                    }
                     if let Ok(mut parser) = term_reader.lock() {
                         parser.process(&local[..n]);
                     }
@@ -459,8 +529,8 @@ pub fn spawn_reader_thread(
                 }
                 Ok(_) => {
                     zero_reads += 1;
-                    if zero_reads > 200 { break; }
-                    thread::sleep(Duration::from_millis(5));
+                    if zero_reads > 10 { break; }
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(_) => break,
             }

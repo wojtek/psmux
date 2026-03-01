@@ -17,8 +17,7 @@
 //   cargo run --release --example latency_harness -- --chars 80 --delay 200
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::io::{BufRead, Read, Write};
-use std::net::TcpStream;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,7 +102,7 @@ fn main() {
     drop(pair.slave);
 
     let reader = pair.master.try_clone_reader().expect("clone reader");
-    let mut pty_writer = pair.master;
+    let mut pty_writer = pair.master.take_writer().expect("take writer");
 
     // ── 4. Output tracker thread ──
     // Track both total bytes AND last-activity timestamp (nanos since epoch)

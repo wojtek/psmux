@@ -7,6 +7,8 @@
 use ratatui::prelude::*;
 use ratatui::style::{Style, Modifier};
 
+use crate::debug_log::style_log;
+
 // ─── Color mapping ──────────────────────────────────────────────────────────
 
 /// Map a tmux color name/hex/index string to a ratatui `Color`.
@@ -160,9 +162,22 @@ fn apply_modifier(token: &str, style: &mut Style) {
 ///
 /// Unlike `parse_status()`, this does NOT re-expand status variables.
 /// Use for text already expanded by the format engine (e.g. window tab labels).
+///
+/// Supports tmux-compatible tokens:
+/// - `fg=color`, `bg=color` — set foreground/background
+/// - `bold`, `dim`, `italic`, `underline`, `blink`, `reverse`, `strikethrough`
+/// - `nobold`, `nodim`, etc. — remove modifiers
+/// - `default`, `none` — reset to base style
+/// - `push-default` — push current style onto stack
+/// - `pop-default` — pop style from stack
+/// - `fill` — recognised but handled by caller (ignored here)
+/// - `list=on`, `list=left`, `list=right`, `nolist` — window list markers (ignored here)
+/// - `range=...`, `norange` — mouse range markers (ignored here)
+/// - `align=left`, `align=centre`, `align=right` — alignment markers (ignored here)
 pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cur_style = base_style;
+    let mut style_stack: Vec<Style> = Vec::new();
     let mut i = 0;
     let bytes = text.as_bytes();
     while i < bytes.len() {
@@ -174,11 +189,28 @@ pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> 
                     if p.starts_with("fg=") { cur_style = cur_style.fg(map_color(&p[3..])); }
                     else if p.starts_with("bg=") { cur_style = cur_style.bg(map_color(&p[3..])); }
                     else if p == "default" || p == "none" { cur_style = base_style; }
+                    else if p == "push-default" { style_stack.push(cur_style); }
+                    else if p == "pop-default" {
+                        if let Some(s) = style_stack.pop() { cur_style = s; }
+                        else { cur_style = base_style; }
+                    }
+                    // Recognised but handled at a higher level — silently skip
+                    else if p == "fill" || p.starts_with("list") || p == "nolist"
+                         || p.starts_with("range") || p == "norange"
+                         || p.starts_with("align") {}
                     else { apply_modifier(p, &mut cur_style); }
                 }
                 i += 2 + end + 1;
                 continue;
             }
+            // No closing ']' found — treat remaining text as literal
+            style_log("parse_inline", &format!("WARN: unclosed #[ at pos {} in: [{}]",
+                i, text.chars().take(120).collect::<String>()));
+            let chunk = &text[i..];
+            if !chunk.is_empty() {
+                spans.push(Span::styled(chunk.to_string(), cur_style));
+            }
+            break;
         }
         let mut j = i;
         while j < bytes.len() && !(bytes[j] == b'#' && j + 1 < bytes.len() && bytes[j + 1] == b'[') {
@@ -193,9 +225,10 @@ pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> 
     spans
 }
 
-/// Calculate the visual display width of styled spans (sum of text content widths).
+/// Calculate the visual display width of styled spans.
 pub fn spans_visual_width(spans: &[Span]) -> usize {
-    spans.iter().map(|s| s.content.len()).sum()
+    use unicode_width::UnicodeWidthStr;
+    spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum()
 }
 
 // ─── Status bar parsing ─────────────────────────────────────────────────────
@@ -231,6 +264,13 @@ pub fn parse_status(fmt: &str, session_name: &str, win_name: &str, win_idx: usiz
                 i += 2 + end + 1;
                 continue;
             }
+            // No closing ']' found — treat remaining text as literal
+            style_log("parse_status", &format!("WARN: unclosed #[ at pos {} in: [{}]",
+                i, fmt.chars().take(120).collect::<String>()));
+            let chunk = &fmt[i..];
+            let text = expand_status(chunk, session_name, win_name, win_idx, time_str);
+            spans.push(Span::styled(text, cur_style));
+            break;
         }
         let mut j = i;
         while j < fmt.len() && !(fmt.as_bytes()[j] == b'#' && j + 1 < fmt.len() && fmt.as_bytes()[j+1] == b'[') { j += 1; }

@@ -10,7 +10,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$psmuxExe = "c:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$psmuxExe = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $psmuxExe)) { $psmuxExe = "$PSScriptRoot\..\target\debug\psmux.exe" }
 
 function Get-LayoutHash {
     param([string]$json)

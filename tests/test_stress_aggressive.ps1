@@ -2,7 +2,8 @@
 # Goal: reproduce "first 2-3 work, after that issues appear"
 
 $ErrorActionPreference = "Continue"
-$PSMUX = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
 $SESSION = "aggro"
 $script:pass = 0
 $script:fail = 0
@@ -114,6 +115,15 @@ foreach ($w in @(0, 5, 10, 15, 20, 25, 29)) {
 foreach ($w in @(0, 10, 20, 29)) {
     $target = "$SESSION`:$w.0"
     $marker = "RAPID_${w}"
+    # Ensure pane is ready before sending echo
+    $pr = Wait-Prompt $target 15000
+    if (-not $pr.Found) {
+        Fail "echo in rapid $target" "pane not ready (no prompt)"
+        continue
+    }
+    # Clear any stale output first
+    & $PSMUX send-keys -t $target "clear" Enter 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
     $r = Run-And-Verify -Target $target -Command "echo $marker" -Expected $marker -Timeout 10000
     if ($r.Found) {
         Pass "echo in rapid $target" "$($r.ElapsedMs)ms"
@@ -224,22 +234,21 @@ Log "SCENARIO C: 50 windows with 1 split each = 100 panes, verify every one"
 Write-Host ("=" * 70)
 
 & $PSMUX new-session -d -s $SESSION 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 
-# Create 49 more windows rapid-fire
+# Create 49 more windows with small yield for ConPTY
 for ($w = 1; $w -le 49; $w++) {
     & $PSMUX new-window -t $SESSION 2>&1 | Out-Null
-    # tiny yield
-    Start-Sleep -Milliseconds 50
+    Start-Sleep -Milliseconds 150
 }
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 5
 
 # Split each window once
 for ($w = 0; $w -le 49; $w++) {
     & $PSMUX split-window -t "$SESSION`:$w" -v 2>&1 | Out-Null
-    Start-Sleep -Milliseconds 50
+    Start-Sleep -Milliseconds 150
 }
-Start-Sleep -Seconds 5
+Start-Sleep -Seconds 8
 
 $panes = Get-AllPanes $SESSION
 $paneCount = $panes.Count
@@ -275,10 +284,19 @@ for ($w = 0; $w -le 49; $w++) {
 
 Log "Prompt results: $promptPasses passed, $promptFails failed out of $paneCount"
 
-# Run echo in every 10th window
+# Run echo in every 10th window (wait for prompt first)
 for ($w = 0; $w -le 49; $w += 10) {
     $target = "$SESSION`:$w.0"
     $marker = "CMD_${w}"
+    # Ensure pane is ready before sending echo
+    $pr = Wait-Prompt $target 15000
+    if (-not $pr.Found) {
+        Fail "echo $target" "pane not ready (no prompt)"
+        continue
+    }
+    # Clear any stale output first
+    & $PSMUX send-keys -t $target "clear" Enter 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
     $r = Run-And-Verify -Target $target -Command "echo $marker" -Expected $marker -Timeout 10000
     if ($r.Found) {
         Pass "echo $target" "$($r.ElapsedMs)ms"

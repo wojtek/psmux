@@ -2,7 +2,8 @@
 # Creates 60 panes while a client is attached, then verifies each
 
 $ErrorActionPreference = "Continue"
-$PSMUX = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
 $SESSION = "attached_test"
 $script:pass = 0
 $script:fail = 0
@@ -48,7 +49,12 @@ function Run-And-Verify {
 Log "Testing with ATTACHED session (rendering pipeline active)"
 Write-Host ("=" * 70)
 
-# Session should already be running and attached
+# Create the session (detached for CI, but tests the full pane/window pipeline)
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 2
+& $PSMUX new-session -d -s $SESSION 2>&1 | Out-Null
+Start-Sleep -Seconds 3
+
 $out = & $PSMUX list-sessions 2>&1
 Log "Sessions: $out"
 
@@ -110,6 +116,15 @@ Log "Phase 2: Verify command execution"
 for ($w = 0; $w -le 19; $w += 4) {
     $target = "$SESSION`:$w.0"
     $marker = "ATTACHED_${w}"
+    # Ensure pane is ready before sending echo
+    $pr = Wait-Prompt $target 15000
+    if (-not $pr.Found) {
+        Fail "echo $target" "pane not ready (no prompt)"
+        continue
+    }
+    # Clear stale output first
+    & $PSMUX send-keys -t $target "clear" Enter 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
     $r = Run-And-Verify -Target $target -Command "echo $marker" -Expected $marker -Timeout 10000
     if ($r.Found) { Pass "echo $target" "$($r.ElapsedMs)ms" }
     else { Fail "echo $target" "not found" }
@@ -123,6 +138,13 @@ Write-Host ""
 Write-Host ("=" * 70)
 Log "RESULTS: $($script:pass) passed, $($script:fail) failed"
 Write-Host ("=" * 70)
+if ($script:errors.Count -gt 0) {
+    Log "FAILURES:"
+    $script:errors | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+}
+
+# Cleanup
+& $PSMUX kill-server 2>&1 | Out-Null
 if ($script:errors.Count -gt 0) {
     Log "FAILURES:"
     $script:errors | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }

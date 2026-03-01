@@ -74,6 +74,11 @@ if line.trim() == "PERSISTENT" {
     let _ = write_stream.set_nodelay(true);
     // Use longer read timeout for persistent mode - client controls pacing
     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
+
+    // Track this stream so the server can explicitly shut it down before
+    // process::exit(0).  Without this, the client never gets EOF on
+    // Windows loopback sockets.
+    crate::types::register_persistent_stream(&write_stream);
     
     // Spawn a dedicated writer thread so the read loop never blocks
     // waiting for dump-state responses.  The read loop sends oneshot
@@ -187,12 +192,28 @@ let args: Vec<&str> = {
     }
     filtered
 };
-if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
-if let Some(pid) = target_pane { 
-    if pane_is_id {
-        let _ = tx.send(CtrlReq::FocusPane(pid));
+// Commands that should permanently change focus when used with -t
+let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp");
+if let Some(wid) = target_win {
+    if is_focus_cmd {
+        let _ = tx.send(CtrlReq::FocusWindow(wid));
     } else {
-        let _ = tx.send(CtrlReq::FocusPaneByIndex(pid));
+        let _ = tx.send(CtrlReq::FocusWindowTemp(wid));
+    }
+}
+if let Some(pid) = target_pane {
+    if is_focus_cmd {
+        if pane_is_id {
+            let _ = tx.send(CtrlReq::FocusPane(pid));
+        } else {
+            let _ = tx.send(CtrlReq::FocusPaneByIndex(pid));
+        }
+    } else {
+        if pane_is_id {
+            let _ = tx.send(CtrlReq::FocusPaneTemp(pid));
+        } else {
+            let _ = tx.send(CtrlReq::FocusPaneByIndexTemp(pid));
+        }
     }
 }
 match cmd {
@@ -336,6 +357,7 @@ match cmd {
         if args.len() >= 2 { if let (Ok(dx), Ok(dy)) = (args[0].parse::<i16>(), args[1].parse::<i16>()) { let _ = tx.send(CtrlReq::CopyMove(dx, dy)); } }
     }
     "copy-anchor" => { let _ = tx.send(CtrlReq::CopyAnchor); }
+    "rectangle-toggle" => { let _ = tx.send(CtrlReq::CopyRectToggle); }
     "copy-yank" => { let _ = tx.send(CtrlReq::CopyYank); }
     "client-size" => {
         if args.len() >= 2 { if let (Ok(w), Ok(h)) = (args[0].parse::<u16>(), args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::ClientSize(w, h)); } }
@@ -742,14 +764,14 @@ match cmd {
     "pipe-pane" | "pipep" => {
         let stdin_flag = args.iter().any(|a| *a == "-I");
         let stdout_flag = args.iter().any(|a| *a == "-O");
-        let _toggle = args.iter().any(|a| *a == "-o");
+        let toggle = args.iter().any(|a| *a == "-o");
         let cmd = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
         let (stdin, stdout) = if !stdin_flag && !stdout_flag {
             (false, true)
         } else {
             (stdin_flag, stdout_flag)
         };
-        let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout));
+        let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout, toggle));
     }
     "select-layout" | "selectl" => {
         let layout = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"tiled").to_string();
@@ -914,6 +936,13 @@ match cmd {
         let cmd_parts: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
         let shell_cmd = cmd_parts.join(" ");
         let shell_cmd = shell_cmd.trim_matches(|c: char| c == '\'' || c == '"').to_string();
+        // Expand ~ to home directory
+        let shell_cmd = if shell_cmd.contains('~') {
+            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+            shell_cmd.replace("~/", &format!("{}/", home)).replace("~\\", &format!("{}\\", home))
+        } else {
+            shell_cmd
+        };
         if !shell_cmd.is_empty() {
             if background {
                 let _ = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", &shell_cmd]).spawn();

@@ -13,6 +13,18 @@ use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, 
 use crate::types::{AppState, Mode, CopyModeState};
 use crate::tree::{active_pane, active_pane_mut};
 
+/// Emit an OSC 52 escape sequence to set the terminal clipboard.
+/// This works over SSH because the sequence travels through the SSH pipe
+/// to the local terminal emulator (e.g. Windows Terminal, iTerm2).
+/// The `writer` should be the client's stdout (not the server's).
+pub fn emit_osc52<W: Write>(writer: &mut W, text: &str) {
+    let encoded = crate::util::base64_encode(text);
+    // OSC 52 ; c ; <base64> ST   (ST = ESC \\ or BEL)
+    // Use BEL (\x07) as ST for broadest terminal compatibility.
+    let _ = write!(writer, "\x1b]52;c;{}\x07", encoded);
+    let _ = writer.flush();
+}
+
 pub fn enter_copy_mode(app: &mut AppState) { 
     app.mode = Mode::CopyMode; 
     app.copy_scroll_offset = 0;
@@ -572,6 +584,10 @@ pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
     app.paste_buffers.insert(0, text.clone());
     if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
     copy_to_system_clipboard(&text);
+    // Stage text for OSC 52 delivery to the client (works over SSH)
+    if app.set_clipboard != "off" {
+        app.clipboard_osc52 = Some(text.clone());
+    }
     // Pipe to copy-command if configured
     if !app.copy_command.is_empty() {
         let cmd = app.copy_command.clone();

@@ -147,7 +147,7 @@ const COPY_MODE_VI: &[(&str, &str)] = &[
     ("t{char}",   "jump-to-forward"),
     ("T{char}",   "jump-to-backward"),
     // Selection
-    ("v",         "begin-selection"),
+    ("v",         "rectangle-toggle"),
     ("V",         "select-line"),
     ("C-v",       "rectangle-toggle"),
     ("Space",     "begin-selection"),

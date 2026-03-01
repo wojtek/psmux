@@ -35,7 +35,13 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "display-panes" | "displayp" => Some(Action::DisplayPanes),
         "new-window" | "neww" => Some(Action::NewWindow),
         "split-window" | "splitw" => {
-            if parts.iter().any(|p| *p == "-h") {
+            // If extra flags like -c, -d, -p, -F, or a shell command are present,
+            // store as Command to preserve the full argument string.
+            let has_extra = parts.iter().any(|p| matches!(*p, "-c" | "-d" | "-p" | "-l" | "-F" | "-P" | "-b" | "-f" | "-I" | "-Z" | "-e"))
+                || parts.iter().any(|p| !p.starts_with('-') && *p != "split-window" && *p != "splitw");
+            if has_extra {
+                Some(Action::Command(cmd.to_string()))
+            } else if parts.iter().any(|p| *p == "-h") {
                 Some(Action::SplitHorizontal)
             } else {
                 Some(Action::SplitVertical)
@@ -140,18 +146,28 @@ pub fn format_action(action: &Action) -> String {
 pub fn parse_command_line(line: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut in_quotes = false;
+    let mut in_double_quotes = false;
+    let mut in_single_quotes = false;
     let mut escape_next = false;
     
     for c in line.chars() {
         if escape_next {
             current.push(c);
             escape_next = false;
-        } else if c == '\\' && in_quotes {
+        } else if in_single_quotes {
+            // Inside single quotes: everything is literal (no escape processing)
+            if c == '\'' {
+                in_single_quotes = false;
+            } else {
+                current.push(c);
+            }
+        } else if c == '\\' && in_double_quotes {
             escape_next = true;
         } else if c == '"' {
-            in_quotes = !in_quotes;
-        } else if c.is_whitespace() && !in_quotes {
+            in_double_quotes = !in_double_quotes;
+        } else if c == '\'' && !in_double_quotes {
+            in_single_quotes = true;
+        } else if c.is_whitespace() && !in_double_quotes {
             if !current.is_empty() {
                 args.push(current.clone());
                 current.clear();
@@ -380,10 +396,8 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
             }
         }
         "split-window" | "splitw" => {
-            let flag = if parts.iter().any(|p| *p == "-h") { "-h" } else { "-v" };
-            {
-                let _ = send_control_to_session(&app.port_file_base(), &format!("split-window {}\n", flag));
-            }
+            // Forward the full command string to preserve -c, -d, -p etc. flags.
+            let _ = send_control_to_session(&app.port_file_base(), &format!("{}\n", cmd));
         }
         "kill-pane" => {
             let _ = kill_active_pane(app);
@@ -530,6 +544,7 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
                         let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                         let pair = pty_sys.openpty(pty_size).ok()?;
                         let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                        if let Ok(dir) = std::env::current_dir() { cmd_builder.cwd(dir); }
                         if cfg!(windows) { cmd_builder.args(["-NoProfile", "-Command", &rest]); } else { cmd_builder.args(["-c", &rest]); }
                         let child = pair.slave.spawn_command(cmd_builder).ok()?;
                         // Close the slave handle immediately – required for ConPTY.
@@ -671,6 +686,45 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
         "kill-session" => {
             {
                 let _ = send_control_to_session(&app.port_file_base(), "kill-session\n");
+            }
+        }
+        "run-shell" | "run" => {
+            // Parse with quote-aware parser to handle nested quotes properly
+            let args = parse_command_line(cmd);
+            let mut cmd_parts: Vec<&str> = Vec::new();
+            for arg in &args[1..] {
+                if arg == "-b" { /* always spawn non-blocking */ }
+                else { cmd_parts.push(arg); }
+            }
+            let shell_cmd = cmd_parts.join(" ");
+            if !shell_cmd.is_empty() {
+                // Expand ~ to home directory
+                let shell_cmd = if shell_cmd.contains('~') {
+                    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+                    shell_cmd.replace("~/", &format!("{}/", home)).replace("~\\", &format!("{}\\", home))
+                } else {
+                    shell_cmd
+                };
+                // Set PSMUX_TARGET_SESSION so child scripts connect to the correct server
+                let target_session = app.port_file_base();
+                #[cfg(windows)]
+                {
+                    let mut c = std::process::Command::new("pwsh");
+                    c.args(["-NoProfile", "-Command", &shell_cmd]);
+                    if !target_session.is_empty() {
+                        c.env("PSMUX_TARGET_SESSION", &target_session);
+                    }
+                    let _ = c.spawn();
+                }
+                #[cfg(not(windows))]
+                {
+                    let mut c = std::process::Command::new("sh");
+                    c.args(["-c", &shell_cmd]);
+                    if !target_session.is_empty() {
+                        c.env("PSMUX_TARGET_SESSION", &target_session);
+                    }
+                    let _ = c.spawn();
+                }
             }
         }
         _ => {

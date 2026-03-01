@@ -2,7 +2,8 @@
 # Goal: find what breaks after the first 2-3 windows
 
 $ErrorActionPreference = "Continue"
-$PSMUX = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
 $SESSION = "stress50"
 $script:pass = 0
 $script:fail = 0

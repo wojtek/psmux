@@ -143,6 +143,9 @@ MISC:
 OPTIONS:
     -h, --help              Show this help message
     -V, --version           Show version information
+    -f <file>               Use <file> as the configuration file
+    -L <name>               Name the server socket (namespace isolation)
+    -S <path>               Specify server socket path
     -t <target>             Target session, window, or pane
 
 TARGET SYNTAX (-t):

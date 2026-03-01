@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# Prevent duplicate runs from overwriting release assets / submitting duplicate PRs
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -164,8 +169,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify crate compiles with crates.io dependencies
+        run: |
+          cargo check 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Crate fails to compile with crates.io dependencies! Fix before publishing."
+            exit 1
+          }
+        shell: pwsh
+
       - name: Publish to crates.io
-        run: cargo publish --no-verify --allow-dirty
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -175,6 +189,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for release assets to stabilize on GitHub CDN
+        shell: pwsh
+        run: |
+          Write-Output "Waiting 60s for GitHub release CDN propagation..."
+          Start-Sleep 60
 
       - name: Extract version from tag
         id: version
@@ -330,6 +350,11 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - name: Wait for release assets to stabilize on GitHub CDN
+        run: |
+          echo "Waiting 60s for GitHub release CDN propagation..."
+          sleep 60
+
       - name: Extract version from tag
         id: version
         shell: bash
@@ -448,6 +473,12 @@ jobs:
     needs: release
     runs-on: windows-latest
     steps:
+      - name: Wait for release assets to stabilize on GitHub CDN
+        shell: pwsh
+        run: |
+          Write-Output "Waiting 90s for GitHub release CDN propagation..."
+          Start-Sleep 90
+
       - name: Extract version from tag
         id: version
         shell: pwsh

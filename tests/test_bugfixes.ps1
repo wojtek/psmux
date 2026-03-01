@@ -1,5 +1,6 @@
-$psmux = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
-$out = "C:\Users\gj\Documents\workspace\psmux\test_bugfix_results.txt"
+$psmux = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $psmux)) { $psmux = "$PSScriptRoot\..\target\debug\psmux.exe" }
+$out = "$PSScriptRoot\..\test_bugfix_results.txt"
 
 # Clean up
 taskkill /f /im psmux.exe 2>$null

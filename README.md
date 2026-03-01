@@ -38,6 +38,10 @@ psmux is a **native Windows terminal multiplexer** built from the ground up in R
 
 > 💡 **Tip:** psmux ships with `tmux` and `pmux` aliases. Just type `tmux` and it works!
 
+👀 On Windows 👇
+
+![psmux in action](demo.gif)
+
 ## Installation
 
 ### Using WinGet
@@ -110,8 +114,6 @@ If you've used tmux on Linux/macOS and wished you had something like it on Windo
 | Zero dependencies | ✅ | ✅ | ❌ (needs WSL) |
 | Scriptable (76 commands) | ✅ | ❌ | ✅ |
 
-![psmux in action - monitoring system info](psmux_sysinfo.gif)
-
 Split panes, multiple windows, session persistence, 76 commands, full mouse, tmux themes, 126+ format variables, 53 vim copy-mode keys. Full details: **[docs/features.md](docs/features.md)**
 
 ## Performance
@@ -164,6 +166,8 @@ psmux has a full plugin ecosystem — ports of the most popular tmux plugins, re
 
 **Browse available plugins and themes:** [**psmux-plugins**](https://github.com/marlocarlo/psmux-plugins)
 
+**Install & manage plugins with a TUI:** [**Tmux Plugin Panel (tppanel)**](https://github.com/marlocarlo/tppanel) — a terminal UI for browsing, installing, updating, and removing plugins and themes.
+
 | Plugin | Description |
 |--------|-------------|
 | [psmux-sensible](https://github.com/marlocarlo/psmux-plugins/tree/main/psmux-sensible) | Sensible defaults for psmux |
@@ -178,7 +182,7 @@ psmux has a full plugin ecosystem — ports of the most popular tmux plugins, re
 Quick start:
 ```powershell
 # Install the plugin manager
-git clone https://github.com/marlocarlo/psmux-plugins "$env:USERPROFILE\.psmux\plugins\psmux-plugins"
+git clone https://github.com/psmux-plugins/ppm "$env:USERPROFILE\.psmux\plugins\ppm"
 ```
 Then add to your `~/.psmux.conf`:
 ```
@@ -186,6 +190,7 @@ set -g @plugin 'psmux-plugins/ppm'
 set -g @plugin 'psmux-plugins/psmux-sensible'
 run '~/.psmux/plugins/ppm/ppm.ps1'
 ```
+Press `Prefix + I` inside psmux to install the declared plugins.
 
 ## Usage
 

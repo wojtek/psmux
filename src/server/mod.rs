@@ -24,7 +24,7 @@ use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_st
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
 use options::{get_option_value, apply_set_option};
 
-use crate::input::{send_text_to_active, send_key_to_active, move_focus};
+use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus};
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, move_copy_cursor, current_prompt_pos,
     yank_selection, scroll_copy_up, scroll_copy_down, switch_with_copy_save,
     capture_active_pane_text, capture_active_pane_range, capture_active_pane_styled};
@@ -37,11 +37,11 @@ use crate::window_ops::{toggle_zoom, remote_mouse_down, remote_mouse_drag, remot
 use crate::config::{load_config, parse_key_string, format_key_binding, normalize_key_for_binding,
     parse_config_content, parse_config_line};
 use crate::commands::{parse_command_to_action, format_action, parse_menu_definition};
-use crate::util::{list_windows_json, list_tree_json, list_windows_tmux};
+use crate::util::{list_windows_json, list_tree_json, list_windows_tmux, base64_encode};
 use crate::format::{expand_format, format_list_windows, format_list_panes, set_buffer_idx_override};
 use crate::help;
 
-pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>) -> io::Result<()> {
+pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>) -> io::Result<()> {
     // Write crash info to a log file when stderr is unavailable (detached server)
     std::panic::set_hook(Box::new(|info| {
         let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
@@ -89,6 +89,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
     let _ = std::fs::write(&keypath, &session_key);
 
+    // Expose the server identity via env var so that child processes spawned
+    // by run-shell (from hooks, keybindings, etc.) can find this server when
+    // they call `psmux set -g ...` or other CLI commands.
+    env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
+
     // Try to set file permissions to user-only (Windows)
     #[cfg(windows)]
     {
@@ -104,11 +109,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Create initial window with optional command (this spawns ConPTY + pwsh,
     // which is the slowest step — but the port file is already written so the
     // client can connect immediately without waiting)
+    // Apply initial dimensions if specified via -x/-y
+    if let Some((w, h)) = init_size {
+        app.last_window_area = ratatui::layout::Rect { x: 0, y: 0, width: w, height: h };
+    }
+    // Apply start directory if specified via -c (new-session) / -d (server)
+    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
+    if let Some(ref dir) = start_dir { env::set_current_dir(dir).ok(); }
     if let Some(ref raw_args) = raw_command {
         create_window_raw(&*pty_system, &mut app, raw_args)?;
     } else {
         create_window(&*pty_system, &mut app, initial_command.as_deref())?;
     }
+    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
+    // Apply window name if specified via -n
+    if let Some(n) = window_name { app.windows.last_mut().map(|w| w.name = n); }
     
     // Shared command aliases map — updated by main loop, read by handler threads
     let shared_aliases: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> =
@@ -137,6 +152,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             }
         }
     });
+    // Fire client-attached hooks once at startup so plugins populate initial
+    // data (e.g. CPU/battery) even for detached sessions (tppanel previews).
+    {
+        let cmds: Vec<String> = app.hooks.get("client-attached").cloned().unwrap_or_default();
+        for cmd in cmds {
+            parse_config_line(&mut app, &cmd);
+        }
+    }
     let mut state_dirty = true;
     let mut cached_dump_state = String::new();
     let mut cached_data_version: u64 = 0;
@@ -164,18 +187,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // to 5ms, adding cumulative latency visible as heavy input lag.
     let mut echo_pending_until: Option<Instant> = None;
 
+    // Track when any client last requested a dump or sent input.
+    // Used to ramp down the server loop frequency when truly idle.
+    let mut last_client_activity = Instant::now();
+
     loop {
-        // Adaptive timeout: 1ms when echo-pending or fresh PTY data just
-        // arrived (so we can serve the waiting dump-state request quickly),
-        // 5ms otherwise to stay idle-friendly.
+        // Adaptive timeout: ramps from 1ms (active typing/echo) through
+        // 5ms (client recently active) up to 50ms (fully idle).  This
+        // dramatically reduces CPU usage when the session is idle while
+        // keeping responsiveness high during interaction.
         let data_ready = crate::types::PTY_DATA_READY.swap(false, std::sync::atomic::Ordering::AcqRel);
         if data_ready {
             state_dirty = true;
         }
         let echo_active = echo_pending_until.map_or(false, |t| t.elapsed().as_millis() < 50);
-        let timeout_ms: u64 = if echo_active || data_ready { 1 } else { 5 };
+        let idle_secs = last_client_activity.elapsed().as_secs();
+        let timeout_ms: u64 = if echo_active || data_ready {
+            1      // Active echo/data: 1ms for maximum responsiveness
+        } else if idle_secs < 2 {
+            5      // Recently active: 5ms (200 Hz)
+        } else {
+            50     // Fully idle: 50ms (20 Hz) — saves ~90% CPU vs 5ms
+        };
         if let Some(rx) = app.control_rx.as_ref() {
             if let Ok(req) = rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+                last_client_activity = Instant::now();
                 let mut pending = vec![req];
                 // Drain any additional queued messages without blocking
                 while let Ok(r) = rx.try_recv() {
@@ -195,9 +231,39 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     CtrlReq::DumpLayout(_) => 1,
                     _ => 0,
                 });
+                // Track temporary -t focus: save (active_idx, active_path) when
+                // FocusWindowTemp/FocusPaneTemp is seen, restore after next
+                // non-temp command so the user's view doesn't jump.
+                let mut temp_focus_restore: Option<(usize, Vec<usize>)> = None;
                 for req in pending {
                     let mutates_state = !matches!(&req, CtrlReq::DumpState(..));
+                    let is_temp_focus = matches!(&req,
+                        CtrlReq::FocusWindowTemp(_) | CtrlReq::FocusPaneTemp(_) | CtrlReq::FocusPaneByIndexTemp(_));
                     let mut hook_event: Option<&str> = None;
+                    // Track active_idx changes for debugging window-switch issues
+                    let _prev_active_idx = app.active_idx;
+                    let _req_tag: &str = match &req {
+                        CtrlReq::NextWindow => "NextWindow",
+                        CtrlReq::PrevWindow => "PrevWindow",
+                        CtrlReq::SelectWindow(_) => "SelectWindow",
+                        CtrlReq::FocusWindow(_) => "FocusWindow",
+                        CtrlReq::FocusWindowTemp(_) => "FocusWindowTemp",
+                        CtrlReq::FocusWindowCmd(_) => "FocusWindowCmd",
+                        CtrlReq::LastWindow => "LastWindow",
+                        CtrlReq::MouseDown(..) => "MouseDown",
+                        CtrlReq::MouseDownRight(..) => "MouseDownRight",
+                        CtrlReq::MouseDownMiddle(..) => "MouseDownMiddle",
+                        CtrlReq::FocusPane(_) => "FocusPane",
+                        CtrlReq::FocusPaneTemp(_) => "FocusPaneTemp",
+                        CtrlReq::NewWindow(..) => "NewWindow",
+                        CtrlReq::KillWindow => "KillWindow",
+                        CtrlReq::KillPane => "KillPane",
+                        CtrlReq::BreakPane => "BreakPane",
+                        CtrlReq::JoinPane(_) => "JoinPane",
+                        CtrlReq::MoveWindow(..) => "MoveWindow",
+                        CtrlReq::SwapWindow(_) => "SwapWindow",
+                        _ => "",
+                    };
                     match req {
                 CtrlReq::NewWindow(cmd, name, detached, start_dir) => {
                     let prev_idx = app.active_idx;
@@ -309,6 +375,34 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if app.windows[app.active_idx].active_path != old_path { unzoom_if_zoomed(&mut app); }
                     meta_dirty = true;
                 }
+                // ── Temporary focus variants for -t targeting ────────────
+                // These switch active_idx/active_path so the NEXT command
+                // in the batch operates on the correct window/pane.
+                // After the entire pending batch is processed, we restore
+                // the original focus (see temp_focus_restore below).
+                CtrlReq::FocusWindowTemp(wid) => {
+                    if temp_focus_restore.is_none() {
+                        temp_focus_restore = Some((app.active_idx, app.windows[app.active_idx].active_path.clone()));
+                    }
+                    if wid >= app.window_base_index {
+                        let internal_idx = wid - app.window_base_index;
+                        if internal_idx < app.windows.len() {
+                            app.active_idx = internal_idx;
+                        }
+                    }
+                }
+                CtrlReq::FocusPaneTemp(pid) => {
+                    if temp_focus_restore.is_none() {
+                        temp_focus_restore = Some((app.active_idx, app.windows[app.active_idx].active_path.clone()));
+                    }
+                    focus_pane_by_id(&mut app, pid);
+                }
+                CtrlReq::FocusPaneByIndexTemp(idx) => {
+                    if temp_focus_restore.is_none() {
+                        temp_focus_restore = Some((app.active_idx, app.windows[app.active_idx].active_path.clone()));
+                    }
+                    focus_pane_by_index(&mut app, idx);
+                }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { " (attached)" } else { "" };
                     let windows = app.windows.len();
@@ -334,7 +428,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     if p.last_title_check.elapsed().as_millis() < 1000 { continue; }
                                     p.last_title_check = std::time::Instant::now();
                                     if p.child_pid.is_none() {
-                                        p.child_pid = unsafe { crate::platform::mouse_inject::get_child_pid(&*p.child) };
+                                        p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
                                     }
                                     let new_name = if let Some(pid) = p.child_pid {
                                         crate::platform::process_info::get_foreground_process_name(pid)
@@ -357,8 +451,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // instead of cloning 50-100KB of JSON.
                     // Only allowed for persistent connections that already have
                     // the previous frame; one-shot connections always need full state.
+                    // Skip the fast-path while any pane in the active window still
+                    // has a default placeholder title — we need layout serialisation
+                    // to keep running infer_title_from_prompt until a real title is
+                    // resolved.
+                    let has_placeholder_title = app.windows.get(app.active_idx)
+                        .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
+                        .map_or(false, |p| p.title.starts_with("pane %"));
                     if allow_nc
                         && !state_dirty
+                        && !has_placeholder_title
                         && !cached_dump_state.is_empty()
                         && cached_data_version == combined_data_version(&app)
                     {
@@ -406,15 +508,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         sf.push(']');
                         sf
                     };
+                    let cursor_style_code = crate::rendering::configured_cursor_code();
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\"}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
                         mode_style_escaped, status_position_escaped, status_justify_escaped,
+                        cursor_style_code, app.status_visible,
                     ));
                     cached_dump_state.clear();
                     cached_dump_state.push_str(&combined_buf);
+                    // Inject one-shot clipboard data for OSC 52 delivery to
+                    // the client.  Only the *response* includes this field;
+                    // the cached copy does not, so subsequent NC frames won't
+                    // re-trigger clipboard emission on the client.
+                    if let Some(clip_text) = app.clipboard_osc52.take() {
+                        let clip_b64 = base64_encode(&clip_text);
+                        // Replace trailing '}' with the extra field
+                        if combined_buf.ends_with('}') {
+                            combined_buf.pop();
+                            combined_buf.push_str(",\"clipboard_osc52\":\"");
+                            combined_buf.push_str(&clip_b64);
+                            combined_buf.push_str("\"}");
+                        }
+                    }
                     cached_data_version = combined_data_version(&app);
                     state_dirty = false;
                     // Timing log: dump-state build time
@@ -434,7 +552,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; echo_pending_until = Some(Instant::now()); }
                 CtrlReq::SendKey(k) => { send_key_to_active(&mut app, &k)?; echo_pending_until = Some(Instant::now()); }
-                CtrlReq::SendPaste(s) => { send_text_to_active(&mut app, &s)?; echo_pending_until = Some(Instant::now()); }
+                CtrlReq::SendPaste(s) => { send_paste_to_active(&mut app, &s)?; echo_pending_until = Some(Instant::now()); }
                 CtrlReq::ZoomPane => { toggle_zoom(&mut app); hook_event = Some("after-resize-pane"); }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); }
                 CtrlReq::CopyEnterPageUp => {
@@ -448,6 +566,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_anchor_scroll_offset = app.copy_scroll_offset; app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); exit_copy_mode(&mut app); }
+                CtrlReq::CopyRectToggle => {
+                    app.copy_selection_mode = match app.copy_selection_mode {
+                        crate::types::SelectionMode::Rect => crate::types::SelectionMode::Char,
+                        _ => crate::types::SelectionMode::Rect,
+                    };
+                }
                 CtrlReq::ClientSize(w, h) => { 
                     app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
@@ -1009,6 +1133,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                     let _ = std::fs::remove_file(&keypath);
+                    crate::types::shutdown_persistent_streams();
                     std::process::exit(0);
                 }
                 CtrlReq::HasSession(resp) => {
@@ -1465,35 +1590,59 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::PipePane(cmd, stdin, stdout) => {
+                CtrlReq::PipePane(cmd, stdin, stdout, toggle) => {
                     let win = &app.windows[app.active_idx];
                     let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
+                    let has_existing = app.pipe_panes.iter().any(|p| p.pane_id == pane_id);
                     
                     if cmd.is_empty() {
-                        app.pipe_panes.retain(|p| p.pane_id != pane_id);
-                    } else {
+                        // No command: close any existing pipe on this pane
                         if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
                             if let Some(ref mut proc) = app.pipe_panes[idx].process {
                                 let _ = proc.kill();
                             }
                             app.pipe_panes.remove(idx);
-                        } else {
-                            #[cfg(windows)]
-                            let process = std::process::Command::new("pwsh")
-                                .args(["-NoProfile", "-Command", &cmd])
-                                .stdin(if stdout { std::process::Stdio::piped() } else { std::process::Stdio::null() })
-                                .stdout(if stdin { std::process::Stdio::piped() } else { std::process::Stdio::null() })
-                                .stderr(std::process::Stdio::null())
-                                .spawn()
-                                .ok();
-                            
-                            app.pipe_panes.push(PipePaneState {
-                                pane_id,
-                                process,
-                                stdin,
-                                stdout,
-                            });
                         }
+                    } else if toggle && has_existing {
+                        // -o flag with existing pipe: close it (toggle off), don't start new
+                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
+                                let _ = proc.kill();
+                            }
+                            app.pipe_panes.remove(idx);
+                        }
+                    } else {
+                        // Close any existing pipe first (replace)
+                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
+                                let _ = proc.kill();
+                            }
+                            app.pipe_panes.remove(idx);
+                        }
+                        // Start new pipe
+                        #[cfg(windows)]
+                        let process = std::process::Command::new("pwsh")
+                            .args(["-NoProfile", "-Command", &cmd])
+                            .stdin(if stdout { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                            .stdout(if stdin { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .ok();
+                        #[cfg(not(windows))]
+                        let process = std::process::Command::new("sh")
+                            .args(["-c", &cmd])
+                            .stdin(if stdout { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                            .stdout(if stdin { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .ok();
+                        
+                        app.pipe_panes.push(PipePaneState {
+                            pane_id,
+                            process,
+                            stdin,
+                            stdout,
+                        });
                     }
                 }
                 CtrlReq::SelectLayout(layout) => {
@@ -1597,6 +1746,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
                     let _ = std::fs::remove_file(&keypath);
+                    crate::types::shutdown_persistent_streams();
                     std::process::exit(0);
                 }
                 CtrlReq::WaitFor(channel, op) => {
@@ -1645,6 +1795,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 let pty_size = portable_pty::PtySize { rows: height.saturating_sub(2), cols: width.saturating_sub(2), pixel_width: 0, pixel_height: 0 };
                                 let pair = pty_sys.openpty(pty_size).ok()?;
                                 let mut cmd_builder = portable_pty::CommandBuilder::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                                if let Ok(dir) = std::env::current_dir() { cmd_builder.cwd(dir); }
                                 if cfg!(windows) { cmd_builder.args(["-NoProfile", "-Command", &command]); } else { cmd_builder.args(["-c", &command]); }
                                 let child = pair.slave.spawn_command(cmd_builder).ok()?;
                                 // Close the slave handle immediately – required for ConPTY.
@@ -1795,17 +1946,63 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     state_dirty = true;
                 }
             }
+            // Log any active_idx change for debugging window-switch issues
+            if app.active_idx != _prev_active_idx && crate::debug_log::server_log_enabled() {
+                crate::debug_log::server_log("switch", &format!(
+                    "active_idx changed {} -> {} by req={} hook={:?}",
+                    _prev_active_idx, app.active_idx, _req_tag, hook_event));
+            }
             // Fire any hooks registered for the event that just occurred
             if let Some(event) = hook_event {
+                let _pre_hook_idx = app.active_idx;
                 let cmds: Vec<String> = app.hooks.get(event).cloned().unwrap_or_default();
                 for cmd in cmds {
                     parse_config_line(&mut app, &cmd);
+                }
+                // Check if the hook itself changed active_idx
+                if app.active_idx != _pre_hook_idx && crate::debug_log::server_log_enabled() {
+                    crate::debug_log::server_log("switch", &format!(
+                        "active_idx changed {} -> {} by HOOK event={}",
+                        _pre_hook_idx, app.active_idx, event));
+                }
+            }
+            // Restore temporary -t focus after non-temp command completes
+            if !is_temp_focus {
+                if let Some((restore_idx, restore_path)) = temp_focus_restore.take() {
+                    if restore_idx < app.windows.len() {
+                        app.active_idx = restore_idx;
+                        app.windows[restore_idx].active_path = restore_path;
+                    }
                 }
             }
             if mutates_state {
                 state_dirty = true;
             }
         }
+                // Clean up any trailing temp focus at end of batch
+                if let Some((restore_idx, restore_path)) = temp_focus_restore {
+                    if restore_idx < app.windows.len() {
+                        app.active_idx = restore_idx;
+                        app.windows[restore_idx].active_path = restore_path;
+                    }
+                }
+            }
+        }
+        // ── Status-interval timer: fire hooks periodically ──
+        if app.status_interval > 0 {
+            let elapsed = app.last_status_interval_fire.elapsed().as_secs();
+            if elapsed >= app.status_interval {
+                app.last_status_interval_fire = std::time::Instant::now();
+                let _pre_status_idx = app.active_idx;
+                let cmds: Vec<String> = app.hooks.get("status-interval").cloned().unwrap_or_default();
+                for cmd in cmds {
+                    parse_config_line(&mut app, &cmd);
+                }
+                if app.active_idx != _pre_status_idx && crate::debug_log::server_log_enabled() {
+                    crate::debug_log::server_log("switch", &format!(
+                        "active_idx changed {} -> {} by status-interval hook",
+                        _pre_status_idx, app.active_idx));
+                }
             }
         }
         // Check if all windows/panes have exited
@@ -1820,9 +2017,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
             let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
             let _ = std::fs::remove_file(&keypath);
-            break;
+            // Explicitly shut down all persistent client sockets before
+            // exiting.  On Windows, process::exit(0) does not reliably
+            // deliver TCP RST on loopback sockets, leaving clients stuck
+            // in a blocking read_line() forever.
+            crate::types::shutdown_persistent_streams();
+            std::process::exit(0);
         }
         // recv_timeout already handles the wait; no additional sleep needed.
     }
+    #[allow(unreachable_code)]
     Ok(())
 }

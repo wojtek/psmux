@@ -583,12 +583,17 @@ pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
                 app.windows.remove(i);
                 any_pruned = true;
                 // Adjust active_idx after removing a window
+                let _old = app.active_idx;
                 if !app.windows.is_empty() {
                     if i < app.active_idx {
                         app.active_idx -= 1;
                     } else if app.active_idx >= app.windows.len() {
                         app.active_idx = app.windows.len() - 1;
                     }
+                }
+                if app.active_idx != _old {
+                    crate::debug_log::server_log("switch", &format!(
+                        "REAP: active_idx {} -> {} after removing window at index {}", _old, app.active_idx, i));
                 }
             }
         }

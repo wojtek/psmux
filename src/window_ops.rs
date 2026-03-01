@@ -5,10 +5,10 @@ use portable_pty::{PtySize, native_pty_system};
 use ratatui::prelude::*;
 
 use crate::types::{AppState, Mode, Pane, Node, LayoutKind, DragState, Window, FocusDir};
-use crate::tree::{active_pane_mut, compute_rects, compute_split_borders,
+use crate::tree::{active_pane, active_pane_mut, compute_rects, compute_split_borders,
     split_sizes_at, adjust_split_sizes, get_split_mut, resize_all_panes};
 use crate::pane::{detect_shell, build_default_shell, set_tmux_env};
-use crate::copy_mode::{scroll_copy_up, scroll_copy_down, yank_selection};
+use crate::copy_mode::{enter_copy_mode, exit_copy_mode, scroll_copy_up, scroll_copy_down, yank_selection};
 use crate::platform::mouse_inject;
 
 /// Mouse debug logger — writes to ~/.psmux/mouse_debug.log when enabled.
@@ -51,7 +51,7 @@ fn pane_inner_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
 }
 
 /// Write a mouse event to the child PTY using the encoding the child requested.
-fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
+pub fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
     match enc {
         vt100::MouseProtocolEncoding::Sgr => {
             let ch = if press { 'M' } else { 'm' };
@@ -76,7 +76,7 @@ fn write_mouse_event_remote(master: &mut dyn std::io::Write, button: u8, col: u1
 /// that ReadConsoleInput returns.  This works for apps like pstop, Far Manager, etc.
 fn inject_mouse(pane: &mut Pane, col: i16, row: i16, button_state: u32, event_flags: u32) -> bool {
     if pane.child_pid.is_none() {
-        pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
     }
     if let Some(pid) = pane.child_pid {
         mouse_inject::send_mouse_event(pid, col, row, button_state, event_flags, false)
@@ -92,16 +92,6 @@ fn is_vt_bridge(name: &str) -> bool {
     lower.contains("wsl") || lower.contains("ssh")
 }
 
-/// Query the pane's vt100 parser for the child's mouse protocol mode and encoding.
-fn pane_mouse_protocol(pane: &Pane) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
-    if let Ok(parser) = pane.term.lock() {
-        let s = parser.screen();
-        (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
-    } else {
-        (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
-    }
-}
-
 /// Check if the pane is likely running a fullscreen TUI app (htop, vim, etc.)
 /// by detecting alternate screen buffer usage.
 ///
@@ -109,7 +99,7 @@ fn pane_mouse_protocol(pane: &Pane) -> (vt100::MouseProtocolMode, vt100::MousePr
 /// so `screen.alternate_screen()` is always false.  Use the same heuristic
 /// as layout.rs: if the last row of the screen has non-blank content, the
 /// pane is running a fullscreen app.
-fn is_fullscreen_tui(pane: &Pane) -> bool {
+pub(crate) fn is_fullscreen_tui(pane: &Pane) -> bool {
     if let Ok(parser) = pane.term.lock() {
         let screen = parser.screen();
         // Fast check: if the parser reports alternate screen, trust it
@@ -151,6 +141,40 @@ fn is_fullscreen_tui(pane: &Pane) -> bool {
     false
 }
 
+/// Check if the child process in this pane has enabled mouse tracking
+/// (DECSET 1000/1002/1003) and therefore wants to receive scroll wheel events.
+///
+/// This is the same logic tmux uses: if mouse_protocol_mode != None, the
+/// child app (vim, htop, less -R, etc.) handles mouse itself, so psmux
+/// forwards scroll events to it.  If None (shell prompt), psmux enters
+/// copy mode on scroll-up, matching tmux behavior with `set -g mouse on`.
+///
+/// Note: ConPTY strips DECSET mouse mode escape sequences from the output
+/// stream, so for native Windows console apps `mouse_protocol_mode()` is
+/// always `None`.  This is correct: native Windows TUI apps receive mouse
+/// via Win32 MOUSE_EVENT injection (separate path), and shell prompts
+/// (PowerShell, cmd) don't want scroll events at all — scrollback is the
+/// right behavior.
+///
+/// For apps running through a VT bridge (WSL, SSH), the VT escape sequences
+/// DO pass through, so `mouse_protocol_mode()` correctly reflects the
+/// child's actual mouse tracking state.
+pub(crate) fn pane_wants_mouse(pane: &Pane) -> bool {
+    if let Ok(parser) = pane.term.lock() {
+        let screen = parser.screen();
+        // Primary check (tmux parity): did the child enable mouse protocol?
+        if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+            return true;
+        }
+        // Secondary check: alternate screen active (ConPTY may strip DECSET
+        // 1000 but some builds pass DECSET 1049h through).
+        if screen.alternate_screen() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect whether a pane has a VT bridge descendant (wsl.exe, ssh.exe, etc.)
 /// by walking the process tree.  Result is cached for 2 seconds per pane
 /// to avoid expensive CreateToolhelp32Snapshot on every mouse event.
@@ -163,7 +187,7 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
     }
     // Ensure child_pid is resolved
     if pane.child_pid.is_none() {
-        pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
     }
     let result = if let Some(pid) = pane.child_pid {
         crate::platform::process_info::has_vt_bridge_descendant(pid)
@@ -174,84 +198,120 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
     result
 }
 
-/// Inject a mouse event into a pane using the best available method.
+/// Detect whether the child's console has ENABLE_MOUSE_INPUT (0x0010) set.
 ///
-/// Strategy:
-///   1. If the vt100 parser detected mouse protocol (child sent DECSET 1000h),
-///      use VT injection with the child's requested encoding.
-///   2. If the process tree contains a VT bridge (wsl.exe, ssh.exe, etc.)
-///      AND a fullscreen TUI app is running (alternate screen buffer active),
-///      inject SGR mouse as KEY_EVENT records via WriteConsoleInputW.
-///      This bypasses ConPTY entirely — the raw escape sequence characters
-///      reach wsl.exe → Linux PTY → htop/vim/etc.
-///      When not in fullscreen mode (bash prompt), skip VT injection to
-///      prevent garbage characters.  Fall back to Win32 MOUSE_EVENT which
-///      is harmlessly ignored by wsl.exe.
-///   3. Otherwise (native console apps like pstop), use Win32 console injection
-///      which directly writes MOUSE_EVENT records to the console input buffer.
-fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool,
-                          button_state: u32, event_flags: u32, win_name: &str) {
-    // Read mouse protocol mode under parser lock and write VT sequence
-    // atomically to prevent TOCTOU race where the child disables mouse
-    // between the check and the write (which would cause escape sequences
-    // to appear as visible text in the pane).
-    let vt_injected = if let Ok(parser) = pane.term.lock() {
-        let s = parser.screen();
-        let mode = s.mouse_protocol_mode();
-        let enc = s.mouse_protocol_encoding();
-        if mode != vt100::MouseProtocolMode::None {
-            let vt_col = (col + 1).max(1) as u16;
-            let vt_row = (row + 1).max(1) as u16;
-            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} mode={:?} enc={:?} -> VT injection",
-                col, row, vt_button, press, win_name, mode, enc));
-            // Hold parser lock during write to prevent reader thread from
-            // updating mode while we're mid-write.
-            drop(parser); // release lock before PTY write to avoid deadlock
-            write_mouse_event_remote(&mut pane.writer, vt_button, vt_col, vt_row, press, enc);
-            true
-        } else {
-            false
+/// When true, the child reads MOUSE_EVENT records via ReadConsoleInputW
+/// (crossterm/ratatui apps like pstop, claude).  When false, the child
+/// reads input as text / VT sequences (nvim, vim, opencode).
+///
+/// Result is cached for 2 seconds per pane.
+fn detect_mouse_input(pane: &mut Pane) -> bool {
+    if let Some((ts, cached)) = pane.mouse_input_cache {
+        if ts.elapsed().as_secs() < 2 {
+            return cached;
         }
+    }
+    if pane.child_pid.is_none() {
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
+    }
+    let result = if let Some(pid) = pane.child_pid {
+        mouse_inject::query_mouse_input_enabled(pid).unwrap_or(false)
     } else {
         false
     };
+    pane.mouse_input_cache = Some((std::time::Instant::now(), result));
+    result
+}
 
-    if vt_injected { return; }
+/// Helper: inject SGR mouse escape sequence as KEY_EVENT records.
+fn inject_sgr_mouse(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool) -> bool {
+    let vt_col = (col + 1).max(1) as u16;
+    let vt_row = (row + 1).max(1) as u16;
+    let ch = if press { 'M' } else { 'm' };
+    let sgr_seq = format!("\x1b[<{};{};{}{}", vt_button, vt_col, vt_row, ch);
+    mouse_log(&format!("  -> Console VT injection (KEY_EVENTs): seq={:?}", sgr_seq));
+    if pane.child_pid.is_none() {
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
+    }
+    if let Some(pid) = pane.child_pid {
+        let ok = mouse_inject::send_vt_sequence(pid, sgr_seq.as_bytes());
+        mouse_log(&format!("  -> Console VT inject result: {}", ok));
+        ok
+    } else {
+        false
+    }
+}
 
+/// Inject a mouse event into a pane using the best available method.
+///
+/// Strategy:
+///
+///   1. If a VT bridge (wsl, ssh) is detected AND a fullscreen TUI is
+///      running, inject SGR mouse as KEY_EVENT records.  This bypasses
+///      ConPTY and delivers raw escape sequences to the Linux PTY.
+///
+///   2. For native ConPTY fullscreen TUI apps, check ENABLE_MOUSE_INPUT
+///      on the child's console to distinguish between two app categories:
+///
+///      a. Console-API apps (crossterm/ratatui — pstop, claude, etc.)
+///         set ENABLE_MOUSE_INPUT and read MOUSE_EVENT records via
+///         ReadConsoleInputW.  → inject Win32 MOUSE_EVENT records.
+///
+///      b. VT-based apps (nvim, vim, opencode, etc.) do NOT set
+///         ENABLE_MOUSE_INPUT.  They read input as text (ReadConsole
+///         / ReadFile) and expect VT SGR mouse sequences.  ConPTY
+///         does NOT translate Win32 MOUSE_EVENT records into VT mouse
+///         sequences, so these apps never receive wheel/click events
+///         through the MOUSE_EVENT path.  → inject SGR mouse as
+///         KEY_EVENT records.  (fixes #60)
+///
+///   3. For shell prompts (no fullscreen TUI), inject Win32 MOUSE_EVENT
+///      records.  Shells don't consume MOUSE_EVENT, so this is harmless.
+pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool,
+                          button_state: u32, event_flags: u32, win_name: &str) {
     let vt_bridge = detect_vt_bridge(pane);
+    let fullscreen = is_fullscreen_tui(pane);
 
-    if vt_bridge {
-        // VT bridge (WSL/SSH): check if a fullscreen TUI app is running
-        let fullscreen = is_fullscreen_tui(pane);
-        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true fullscreen={}",
-            col, row, vt_button, press, win_name, fullscreen));
-        if fullscreen {
-            // TUI app detected (htop, vim, etc.) — inject SGR mouse as KEY_EVENTs.
-            // This bypasses ConPTY and delivers raw escape sequence characters to
-            // wsl.exe → Linux PTY → the TUI app.
-            let vt_col = (col + 1).max(1) as u16;
-            let vt_row = (row + 1).max(1) as u16;
-            let ch = if press { 'M' } else { 'm' };
-            let sgr_seq = format!("\x1b[<{};{};{}{}", vt_button, vt_col, vt_row, ch);
-            mouse_log(&format!("  -> Console VT injection (KEY_EVENTs): seq={:?}", sgr_seq));
-            if pane.child_pid.is_none() {
-                pane.child_pid = unsafe { mouse_inject::get_child_pid(&*pane.child) };
-            }
-            if let Some(pid) = pane.child_pid {
-                let ok = mouse_inject::send_vt_sequence(pid, sgr_seq.as_bytes());
-                mouse_log(&format!("  -> Console VT inject result: {}", ok));
-            }
-        } else {
-            // Shell prompt (no fullscreen TUI) — use Win32 MOUSE_EVENT injection.
-            // wsl.exe ignores MOUSE_EVENT records (it uses ReadFile, not ReadConsoleInput),
-            // so this is harmless — no garbage characters are printed.
-            mouse_log(&format!("  -> Win32 injection (vt_bridge fallback): col={} row={} btn=0x{:X} flags=0x{:X}", col, row, button_state, event_flags));
+    if fullscreen && vt_bridge {
+        // VT bridge (WSL/SSH) with fullscreen TUI — always use SGR injection.
+        // This bypasses ConPTY entirely, delivering the escape sequence to
+        // wsl.exe → Linux PTY → the TUI app.
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true fullscreen=true -> SGR VT injection",
+            col, row, vt_button, press, win_name));
+        inject_sgr_mouse(pane, col, row, vt_button, press);
+    } else if fullscreen {
+        // Native ConPTY fullscreen TUI — check ENABLE_MOUSE_INPUT to
+        // determine injection method.  (fixes #60)
+        let has_mouse_input = detect_mouse_input(pane);
+        if has_mouse_input {
+            // Console-API app (crossterm/ratatui: pstop, claude, etc.)
+            // Uses ReadConsoleInputW with ENABLE_MOUSE_INPUT to read
+            // MOUSE_EVENT records.  SGR injection would appear as garbage.
+            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} fullscreen=true MOUSE_INPUT=true -> Win32 MOUSE_EVENT (console-API TUI)",
+                col, row, vt_button, press, win_name));
             let ok = inject_mouse(pane, col, row, button_state, event_flags);
             mouse_log(&format!("  -> Win32 inject result: {}", ok));
+        } else {
+            // VT-based app (nvim, vim, opencode, etc.)
+            // Does NOT set ENABLE_MOUSE_INPUT; reads input as text/VT.
+            // Win32 MOUSE_EVENT injection doesn't reach these apps because
+            // ConPTY doesn't translate MOUSE_EVENT to VT mouse sequences.
+            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} fullscreen=true MOUSE_INPUT=false -> SGR VT injection (VT-based TUI)",
+                col, row, vt_button, press, win_name));
+            inject_sgr_mouse(pane, col, row, vt_button, press);
         }
+    } else if vt_bridge {
+        // VT bridge at shell prompt — use Win32 MOUSE_EVENT injection.
+        // wsl.exe ignores MOUSE_EVENT records, so this is harmless.
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true fullscreen=false -> Win32 MOUSE_EVENT (vt_bridge shell)",
+            col, row, vt_button, press, win_name));
+        let ok = inject_mouse(pane, col, row, button_state, event_flags);
+        mouse_log(&format!("  -> Win32 inject result: {}", ok));
     } else {
-        // Native console app — Win32 console injection only
-        mouse_log(&format!("inject_mouse_combined: col={} row={} win={} -> Win32 native", col, row, win_name));
+        // Native ConPTY child at shell prompt — use Win32 MOUSE_EVENT injection.
+        // Shells don't consume MOUSE_EVENT, so this is harmless.
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} -> Win32 MOUSE_EVENT (native ConPTY shell)",
+            col, row, vt_button, press, win_name));
         let ok = inject_mouse(pane, col, row, button_state, event_flags);
         mouse_log(&format!("  -> Win32 inject result: {}", ok));
     }
@@ -326,6 +386,11 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     if y == status_row {
         for &(win_idx, x_start, x_end) in app.tab_positions.iter() {
             if x >= x_start && x < x_end && win_idx < app.windows.len() {
+                if win_idx != app.active_idx {
+                    crate::debug_log::server_log("switch", &format!(
+                        "TAB CLICK: active_idx {} -> {} x={} y={} status_row={} tab_range={}..{}",
+                        app.active_idx, win_idx, x, y, status_row, x_start, x_end));
+                }
                 app.last_window_idx = app.active_idx;
                 app.active_idx = win_idx;
                 return;
@@ -345,10 +410,12 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         }
     }
 
-    if matches!(app.mode, Mode::CopyMode) {
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
         if let Some(area) = active_area {
             let (row, col) = copy_cell_for_area(area, x, y);
-            app.copy_anchor = Some((row, col));
+            // Single click positions cursor, clears selection (tmux parity).
+            // Selection only starts on drag.
+            app.copy_anchor = None;
             app.copy_pos = Some((row, col));
         }
         return;
@@ -387,12 +454,14 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    if matches!(app.mode, Mode::CopyMode) {
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
         if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
             win.active_path = path.clone();
             let (row, col) = copy_cell_for_area(*area, x, y);
             if app.copy_anchor.is_none() {
                 app.copy_anchor = Some((row, col));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((row, col));
         }
@@ -419,16 +488,22 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    if matches!(app.mode, Mode::CopyMode) {
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
         if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
             win.active_path = path.clone();
             let (row, col) = copy_cell_for_area(*area, x, y);
             if app.copy_anchor.is_none() {
                 app.copy_anchor = Some((row, col));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
             }
             app.copy_pos = Some((row, col));
         }
-        let _ = yank_selection(app);
+        // Auto-yank if selection exists (anchor != pos)
+        if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+            if a != p {
+                let _ = yank_selection(app);
+            }
+        }
         return;
     }
 
@@ -501,39 +576,100 @@ fn copy_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
 }
 
 fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
-    if matches!(app.mode, Mode::CopyMode) {
-        if up { scroll_copy_up(app, 3); } else { scroll_copy_down(app, 3); }
+    let mode_str = match &app.mode {
+        Mode::Passthrough => "Passthrough",
+        Mode::CopyMode => "CopyMode",
+        Mode::CopySearch { .. } => "CopySearch",
+        _ => "Other",
+    };
+    mouse_log(&format!("remote_scroll_wheel: x={} y={} up={} mode={}", x, y, up, mode_str));
+
+    // Handle scroll while already in copy mode
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+        mouse_log("  -> already in copy mode, scrolling within");
+        if up {
+            scroll_copy_up(app, 3);
+        } else {
+            scroll_copy_down(app, 3);
+            // Auto-exit copy mode when scrolled back to live output
+            if app.copy_scroll_offset == 0 && app.copy_anchor.is_none() {
+                exit_copy_mode(app);
+            }
+        }
         return;
     }
 
-    let win = &mut app.windows[app.active_idx];
-    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-    compute_rects(&win.root, app.last_window_area, &mut rects);
+    // Determine target pane, switch focus, and check if child is in alternate screen.
+    //
+    // IMPORTANT (tmux parity): For scroll events, we ONLY check alternate_screen()
+    // to decide whether to forward to the child or enter copy mode.
+    // We do NOT use pane_wants_mouse() / mouse_protocol_mode() because:
+    //   - PSReadLine on ConPTY spuriously enables AnyMotion mouse tracking
+    //     when it receives Win32 MOUSE_EVENT injections (e.g. from client-side
+    //     text selection clicks).
+    //   - tmux itself only checks alternate screen for scroll, not mouse tracking mode.
+    //   - Normal shells (PowerShell, cmd, bash) should scroll into copy mode.
+    //   - TUI apps (htop, vim, etc.) are always in alternate screen.
+    let (child_in_alt_screen, target_area_opt, sgr_btn, button_state) = {
+        let win = &mut app.windows[app.active_idx];
+        let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+        compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    let mut target_area: Option<Rect> = None;
-    for (path, area) in &rects {
-        if area.contains(ratatui::layout::Position { x, y }) {
-            win.active_path = path.clone();
-            target_area = Some(*area);
-            break;
+        let mut target_area: Option<Rect> = None;
+        for (path, area) in &rects {
+            if area.contains(ratatui::layout::Position { x, y }) {
+                win.active_path = path.clone();
+                target_area = Some(*area);
+                break;
+            }
         }
-    }
-    if target_area.is_none() {
-        target_area = rects
-            .iter()
-            .find(|(path, _)| *path == win.active_path)
-            .map(|(_, area)| *area);
-    }
+        if target_area.is_none() {
+            target_area = rects
+                .iter()
+                .find(|(path, _)| *path == win.active_path)
+                .map(|(_, area)| *area);
+        }
 
-    let (col, row) = target_area.map_or((0, 0), |area| pane_inner_cell_0based(area, x, y));
-    let win_name = win.name.clone();
-    let sgr_btn: u8 = if up { 64 } else { 65 };
-    let wheel_delta: i16 = if up { 120 } else { -120 };
-    let button_state = ((wheel_delta as i32) << 16) as u32;
-    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-        inject_mouse_combined(p, col, row, sgr_btn, true,
-            button_state, mouse_inject::MOUSE_WHEELED, &win_name);
+        let alt = active_pane(&win.root, &win.active_path)
+            .map_or(false, |p| {
+                if let Ok(parser) = p.term.lock() {
+                    if parser.screen().alternate_screen() {
+                        return true;
+                    }
+                }
+                // Fallback heuristic: ConPTY may strip DECSET 1049h for native
+                // children so alternate_screen() returns false even when a TUI
+                // app (nvim, opencode, etc.) is running.  Use the fullscreen
+                // content heuristic as a fallback.  (fixes #60)
+                is_fullscreen_tui(p)
+            });
+        let sgr_btn: u8 = if up { 64 } else { 65 };
+        let wheel_delta: i16 = if up { 120 } else { -120 };
+        let bs = ((wheel_delta as i32) << 16) as u32;
+        (alt, target_area, sgr_btn, bs)
+    };
+
+    mouse_log(&format!("  -> alt_screen={}", child_in_alt_screen));
+
+    if child_in_alt_screen {
+        // Forward scroll to child TUI app (alternate screen = real TUI)
+        mouse_log("  -> forwarding scroll to child TUI (alt screen)");
+        let win = &mut app.windows[app.active_idx];
+        let (col, row) = target_area_opt.map_or((0, 0), |area| pane_inner_cell_0based(area, x, y));
+        let win_name = win.name.clone();
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+            inject_mouse_combined(p, col, row, sgr_btn, true,
+                button_state, mouse_inject::MOUSE_WHEELED, &win_name);
+        }
+    } else if up {
+        // Shell prompt — auto-enter copy mode and scroll up (tmux parity)
+        mouse_log("  -> entering copy mode (shell scroll-up)");
+        enter_copy_mode(app);
+        scroll_copy_up(app, 3);
+    } else {
+        mouse_log("  -> scroll-down at shell (no-op)");
     }
+    // Scroll down at shell prompt without copy mode is a no-op
 }
 
 pub fn remote_scroll_up(app: &mut AppState, x: u16, y: u16) { remote_scroll_wheel(app, x, y, true); }
@@ -551,7 +687,10 @@ pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
     let Some(ai) = active_idx else { return; };
     let (_, arect) = &rects[ai];
     
-    if let Some(ni) = crate::input::find_best_pane_in_direction(&rects, ai, arect, dir) {
+    // Try direct neighbour first, then wrap to opposite edge (tmux parity #61)
+    let target = crate::input::find_best_pane_in_direction(&rects, ai, arect, dir)
+        .or_else(|| crate::input::find_wrap_target(&rects, ai, arect, dir));
+    if let Some(ni) = target {
         win.active_path = rects[ni].0.clone();
     }
 }
@@ -735,8 +874,10 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::pane::CURSOR_SHAPE_UNSET));
+    let cs_writer = cursor_shape.clone();
     
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer);
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer);
     
     let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -746,7 +887,11 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.child = child;
     pane.term = term;
     pane.data_version = data_version;
+    pane.cursor_shape = cursor_shape;
     pane.child_pid = None;
+    pane.vt_bridge_cache = None;
+    pane.vti_mode_cache = None;
+    pane.mouse_input_cache = None;
     pane.dead = false;
     
     Ok(())

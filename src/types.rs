@@ -33,6 +33,19 @@ pub struct Pane {
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,
+    /// Cached ENABLE_VIRTUAL_TERMINAL_INPUT query result (for mouse injection).
+    /// When true, the child's console input has VTI set, meaning VT mouse
+    /// sequences can be delivered.  Refreshed every 2 seconds.
+    pub vti_mode_cache: Option<(Instant, bool)>,
+    /// Cached ENABLE_MOUSE_INPUT query result (for mouse injection heuristic).
+    /// When true, the child's console has ENABLE_MOUSE_INPUT set, meaning it
+    /// reads MOUSE_EVENT records via ReadConsoleInputW (crossterm/ratatui apps).
+    /// When false, the child expects VT SGR mouse sequences (nvim, vim).
+    /// Refreshed every 2 seconds.
+    pub mouse_input_cache: Option<(Instant, bool)>,
+    /// Last cursor shape requested by the child process via DECSCUSR (`\x1b[N q`).
+    /// 0 = no override (use PSMUX_CURSOR_STYLE default), 1-6 = DECSCUSR values.
+    pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Per-pane copy mode state (tmux-style pane-local copy mode).
     /// Some(_) when this pane is in copy mode, None otherwise.
     pub copy_state: Option<CopyModeState>,
@@ -341,6 +354,8 @@ pub struct AppState {
     pub command_history_idx: usize,
     /// status-interval: seconds between status-line refreshes (default 15)
     pub status_interval: u64,
+    /// Last time the status-interval hook was fired
+    pub last_status_interval_fire: std::time::Instant,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
     /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
@@ -365,6 +380,8 @@ pub struct AppState {
     pub command_aliases: std::collections::HashMap<String, String>,
     /// set-clipboard: "on", "off", "external" (default "on")
     pub set_clipboard: String,
+    /// One-shot clipboard text to be sent to the client via OSC 52 (set by yank, consumed by dump-state).
+    pub clipboard_osc52: Option<String>,
 }
 
 impl AppState {
@@ -468,6 +485,7 @@ impl AppState {
             command_history: Vec::new(),
             command_history_idx: 0,
             status_interval: 15,
+            last_status_interval_fire: std::time::Instant::now(),
             status_justify: "left".to_string(),
             main_pane_width: 0,
             main_pane_height: 0,
@@ -480,6 +498,7 @@ impl AppState {
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
             set_clipboard: "on".to_string(),
+            clipboard_osc52: None,
         }
     }
 
@@ -544,8 +563,13 @@ pub enum CtrlReq {
     CapturePane(mpsc::Sender<String>),
     CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>),
     FocusWindow(usize),
+    /// Temporary focus for -t targeting: server saves/restores active_idx
+    FocusWindowTemp(usize),
     FocusPane(usize),
     FocusPaneByIndex(usize),
+    /// Temporary pane focus for -t targeting
+    FocusPaneTemp(usize),
+    FocusPaneByIndexTemp(usize),
     SessionInfo(mpsc::Sender<String>),
     CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>),
     ClientAttach,
@@ -561,6 +585,7 @@ pub enum CtrlReq {
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
+    CopyRectToggle,
     ClientSize(u16, u16),
     FocusPaneCmd(usize),
     FocusWindowCmd(usize),
@@ -626,7 +651,7 @@ pub enum CtrlReq {
     UnlinkWindow,
     FindWindow(mpsc::Sender<String>, String),
     MovePane(usize),
-    PipePane(String, bool, bool),
+    PipePane(String, bool, bool, bool),
     SelectLayout(String),
     NextLayout,
     ListClients(mpsc::Sender<String>),
@@ -669,6 +694,31 @@ pub enum CtrlReq {
 /// The server loop checks this to use a shorter recv_timeout, reducing
 /// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
 pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tracked persistent client TCP streams.
+/// Connection handlers register clones here so the server can explicitly
+/// `shutdown()` them before `process::exit(0)`.  Without this, Windows
+/// does not reliably deliver TCP RST on loopback sockets when a process
+/// exits, leaving the client's blocking `read_line()` stuck forever.
+static PERSISTENT_STREAMS: std::sync::Mutex<Vec<std::net::TcpStream>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a persistent client stream (call from connection handler).
+pub fn register_persistent_stream(stream: &std::net::TcpStream) {
+    if let Ok(cloned) = stream.try_clone() {
+        if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
+            v.push(cloned);
+        }
+    }
+}
+
+/// Shut down all tracked persistent client streams so their readers get EOF.
+pub fn shutdown_persistent_streams() {
+    if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
+        for s in v.drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
 
 /// Wait-for operation types
 #[derive(Clone, Copy)]

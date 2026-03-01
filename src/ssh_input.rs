@@ -135,8 +135,10 @@ pub fn send_mouse_enable() {
         extern "system" {
             fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
             fn GetConsoleMode(h: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+            fn SetConsoleMode(h: *mut std::ffi::c_void, mode: u32) -> i32;
         }
         const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
         let h = GetStdHandle(STD_OUTPUT_HANDLE);
         if !h.is_null() && h != (-1isize) as *mut std::ffi::c_void {
             let mut mode: u32 = 0;
@@ -146,6 +148,28 @@ pub fn send_mouse_enable() {
                     "stdout console mode: 0x{:04X} VTP={} (pass-through={})",
                     mode, vtp, if vtp { "likely" } else { "NO" },
                 ));
+            }
+        }
+        // Verify and restore VTI + MOUSE_INPUT on stdin — these can be
+        // cleared by crossterm's raw_mode toggle or ConPTY internal resets.
+        let hin = GetStdHandle(STD_INPUT_HANDLE);
+        if !hin.is_null() && hin != (-1isize) as *mut std::ffi::c_void {
+            let mut mode: u32 = 0;
+            if GetConsoleMode(hin, &mut mode) != 0 {
+                let vti = mode & 0x0200 != 0;
+                let mouse = mode & 0x0010 != 0;
+                ssh_debug_log(&format!(
+                    "stdin console mode: 0x{:04X} VTI={} MOUSE={}",
+                    mode, vti, mouse,
+                ));
+                if !vti || !mouse {
+                    let fixed = mode | 0x0200 | 0x0010; // VTI + ENABLE_MOUSE_INPUT
+                    SetConsoleMode(hin, fixed);
+                    ssh_debug_log(&format!(
+                        "stdin mode restored: 0x{:04X} -> 0x{:04X}",
+                        mode, fixed,
+                    ));
+                }
             }
         }
     }
@@ -351,6 +375,8 @@ enum PS {
     PasteEsc,   // received \x1b inside paste
     PasteBrk,   // received \x1b[ inside paste
     PasteNum,   // accumulating digits inside paste CSI
+    Osc,        // inside \x1b] … waiting for ST (\x07 or \x1b\\)
+    OscEsc,     // received \x1b inside OSC — might be ST
 }
 
 struct VtParser {
@@ -370,6 +396,8 @@ struct VtParser {
     x10_buf: [u8; 3],
     /// Bracketed-paste text accumulator.
     paste: String,
+    /// OSC sequence accumulator (e.g. for OSC 52 clipboard responses).
+    osc: String,
     /// Pending high surrogate for UTF-16 decoding.
     hi_sur: Option<u16>,
 }
@@ -386,6 +414,7 @@ impl VtParser {
             x10_n: 0,
             x10_buf: [0; 3],
             paste: String::new(),
+            osc: String::new(),
             hi_sur: None,
         }
     }
@@ -413,6 +442,8 @@ impl VtParser {
             PS::PasteEsc => self.on_paste_esc(ch, emit),
             PS::PasteBrk => self.on_paste_brk(ch, emit),
             PS::PasteNum => self.on_paste_num(ch, emit),
+            PS::Osc      => self.on_osc(ch, emit),
+            PS::OscEsc   => self.on_osc_esc(ch, emit),
         }
     }
 
@@ -480,6 +511,11 @@ impl VtParser {
             '\x1b' => {
                 // Double-Esc → emit one Escape, stay in Escape state.
                 emit(make_key(KeyCode::Esc, KeyModifiers::empty()));
+            }
+            ']' => {
+                // OSC sequence start (\x1b])
+                self.osc.clear();
+                self.state = PS::Osc;
             }
             c if c >= ' ' && c <= '~' => {
                 // Alt + printable character.
@@ -850,6 +886,62 @@ impl VtParser {
             self.state = PS::Paste;
         }
     }
+
+    // ── OSC (Operating System Command) ───────────────────────────────────
+    //
+    // Accumulates \x1b] ... ST where ST is \x07 (BEL) or \x1b\\.
+    // Used to parse OSC 52 clipboard responses from the client terminal.
+
+    fn on_osc<F: FnMut(Event)>(&mut self, ch: char, emit: &mut F) {
+        match ch {
+            '\x07' => {
+                // ST (BEL) — dispatch OSC
+                self.dispatch_osc(emit);
+                self.state = PS::Ground;
+            }
+            '\x1b' => {
+                // Possible start of ST (\x1b\\)
+                self.state = PS::OscEsc;
+            }
+            c => {
+                // Safety limit: 128 KB
+                if self.osc.len() < 131072 {
+                    self.osc.push(c);
+                }
+            }
+        }
+    }
+
+    fn on_osc_esc<F: FnMut(Event)>(&mut self, ch: char, emit: &mut F) {
+        if ch == '\\' {
+            // ST (\x1b\\) — dispatch OSC
+            self.dispatch_osc(emit);
+            self.state = PS::Ground;
+        } else {
+            // Not ST — abort OSC, re-process as new escape sequence
+            self.osc.clear();
+            self.state = PS::Escape;
+            self.on_escape(ch, emit);
+        }
+    }
+
+    fn dispatch_osc<F: FnMut(Event)>(&self, emit: &mut F) {
+        // OSC 52 clipboard response: "52;<selection>;<base64data>"
+        if let Some(rest) = self.osc.strip_prefix("52;") {
+            if let Some(sc_idx) = rest.find(';') {
+                let data = &rest[sc_idx + 1..];
+                // Ignore queries ("?") and empty responses
+                if data != "?" && !data.is_empty() {
+                    if let Some(text) = crate::util::base64_decode(data) {
+                        if !text.is_empty() {
+                            emit(Event::Paste(text));
+                        }
+                    }
+                }
+            }
+        }
+        // All other OSC sequences silently discarded
+    }
 }
 
 // ─── VK-code → KeyCode mapping (Windows Console API) ─────────────────────────
@@ -1216,6 +1308,16 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                             "heartbeat: loops={} records={} chars={} vk={} mouse={}",
                             loop_count, total_records, key_char_count, key_vk_count, mouse_count,
                         ));
+                        // Verify VTI is still set — ConPTY or other processes can
+                        // clear it, which silently breaks mouse input over SSH.
+                        let mut cur_mode: u32 = 0;
+                        if unsafe { GetConsoleMode(handle, &mut cur_mode) } != 0 {
+                            if cur_mode & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
+                                ssh_debug_log("WARNING: VTI cleared! Re-enabling...");
+                                let fixed = cur_mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_MOUSE_INPUT;
+                                unsafe { SetConsoleMode(handle, fixed) };
+                            }
+                        }
                     }
                     // Flush pending Esc (if any) as a standalone keypress.
                     parser.flush_escape(&mut |evt| {

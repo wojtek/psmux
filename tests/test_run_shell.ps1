@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Continue"
-$psmux = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$psmux = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $psmux)) { $psmux = "$PSScriptRoot\..\target\debug\psmux.exe" }
 
 # Clean up first
 taskkill /f /im psmux.exe 2>$null

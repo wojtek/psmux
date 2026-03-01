@@ -117,6 +117,20 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     continue;
                 }
             }
+            if bytes[i + 1] == b'(' {
+                // #(command) — shell command execution (tmux compat)
+                if let Some(end) = fmt[i + 2..].find(')') {
+                    let cmd = &fmt[i + 2..i + 2 + end];
+                    let output = run_shell_command(cmd);
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&output));
+                    } else {
+                        result.push_str(&output);
+                    }
+                    i = i + 2 + end + 1;
+                    continue;
+                }
+            }
             if bytes[i + 1] == b',' {
                 // Escaped comma inside conditional branches
                 result.push(',');
@@ -186,8 +200,14 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 _ => {}
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        // Advance by full UTF-8 character (not single byte) to preserve
+        // multi-byte chars like ▶ (U+25B6, 3 bytes) and ◀ (U+25C0).
+        if let Some(ch) = fmt[i..].chars().next() {
+            result.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
     }
     // Expand strftime %-sequences only if the ORIGINAL format contained '%'
     if has_strftime && result.contains('%') {
@@ -203,6 +223,25 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
         // On error, keep the pre-strftime result as-is
     }
     result
+}
+
+/// Execute a shell command and return its stdout (trimmed).
+/// Used for `#(command)` expansion (tmux compatibility).
+/// Caches results for the lifetime of a single format expansion cycle to
+/// avoid repeated subprocess spawning on every refresh.
+fn run_shell_command(cmd: &str) -> String {
+    use std::process::Command;
+    let output = if cfg!(windows) {
+        Command::new("cmd").args(["/C", cmd]).output()
+    } else {
+        Command::new("sh").args(["-c", cmd]).output()
+    };
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Escape '%' to '%%' in expanded variable content so chrono's strftime
@@ -717,6 +756,11 @@ fn expand_var_or_format(target: &str, app: &AppState, win_idx: usize) -> String 
 }
 
 /// Look up a tmux option by name.
+/// Public wrapper for lookup_option so config.rs can use it for -o flag check.
+pub fn lookup_option_pub(name: &str, app: &AppState) -> Option<String> {
+    lookup_option(name, app)
+}
+
 fn lookup_option(name: &str, app: &AppState) -> Option<String> {
     if name.starts_with('@') {
         return app.environment.get(name).cloned();
@@ -768,7 +812,18 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "monitor-silence" => Some(app.monitor_silence.to_string()),
         "bell-action" => Some(app.bell_action.clone()),
         "visual-bell" => Some(if app.visual_bell { "on".into() } else { "off".into() }),
-        _ => app.environment.get(name).cloned(),
+        _ => {
+            // Try exact name first, then @name for plugin user-option compat
+            // (plugins store @cpu_percentage but format strings use #{cpu_percentage})
+            app.environment.get(name).cloned()
+                .or_else(|| {
+                    if !name.starts_with('@') {
+                        app.environment.get(&format!("@{}", name)).cloned()
+                    } else {
+                        None
+                    }
+                })
+        }
     }
 }
 
@@ -1310,6 +1365,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         // ── Server ──
         "host" | "hostname" => hostname_cached(),
         "host_short" => { let h = hostname_cached(); h.split('.').next().unwrap_or(&h).to_string() }
+        "user" | "username" => env::var("USERNAME").or_else(|_| env::var("USER")).unwrap_or_else(|_| "unknown".into()),
         "pid" | "server_pid" => std::process::id().to_string(),
         "version" => VERSION.to_string(),
         "start_time" => app.created_at.timestamp().to_string(),
@@ -1340,6 +1396,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "origin_flag" | "insert_flag" | "keypad_cursor_flag" | "keypad_flag" => "0".into(),
         "wrap_flag" => "1".into(),
         "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
+        "current_file" => crate::config::current_config_file(),
 
         // Anything else: try as option, then env
         _ => {
@@ -1382,7 +1439,8 @@ fn split_at_depth0(s: &str, delim: u8) -> Vec<String> {
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0;
-    let mut depth = 0usize;
+    let mut depth = 0usize;       // #{...} nesting depth
+    let mut in_style = false;      // inside #[...] style directive
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
@@ -1395,12 +1453,23 @@ fn split_at_depth0(s: &str, delim: u8) -> Vec<String> {
             i += 1;
             continue;
         }
+        // Track #[...] style directives — commas inside are NOT delimiters
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'[' && !in_style {
+            in_style = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b']' && in_style {
+            in_style = false;
+            i += 1;
+            continue;
+        }
         // Handle #, (escaped delimiter) – skip over without splitting
         if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == delim && depth == 0 {
             i += 2;
             continue;
         }
-        if bytes[i] == delim && depth == 0 {
+        if bytes[i] == delim && depth == 0 && !in_style {
             parts.push(s[start..i].to_string());
             start = i + 1;
         }

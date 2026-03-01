@@ -17,7 +17,7 @@ use crate::types::{AppState, CtrlReq, LayoutKind, Mode};
 use crate::tree::{active_pane_mut, compute_rects, resize_all_panes, kill_all_children,
     find_window_index_by_id, focus_pane_by_id, focus_pane_by_index, reap_children};
 use crate::pane::{create_window, split_active_with_command, kill_active_pane};
-use crate::input::{handle_key, handle_mouse, send_text_to_active, send_key_to_active};
+use crate::input::{handle_key, handle_mouse, send_text_to_active, send_key_to_active, send_paste_to_active};
 use crate::rendering::{render_window, parse_status, centered_rect};
 use crate::style::{parse_tmux_style, parse_inline_styles, spans_visual_width};
 use crate::config::load_config;
@@ -124,12 +124,27 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     }
                     i += 1;
                 }
-                if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
-                if let Some(pid) = target_pane { 
-                    if pane_is_id {
-                        let _ = tx.send(CtrlReq::FocusPane(pid));
+                let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp");
+                if let Some(wid) = target_win {
+                    if is_focus_cmd {
+                        let _ = tx.send(CtrlReq::FocusWindow(wid));
                     } else {
-                        let _ = tx.send(CtrlReq::FocusPaneByIndex(pid));
+                        let _ = tx.send(CtrlReq::FocusWindowTemp(wid));
+                    }
+                }
+                if let Some(pid) = target_pane {
+                    if is_focus_cmd {
+                        if pane_is_id {
+                            let _ = tx.send(CtrlReq::FocusPane(pid));
+                        } else {
+                            let _ = tx.send(CtrlReq::FocusPaneByIndex(pid));
+                        }
+                    } else {
+                        if pane_is_id {
+                            let _ = tx.send(CtrlReq::FocusPaneTemp(pid));
+                        } else {
+                            let _ = tx.send(CtrlReq::FocusPaneByIndexTemp(pid));
+                        }
                     }
                 }
                 match cmd {
@@ -181,10 +196,11 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         terminal.draw(|f| {
             let area = f.area();
             let status_at_top = app.status_position == "top";
+            let status_h: u16 = if app.status_visible { 1 } else { 0 };
             let constraints = if status_at_top {
-                vec![Constraint::Length(1), Constraint::Min(1)]
+                vec![Constraint::Length(status_h), Constraint::Min(1)]
             } else {
-                vec![Constraint::Min(1), Constraint::Length(1)]
+                vec![Constraint::Min(1), Constraint::Length(status_h)]
             };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -247,7 +263,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let status_x = chunks[1].x;
             let mut cursor_x: u16 = status_x;
             for s in combined.iter() {
-                cursor_x += s.content.len() as u16;
+                cursor_x += unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16;
             }
 
             // Parse window-status styles
@@ -283,8 +299,11 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let sep = &app.window_status_separator;
             for (i, _w) in app.windows.iter().enumerate() {
                 if i > 0 {
-                    combined.push(Span::styled(sep.clone(), base_status_style));
-                    cursor_x += sep.len() as u16;
+                    // Parse inline styles in separator (e.g. "#[fg=#44475a]|")
+                    let sep_spans = parse_inline_styles(sep, base_status_style);
+                    let sep_w = spans_visual_width(&sep_spans) as u16;
+                    combined.extend(sep_spans);
+                    cursor_x += sep_w;
                 }
                 let fmt = if i == app.active_idx {
                     &app.window_status_current_format
@@ -368,7 +387,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         )));
                     }
                 }
-                let height = (lines.len() as u16 + 2).min(20);
+                // Cap overlay height to available terminal space
+                let height = (lines.len() as u16 + 2)
+                    .min(20)
+                    .min(area.height.saturating_sub(2));
                 let overlay = Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title("choose-tree"));
                 let oa = centered_rect(70, height, area);
                 f.render_widget(Clear, oa);
@@ -521,6 +543,8 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
                                     if cell.underline() { style = style.add_modifier(Modifier::UNDERLINED); }
                                     if cell.inverse() { style = style.add_modifier(Modifier::REVERSED); }
+                                    if cell.blink() { style = style.add_modifier(Modifier::SLOW_BLINK); }
+                                    if cell.hidden() { style = style.add_modifier(Modifier::HIDDEN); }
                                     let ch = cell.contents();
                                     if style != current_style {
                                         if !current_text.is_empty() {
@@ -587,6 +611,40 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             }
         })?;
 
+        // Forward active pane's cursor shape (DECSCUSR) to the real terminal.
+        // Write directly to stdout (not through ratatui backend) to avoid
+        // any buffering interference with the next draw cycle.
+        //
+        // When cursor_shape is CURSOR_SHAPE_UNSET (255), ConPTY consumed the
+        // child's DECSCUSR (Windows 10 without passthrough mode).  In that
+        // case, fall back to the user-configured cursor-style option so TUI
+        // apps like Claude still get a sensible cursor (default: bar).
+        {
+            let win = &app.windows[app.active_idx];
+            if let Some(pane) = crate::tree::active_pane(&win.root, &win.active_path) {
+                let shape = pane.cursor_shape.load(std::sync::atomic::Ordering::Relaxed);
+                // Resolve effective shape: child's DECSCUSR if received,
+                // otherwise the configured cursor-style fallback.
+                let effective = if shape <= 6 {
+                    shape
+                } else {
+                    crate::rendering::configured_cursor_code()
+                };
+                use crossterm::cursor::SetCursorStyle;
+                let style = match effective {
+                    0 => SetCursorStyle::DefaultUserShape,
+                    1 => SetCursorStyle::BlinkingBlock,
+                    2 => SetCursorStyle::SteadyBlock,
+                    3 => SetCursorStyle::BlinkingUnderScore,
+                    4 => SetCursorStyle::SteadyUnderScore,
+                    5 => SetCursorStyle::BlinkingBar,
+                    6 => SetCursorStyle::SteadyBar,
+                    _ => SetCursorStyle::DefaultUserShape,
+                };
+                let _ = crossterm::execute!(std::io::stdout(), style);
+            }
+        }
+
         if let Mode::PaneChooser { opened_at } = &app.mode {
             if opened_at.elapsed() > Duration::from_millis(1500) { app.mode = Mode::Passthrough; }
         }
@@ -616,6 +674,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         last_resize = Instant::now();
                     }
                 }
+                Event::Paste(text) => {
+                    crate::debug_log::input_log("paste", &format!("Event::Paste received, len={} text={:?}", text.len(), &text[..text.len().min(200)]));
+                    send_paste_to_active(&mut app, &text)?;
+                }
                 _ => {}
             }
         }
@@ -642,8 +704,11 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     if let Some(text) = capture_active_pane_range(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
                 CtrlReq::FocusWindow(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
+                CtrlReq::FocusWindowTemp(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
                 CtrlReq::FocusPane(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusPaneByIndex(idx) => { focus_pane_by_index(&mut app, idx); }
+                CtrlReq::FocusPaneTemp(pid) => { focus_pane_by_id(&mut app, pid); }
+                CtrlReq::FocusPaneByIndexTemp(idx) => { focus_pane_by_index(&mut app, idx); }
                 CtrlReq::SessionInfo(resp) => {
                     let attached = if app.attached_clients > 0 { "(attached)" } else { "(detached)" };
                     let windows = app.windows.len();
@@ -665,12 +730,18 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; }
                 CtrlReq::SendKey(k) => { send_key_to_active(&mut app, &k)?; }
-                CtrlReq::SendPaste(s) => { send_text_to_active(&mut app, &s)?; }
+                CtrlReq::SendPaste(s) => { send_paste_to_active(&mut app, &s)?; }
                 CtrlReq::ZoomPane => { toggle_zoom(&mut app); }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); }
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
                 CtrlReq::CopyAnchor => { if let Some((r,c)) = current_prompt_pos(&mut app) { app.copy_anchor = Some((r,c)); app.copy_pos = Some((r,c)); } }
                 CtrlReq::CopyYank => { let _ = yank_selection(&mut app); app.mode = Mode::Passthrough; }
+                CtrlReq::CopyRectToggle => {
+                    app.copy_selection_mode = match app.copy_selection_mode {
+                        crate::types::SelectionMode::Rect => crate::types::SelectionMode::Char,
+                        _ => crate::types::SelectionMode::Rect,
+                    };
+                }
                 CtrlReq::ClientSize(w, h) => { 
                     app.last_window_area = Rect { x: 0, y: 0, width: w, height: h }; 
                     resize_all_panes(&mut app);
