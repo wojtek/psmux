@@ -19,8 +19,10 @@ When asked to update/sync with upstream:
    all fork changes listed in the **Fork Changes** section below as separate commits
 5. Fix any FFI signature clashes (e.g. `*mut c_void` vs `isize` for HANDLE types)
 6. `cargo build --release` — must compile clean
-7. Deploy (copy binary to both locations above)
-8. `git push origin master --force-with-lease`
+7. Quick smoke check (recommended): detached session + `send-keys` + `capture-pane`
+   to confirm control pipe readiness before deployment
+8. Deploy (copy binary to both locations above)
+9. `git push origin master --force-with-lease`
 
 ## Fork Changes
 
@@ -46,6 +48,23 @@ Replace all TCP (`TcpStream`/`TcpListener`) communication with Windows named pip
 **Why:** SSH sessions on Windows run in Session 0 (isolated). Named pipes with SDDL
 security descriptors (low integrity SACL) allow cross-session access, so SSH users
 can control psmux sessions created on the desktop.
+
+### Named pipe readiness + persistent stream typing (`src/pipe.rs`, `src/types.rs`)
+Harden the pipe transport so startup checks do not consume server pipe instances and
+server-side persistent stream tracking matches the pipe transport.
+
+- `src/pipe.rs`:
+  - `pipe_exists()` now uses `WaitNamedPipeW(..., 0)` instead of `CreateFileW`
+  - Treats `ERROR_FILE_NOT_FOUND` as "not exists", and busy/timeout as "exists"
+  - Prevents readiness probes from stealing connection slots during startup
+- `src/types.rs`:
+  - `PERSISTENT_STREAMS` switched from `Vec<TcpStream>` to `Vec<PipeStream>`
+  - `register_persistent_stream()` now accepts `&PipeStream`
+  - `shutdown_persistent_streams()` clears tracked pipe handles on shutdown
+
+**Why:** During detached startup, a connect-style existence probe could consume
+available server pipe instances and cause `pipe wait timed out` on control commands
+(`send-keys`, `capture-pane`, etc.). This fix makes readiness checks non-invasive.
 
 ### send-keys argument fix (`src/server/connection.rs`)
 In the send-keys handler, replace the broken `!a.starts_with('-')` filter with a
