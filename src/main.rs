@@ -50,7 +50,8 @@ use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
 use crate::platform::enable_virtual_terminal_processing;
-use crate::cli::{print_help, print_version, print_commands};
+use crate::cli::{print_help, print_version, print_commands, parse_send_keys_args,
+    build_send_keys_control_command};
 use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control,
     send_control_with_response, resolve_default_session_name,
     force_kill_targets, confirms_identity};
@@ -235,6 +236,7 @@ fn run_main() -> io::Result<()> {
     // This avoids conflict with subcommand flags (e.g. select-pane -L, resize-pane -L).
     let mut l_socket_name: Option<String> = None;
     let mut f_config_file: Option<String> = None;
+    let mut subcommand_index: Option<usize> = None;
     let mut control_mode: u8 = 0; // 0=off, 1=-C (echo), 2=-CC (no echo)
     {
         let mut i = 1; // skip binary name
@@ -257,10 +259,18 @@ fn run_main() -> io::Result<()> {
             } else if arg.starts_with('-') {
                 i += 1; // skip single global flags (e.g. -v, -V)
             } else {
+                subcommand_index = Some(i);
                 break; // hit the subcommand name — stop scanning for global flags
             }
         }
     }
+
+    let parsed_cli_send_keys = subcommand_index
+        .filter(|idx| matches!(args[*idx].as_str(), "send-keys" | "send" | "send-key"))
+        .map(|idx| {
+            let tail: Vec<&str> = args[idx + 1..].iter().map(|arg| arg.as_str()).collect();
+            parse_send_keys_args(&tail)
+        });
 
     // Set PSMUX_CONFIG_FILE if -f was provided, so load_config() picks it up.
     if let Some(ref cf) = f_config_file {
@@ -279,8 +289,15 @@ fn run_main() -> io::Result<()> {
     // the pane environment (e.g. a warm-pool shell frozen at `__warm__`) can never
     // hijack the current session. See issue #485.
     let mut explicit_session_target = false;
-    if let Some(pos) = args.iter().position(|a| a == "-t") {
-        if let Some(target) = args.get(pos + 1) {
+    let global_target = subcommand_index.and_then(|idx| {
+        args[1..idx].windows(2).find(|pair| pair[0] == "-t").map(|pair| pair[1].as_str())
+    });
+    let explicit_target = if let Some(send_args) = parsed_cli_send_keys.as_ref() {
+        global_target.or(send_args.target)
+    } else {
+        args.windows(2).find(|pair| pair[0] == "-t").map(|pair| pair[1].as_str())
+    };
+    if let Some(target) = explicit_target {
             // move-window/swap-window: a bare numeric -t is a WINDOW index (tmux
             // target-window semantics), not a session. Coerce "N" -> ":N" so the
             // generic parser treats it as a window and routing stays on the current
@@ -329,7 +346,6 @@ fn run_main() -> io::Result<()> {
                 env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
                 explicit_session_target = true;
             }
-        }
     }
     if !explicit_session_target {
         // No explicit `-t session` on this command line: `$TMUX` (set inside
@@ -380,7 +396,7 @@ fn run_main() -> io::Result<()> {
                 }
             } else {
                 // After subcommand: strip only -t (and its value)
-                if args[i] == "-t" && i + 1 < args.len() {
+                if parsed_cli_send_keys.is_none() && args[i] == "-t" && i + 1 < args.len() {
                     i += 2;
                     continue;
                 }
@@ -1635,40 +1651,8 @@ fn run_main() -> io::Result<()> {
             }
             // send-keys - Send keys to a pane (critical for scripting)
             "send-keys" | "send" | "send-key" => {
-                let mut literal = false;
-                let mut has_x = false;
-                let mut has_hex = false;
-                let mut keys: Vec<String> = Vec::new();
-                // Getopt-style parsing: -t consumes next arg, -l/-R/-X/-H are flags
-                let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-l" => { literal = true; }
-                        "-R" => { keys.push("__RESET__".to_string()); }
-                        "-X" => { has_x = true; }
-                        "-H" => { has_hex = true; }
-                        "-t" => { i += 1; } // consume target value (already handled globally)
-                        "-N" => { i += 1; } // repeat count, consume value
-                        _ => { keys.push(cmd_args[i].to_string()); }
-                    }
-                    i += 1;
-                }
-                let mut cmd = "send-keys".to_string();
-                if literal { cmd.push_str(" -l"); }
-                if has_x { cmd.push_str(" -X"); }
-                if has_hex { cmd.push_str(" -H"); }
-                // Quote arguments that contain spaces to preserve them
-                for k in keys { 
-                    if k.contains(' ') || k.contains('\t') || k.contains('"') {
-                        // Escape embedded double-quotes and wrap in quotes.
-                        // Do NOT escape backslashes: the server parser treats
-                        // them as literal (Windows path separator).
-                        let escaped = k.replace('"', "\\\"");
-                        cmd.push_str(&format!(" \"{}\"", escaped));
-                    } else {
-                        cmd.push_str(&format!(" {}", k)); 
-                    }
-                }
+                let send_args: Vec<&str> = cmd_args.iter().skip(1).map(|arg| arg.as_str()).collect();
+                let mut cmd = build_send_keys_control_command(&send_args);
                 cmd.push('\n');
                 send_control(cmd)?;
                 return Ok(());

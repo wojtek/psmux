@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::net::TcpStream;
 
 use crate::types::{CtrlReq, LayoutKind, WaitForOp, ControlNotification};
-use crate::cli::{parse_target, extract_flag_value};
+use crate::cli::{parse_target, extract_flag_value, parse_send_keys_args};
 use crate::util::base64_decode;
 use crate::control;
 
@@ -65,6 +65,79 @@ fn split_top_level_semicolons(s: &str) -> Vec<String> {
     out
 }
 
+fn dispatch_send_keys(args: &[&str], tx: &mpsc::Sender<CtrlReq>) {
+    let parsed = parse_send_keys_args(args);
+    if parsed.hex_mode {
+        // `-H` is a byte channel. Malformed operands are dropped rather than
+        // leaking their literal token text into the pane.
+        let bytes: Vec<u8> = parsed.operands.iter()
+            .filter_map(|operand| u8::from_str_radix(operand, 16).ok())
+            .collect();
+        if !bytes.is_empty() {
+            for _ in 0..parsed.repeat_count {
+                let _ = tx.send(CtrlReq::SendBytes(bytes.clone()));
+            }
+        }
+        return;
+    }
+
+    if parsed.copy_mode {
+        let command = parsed.operands.join(" ");
+        for _ in 0..parsed.repeat_count {
+            let _ = tx.send(CtrlReq::SendKeysX(command.clone()));
+        }
+        return;
+    }
+
+    let mut any_hex = false;
+    let keys: Vec<String> = parsed.operands.iter().map(|operand| {
+        if let Some(rest) = operand.strip_prefix("0x").or_else(|| operand.strip_prefix("0X")) {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                if let Ok(n) = u32::from_str_radix(rest, 16) {
+                    if let Some(c) = char::from_u32(n) {
+                        any_hex = true;
+                        return c.to_string();
+                    }
+                }
+            }
+        }
+        (*operand).to_string()
+    }).collect();
+    let effective_literal = parsed.literal || any_hex;
+
+    for _ in 0..parsed.repeat_count {
+        if parsed.paste_mode {
+            let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
+        } else {
+            // Keep tokens separate so quoted arguments retain their exact
+            // whitespace through the server event loop (#490).
+            let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
+        }
+    }
+}
+
+fn expand_command_alias_and_normalize(
+    parsed: Vec<String>,
+    alias_expanded: Option<&str>,
+) -> Vec<String> {
+    let Some(expanded) = alias_expanded else {
+        return crate::cli::normalize_flag_equals(parsed);
+    };
+
+    let mut effective: Vec<String> = expanded
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if effective.is_empty() {
+        return crate::cli::normalize_flag_equals(parsed);
+    }
+    effective.extend(parsed.into_iter().skip(1));
+    // The expanded command owns option semantics. In particular, an alias can
+    // establish the send-keys operand boundary before a caller supplies a key
+    // such as `-t=%9`, which must remain one literal operand.
+    crate::cli::normalize_flag_equals(effective)
+}
+
 /// Try to decode a single `send`/`send-keys` command into the literal byte
 /// payload it would inject and the pane target.  Returns `None` if the
 /// command uses features we don't safely coalesce (e.g. `-X`, `-p`, `-N`,
@@ -78,47 +151,23 @@ fn split_top_level_semicolons(s: &str) -> Vec<String> {
 /// ESC byte and the `[A` and emits them as literal characters.  Coalescing
 /// guarantees the whole VT sequence reaches the shell in one read().
 fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
-    let toks = parse_command_line(line);
+    let toks = crate::cli::normalize_flag_equals(parse_command_line(line));
     if toks.is_empty() { return None; }
     let cmd = toks[0].as_str();
     if cmd != "send" && cmd != "send-keys" { return None; }
     let args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
 
+    let parsed = parse_send_keys_args(&args);
     // Bail on modes that require special semantics.
-    let any_short = |c: char| {
-        args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.chars().skip(1).any(|fc| fc == c))
-    };
-    if any_short('X') || any_short('p') || any_short('N') || any_short('R') { return None; }
+    if parsed.copy_mode || parsed.paste_mode || parsed.has_repeat || parsed.reset { return None; }
 
-    let prev_consumes_operand = |i: usize| -> bool {
-        if i == 0 { return false; }
-        if let Some(prev) = args.get(i - 1) {
-            if prev.starts_with('-') && !prev.starts_with("--") && prev.len() >= 2 {
-                if let Some(last) = prev.chars().last() {
-                    return matches!(last, 't' | 'T' | 'N' | 'R' | 'c');
-                }
-            }
-        }
-        false
-    };
-
-    // Find target (-t / -lt /...).  Default to %active if absent.
-    let mut target: Option<String> = None;
-    for (i, a) in args.iter().enumerate() {
-        if a.starts_with('-') && !a.starts_with("--") && a.ends_with('t') {
-            if let Some(t) = args.get(i + 1) { target = Some((*t).to_string()); break; }
-        }
-    }
-
-    let literal = any_short('l');
+    let literal = parsed.literal;
     // -H marks every operand as one raw hexadecimal byte (tmux KEYC_LITERAL).
-    let literal_byte = any_short('H');
+    let literal_byte = parsed.hex_mode;
     let mut bytes: Vec<u8> = Vec::new();
-    for (i, a) in args.iter().enumerate() {
-        if a.starts_with('-') { continue; }
-        if prev_consumes_operand(i) { continue; }
+    for a in parsed.operands {
         // Hex codepoint?
-        let s = *a;
+        let s = a;
         if literal_byte {
             match u8::from_str_radix(s, 16) {
                 Ok(byte) => { bytes.push(byte); continue; }
@@ -149,7 +198,7 @@ fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
         bytes.extend_from_slice(s.as_bytes());
     }
 
-    Some((target.unwrap_or_else(|| String::new()), bytes))
+    Some((parsed.target.unwrap_or("").to_string(), bytes))
 }
 
 /// Re-join already-tokenized command args into a single command string,
@@ -615,7 +664,7 @@ if control_echo || control_noecho {
         let ts = chrono::Utc::now().timestamp();
 
         // Dispatch the command (before acquiring write lock)
-        let parsed = crate::cli::normalize_flag_equals(parse_command_line(trimmed));
+        let parsed = parse_command_line(trimmed);
         let raw_cmd = parsed.first().map(|s| s.as_str()).unwrap_or("");
 
         if raw_cmd.is_empty() {
@@ -634,14 +683,12 @@ if control_echo || control_noecho {
             map.get(raw_cmd).cloned()
         } else { None };
 
-        let (cmd_name, cmd_args): (&str, Vec<&str>) = if let Some(ref expanded) = alias_expanded {
-            let parts: Vec<&str> = expanded.split_whitespace().collect();
-            let mut all: Vec<&str> = parts[1..].to_vec();
-            all.extend(parsed.iter().skip(1).map(|s| s.as_str()));
-            (parts.first().copied().unwrap_or(raw_cmd), all)
-        } else {
-            (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
-        };
+        let parsed = expand_command_alias_and_normalize(parsed, alias_expanded.as_deref());
+        let cmd_name = parsed.first().map(|s| s.as_str()).unwrap_or("");
+        let cmd_args: Vec<&str> = parsed.iter().skip(1).map(|s| s.as_str()).collect();
+
+        let parsed_send_keys = matches!(cmd_name, "send-keys" | "send")
+            .then(|| parse_send_keys_args(&cmd_args));
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -650,7 +697,18 @@ if control_echo || control_noecho {
         let mut ctrl_target_pane: Option<usize> = None;
         let mut ctrl_pane_is_id = false;
         let mut ctrl_raw_target: Option<String> = None;
-        {
+        if let Some(send_args) = parsed_send_keys.as_ref() {
+            if let Some(v) = send_args.target {
+                ctrl_raw_target = Some(v.to_string());
+                let pt = parse_target(v);
+                if pt.window.is_some() { ctrl_target_win = pt.window; ctrl_target_win_is_id = pt.window_is_id; ctrl_target_win_name = None; }
+                else if pt.window_name.is_some() { ctrl_target_win_name = pt.window_name; ctrl_target_win = None; ctrl_target_win_is_id = false; }
+                if pt.pane.is_some() {
+                    ctrl_target_pane = pt.pane;
+                    ctrl_pane_is_id = pt.pane_is_id;
+                }
+            }
+        } else {
             let mut i = 0;
             while i < cmd_args.len() {
                 if cmd_args[i] == "-t" {
@@ -671,7 +729,9 @@ if control_echo || control_noecho {
         }
 
         // Build filtered args (without -t)
-        let filtered_args: Vec<&str> = {
+        let filtered_args: Vec<&str> = if parsed_send_keys.is_some() {
+            cmd_args.clone()
+        } else {
             let mut filtered = Vec::new();
             let mut i = 0;
             while i < cmd_args.len() {
@@ -864,21 +924,18 @@ loop {
     } else {
         effective_line = line.trim().to_string();
     }
-    let parsed = crate::cli::normalize_flag_equals(parse_command_line(&effective_line));
+    let parsed = parse_command_line(&effective_line);
     let raw_cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
     // Check command aliases before normal dispatch
     let alias_expanded = if let Ok(map) = aliases.read() {
         map.get(raw_cmd).cloned()
     } else { None };
-    let (cmd, args): (&str, Vec<&str>) = if let Some(ref expanded) = alias_expanded {
-        // Alias expansion: replace command name, keep original args
-        let expanded_parts: Vec<&str> = expanded.split_whitespace().collect();
-        let mut all_args: Vec<&str> = expanded_parts[1..].to_vec();
-        all_args.extend(parsed.iter().skip(1).map(|s| s.as_str()));
-        (expanded_parts.first().copied().unwrap_or(raw_cmd), all_args)
-    } else {
-        (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
-    };
+    let parsed = expand_command_alias_and_normalize(parsed, alias_expanded.as_deref());
+    let cmd = parsed.first().map(|s| s.as_str()).unwrap_or("");
+    let args: Vec<&str> = parsed.iter().skip(1).map(|s| s.as_str()).collect();
+
+let parsed_send_keys = matches!(cmd, "send-keys" | "send")
+    .then(|| parse_send_keys_args(&args));
 
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;
@@ -889,10 +946,22 @@ let mut pane_is_id = global_pane_is_id;
 // Save raw -t value for relative pane targets like :.+ or :.-
 // Falls back to global_raw_target from TARGET protocol line
 let mut raw_target: Option<String> = global_raw_target.clone();
-let mut i = 0;
-while i < args.len() {
-    if args[i] == "-t" {
-        if let Some(v) = args.get(i+1) {
+if let Some(send_args) = parsed_send_keys.as_ref() {
+    if let Some(v) = send_args.target {
+        raw_target = Some(v.to_string());
+        let pt = parse_target(v);
+        if pt.window.is_some() { target_win = pt.window; target_win_is_id = pt.window_is_id; target_win_name = None; }
+        else if pt.window_name.is_some() { target_win_name = pt.window_name; target_win = None; target_win_is_id = false; }
+        if pt.pane.is_some() {
+            target_pane = pt.pane;
+            pane_is_id = pt.pane_is_id;
+        }
+    }
+} else {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-t" {
+            if let Some(v) = args.get(i+1) {
             raw_target = Some(v.to_string());
             // Parse the -t value using parse_target for consistent handling
             let pt = parse_target(v);
@@ -902,13 +971,16 @@ while i < args.len() {
                 target_pane = pt.pane;
                 pane_is_id = pt.pane_is_id;
             }
+            }
+            i += 2; continue;
         }
-        i += 2; continue;
+        i += 1;
     }
-    i += 1;
 }
 // Build args without -t and its value so command handlers get clean positional args
-let args: Vec<&str> = {
+let args: Vec<&str> = if parsed_send_keys.is_some() {
+    args
+} else {
     let mut filtered = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1327,104 +1399,7 @@ match cmd {
     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
     "send-keys" | "send" => {
-        // tmux short-flag clusters (e.g. iTerm2's `send -lt %1 l`): inspect
-        // each `-xyz` arg and check whether any of x/y/z is a known flag.
-        let flag_has = |c: char| -> bool {
-            args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.chars().skip(1).any(|fc| fc == c))
-        };
-        // Returns true if the previous arg is a short-flag cluster whose
-        // *trailing* character takes an operand (e.g. -t, -lt, -N).
-        let prev_consumes_operand = |i: usize| -> bool {
-            if i == 0 { return false; }
-            if let Some(prev) = args.get(i - 1) {
-                if prev.starts_with('-') && !prev.starts_with("--") && prev.len() >= 2 {
-                    if let Some(last) = prev.chars().last() {
-                        return matches!(last, 't' | 'T' | 'N' | 'R' | 'c');
-                    }
-                }
-            }
-            false
-        };
-        let literal = flag_has('l');
-        let paste_mode = flag_has('p');
-        let has_x = flag_has('X');
-        let hex_mode = flag_has('H');
-        // Parse -N <count> for repeat (look for any cluster ending in 'N')
-        let mut repeat_count: usize = 1;
-        if let Some(n_pos) = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.ends_with('N')) {
-            if let Some(count_str) = args.get(n_pos + 1) {
-                repeat_count = count_str.parse::<usize>().unwrap_or(1).max(1);
-            }
-        }
-        if hex_mode {
-            // tmux `send-keys -H`: every operand is one hexadecimal BYTE value.
-            // tmux tags these keys KEYC_LITERAL and writes them to the pty as
-            // single bytes ("can't be more than 8 bits"), so this is a byte
-            // channel, not a codepoint channel.  Decode here and pass the raw
-            // bytes through untouched so UTF-8 sequences and escape sequences
-            // survive verbatim.
-            let mut bytes: Vec<u8> = Vec::new();
-            for (i, a) in args.iter().enumerate() {
-                if a.starts_with('-') || prev_consumes_operand(i) { continue; }
-                // A malformed operand is dropped rather than leaked into the
-                // pane as its literal token text.
-                if let Ok(byte) = u8::from_str_radix(a, 16) { bytes.push(byte); }
-            }
-            if !bytes.is_empty() {
-                for _ in 0..repeat_count {
-                    let _ = tx.send(CtrlReq::SendBytes(bytes.clone()));
-                }
-            }
-        } else if has_x {
-            // send-keys -X copy-mode-command
-            let cmd_parts: Vec<&str> = args.iter().enumerate()
-                .filter(|(i, a)| !a.starts_with('-') && !prev_consumes_operand(*i))
-                .map(|(_, a)| *a).collect();
-            for _ in 0..repeat_count {
-                let _ = tx.send(CtrlReq::SendKeysX(cmd_parts.join(" ")));
-            }
-        } else {
-            let keys: Vec<String> = args.iter()
-                .enumerate()
-                .filter(|(i, a)| !a.starts_with('-') && !prev_consumes_operand(*i))
-                .map(|(_, a)| {
-                    // Convert real-tmux 0xNN hex codepoint syntax (sent by
-                    // iTerm2's gateway: e.g. `send -t %1 0xd` for Enter) into
-                    // the literal character so SendKeys forwards the right
-                    // byte to the PTY instead of the string "0xd".
-                    let s = *a;
-                    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-                            if let Ok(n) = u32::from_str_radix(rest, 16) {
-                                if let Some(c) = char::from_u32(n) {
-                                    return c.to_string();
-                                }
-                            }
-                        }
-                    }
-                    s.to_string()
-                })
-                .collect();
-            // If any key was a hex-converted single byte, force literal mode so
-            // the byte is written verbatim and not parsed as a key name.
-            let any_hex = args.iter().any(|a| {
-                let s = *a;
-                if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit());
-                }
-                false
-            });
-            let effective_literal = literal || any_hex;
-            for _ in 0..repeat_count {
-                if paste_mode {
-                    let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
-                } else {
-                    // #490: hand the tokens over UNJOINED so quoted
-                    // arguments keep their exact whitespace end to end.
-                    let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
-                }
-            }
-        }
+        dispatch_send_keys(&args, &tx);
     }
     "select-pane" | "selectp" => {
         // Detect relative pane targets: -t :.+  or  -t :.-
@@ -3526,68 +3501,7 @@ fn dispatch_control_command(
             true
         }
         "send-keys" | "send" => {
-            let flag_has = |c: char| -> bool {
-                args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.chars().skip(1).any(|fc| fc == c))
-            };
-            let prev_consumes_operand = |i: usize| -> bool {
-                if i == 0 { return false; }
-                if let Some(prev) = args.get(i - 1) {
-                    if prev.starts_with('-') && !prev.starts_with("--") && prev.len() >= 2 {
-                        if let Some(last) = prev.chars().last() {
-                            return matches!(last, 't' | 'T' | 'N' | 'R' | 'c');
-                        }
-                    }
-                }
-                false
-            };
-            let literal = flag_has('l');
-            if flag_has('H') {
-                // tmux `send-keys -H`: every operand is one hexadecimal BYTE value.
-                // tmux tags these keys KEYC_LITERAL and writes them to the pty as
-                // single bytes ("can't be more than 8 bits"), so this is a byte
-                // channel, not a codepoint channel.  Decode here and pass the raw
-                // bytes through untouched so UTF-8 sequences and escape sequences
-                // survive verbatim.
-                let mut bytes: Vec<u8> = Vec::new();
-                for (i, a) in args.iter().enumerate() {
-                    if a.starts_with('-') || prev_consumes_operand(i) { continue; }
-                    // A malformed operand is dropped rather than leaked into the
-                    // pane as its literal token text.
-                    if let Ok(byte) = u8::from_str_radix(a, 16) { bytes.push(byte); }
-                }
-                if !bytes.is_empty() {
-                    let _ = tx.send(CtrlReq::SendBytes(bytes));
-                }
-                return true;
-            }
-            // Convert real-tmux 0xNN hex codepoint syntax (used by iTerm2 for
-            // every keystroke: `send -t %1 0xd` etc.) into literal characters.
-            let keys: Vec<String> = args.iter().enumerate().filter(|(i, a)| {
-                !a.starts_with('-') && !prev_consumes_operand(*i)
-            }).map(|(_, a)| {
-                let s = *a;
-                if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-                        if let Ok(n) = u32::from_str_radix(rest, 16) {
-                            if let Some(c) = char::from_u32(n) {
-                                return c.to_string();
-                            }
-                        }
-                    }
-                }
-                s.to_string()
-            }).collect();
-            let any_hex = args.iter().any(|a| {
-                let s = *a;
-                if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit());
-                }
-                false
-            });
-            let effective_literal = literal || any_hex;
-            // #490: hand the tokens over UNJOINED so quoted arguments keep
-            // their exact whitespace end to end.
-            let _ = tx.send(CtrlReq::SendKeys(keys, effective_literal));
+            dispatch_send_keys(args, tx);
             let _ = resp_tx.send(String::new());
             true
         }

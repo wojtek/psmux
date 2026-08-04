@@ -112,3 +112,204 @@ fn non_send_commands_pass_through_untouched() {
         "an unrelated command between two sends must break the run and survive verbatim"
     );
 }
+
+#[test]
+fn option_separator_allows_a_leading_dash_key() {
+    let (_, bytes) = decode("send-keys -l -- --help").expect("must decode");
+    assert_eq!(bytes, b"--help");
+}
+
+#[test]
+fn option_parsing_stops_at_the_first_key() {
+    let (_, bytes) = decode("send-keys -l text -n").expect("must decode");
+    assert_eq!(bytes, b"text-n");
+}
+
+#[test]
+fn target_flag_after_option_separator_is_key_input() {
+    let (target, bytes) = decode("send-keys -l -- -t %9").expect("must decode");
+    assert_eq!(target, "");
+    assert_eq!(bytes, b"-t%9");
+}
+
+#[test]
+fn shared_parser_preserves_clusters_targets_and_later_dash_keys() {
+    let parsed = parse_send_keys_args(&["-lt", "%1", "A", "-n"]);
+    assert!(parsed.literal);
+    assert_eq!(parsed.target, Some("%1"));
+    assert_eq!(parsed.operands, vec!["A", "-n"]);
+}
+
+#[test]
+fn unrecognized_leading_dash_token_starts_key_input() {
+    let parsed = parse_send_keys_args(&["--help", "-t", "%9"]);
+    assert_eq!(parsed.target, None);
+    assert_eq!(parsed.operands, vec!["--help", "-t", "%9"]);
+}
+
+#[test]
+fn shared_dispatch_sends_leading_dash_operands_unchanged() {
+    let (tx, rx) = mpsc::channel();
+    dispatch_send_keys(&["-l", "--", "--help", "-n"], &tx);
+
+    match rx.recv().expect("one send request") {
+        CtrlReq::SendKeys(keys, literal) => {
+            assert!(literal);
+            assert_eq!(keys, vec!["--help", "-n"]);
+        }
+        _ => panic!("expected SendKeys"),
+    }
+    assert!(rx.try_recv().is_err(), "dispatch must emit exactly one request");
+}
+
+#[test]
+fn shared_dispatch_preserves_repeat_and_copy_mode() {
+    let (tx, rx) = mpsc::channel();
+    dispatch_send_keys(&["-XN", "2", "copy-selection"], &tx);
+
+    for _ in 0..2 {
+        match rx.recv().expect("repeated copy-mode request") {
+            CtrlReq::SendKeysX(command) => assert_eq!(command, "copy-selection"),
+            _ => panic!("expected SendKeysX"),
+        }
+    }
+    assert!(rx.try_recv().is_err(), "repeat count must be exact");
+}
+
+#[test]
+fn reset_is_boolean_and_does_not_swallow_the_first_key() {
+    let parsed = parse_send_keys_args(&["-R", "Enter"]);
+    assert!(parsed.reset);
+    assert_eq!(parsed.operands, vec!["Enter"]);
+}
+
+#[test]
+fn shared_dispatch_reset_does_not_type_an_internal_marker() {
+    let (tx, rx) = mpsc::channel();
+    dispatch_send_keys(&["-R", "Enter"], &tx);
+
+    match rx.recv().expect("one send request") {
+        CtrlReq::SendKeys(keys, literal) => {
+            assert!(!literal);
+            assert_eq!(keys, vec!["Enter"]);
+        }
+        _ => panic!("expected SendKeys"),
+    }
+    assert!(rx.try_recv().is_err(), "dispatch must emit exactly one request");
+}
+
+#[test]
+fn unsupported_t_and_c_flags_are_key_operands() {
+    let parsed = parse_send_keys_args(&["-T", "table", "-c", "client"]);
+    assert_eq!(parsed.operands, vec!["-T", "table", "-c", "client"]);
+}
+
+#[test]
+fn direct_cli_rebuild_protects_target_shaped_key_operands() {
+    let command = crate::cli::build_send_keys_control_command(
+        &["-t", "%1", "-l", "--", "-t", "%9"],
+    );
+    assert_eq!(command, "send-keys -l -- \"-t\" \"%9\"");
+}
+
+#[test]
+fn direct_cli_rebuild_preserves_repeat_copy_and_dash_arguments() {
+    let command = crate::cli::build_send_keys_control_command(
+        &["-XN", "2", "copy-selection", "-t"],
+    );
+    assert_eq!(command, "send-keys -X -N 2 -- \"copy-selection\" \"-t\"");
+}
+
+#[test]
+fn direct_cli_rebuild_round_trips_all_operand_shapes() {
+    let expected = vec![
+        "don't",
+        "",
+        r#"say "hi""#,
+        r#"C:\\Program Files\\psmux"#,
+    ];
+    let mut input = vec!["-l", "--"];
+    input.extend(expected.iter().copied());
+
+    let command = crate::cli::build_send_keys_control_command(&input);
+    let commands = split_top_level_semicolons(&command);
+    assert_eq!(commands.len(), 1, "quoted operands must remain one command");
+
+    let tokens = parse_command_line(&commands[0]);
+    let args: Vec<&str> = tokens.iter().skip(1).map(|token| token.as_str()).collect();
+    let parsed = parse_send_keys_args(&args);
+    assert_eq!(parsed.operands, expected);
+}
+
+#[test]
+fn direct_cli_rebuild_keeps_semicolon_as_one_key_operand() {
+    let command = crate::cli::build_send_keys_control_command(
+        &["-l", "--", ";", "display-message", "not-a-command"],
+    );
+    let commands = split_top_level_semicolons(&command);
+    assert_eq!(commands.len(), 1, "literal semicolon must not split commands");
+
+    let tokens = parse_command_line(&commands[0]);
+    let args: Vec<&str> = tokens.iter().skip(1).map(|token| token.as_str()).collect();
+    let parsed = parse_send_keys_args(&args);
+    assert_eq!(parsed.operands, vec![";", "display-message", "not-a-command"]);
+}
+
+#[test]
+fn flag_equals_normalization_stops_at_send_keys_separator() {
+    let input = vec!["psmux", "send-keys", "-l", "--", "-t=%9", "-N=2"];
+    let normalized = crate::cli::normalize_flag_equals(
+        input.iter().map(|arg| (*arg).to_string()).collect(),
+    );
+    assert_eq!(normalized, input);
+
+    let args: Vec<&str> = normalized.iter().skip(2).map(|arg| arg.as_str()).collect();
+    let parsed = parse_send_keys_args(&args);
+    assert_eq!(parsed.target, None);
+    assert_eq!(parsed.operands, vec!["-t=%9", "-N=2"]);
+}
+
+#[test]
+fn flag_equals_normalization_stops_at_first_send_keys_operand() {
+    let input = vec!["send-keys", "-l", "text", "-t=%9"];
+    let normalized = crate::cli::normalize_flag_equals(
+        input.iter().map(|arg| (*arg).to_string()).collect(),
+    );
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn flag_equals_normalization_keeps_pre_boundary_send_keys_options() {
+    let normalized = crate::cli::normalize_flag_equals(
+        ["psmux", "send-keys", "-t=%1", "-N=2", "A"]
+            .iter().map(|arg| (*arg).to_string()).collect(),
+    );
+    assert_eq!(normalized, vec!["psmux", "send-keys", "-t", "%1", "-N", "2", "A"]);
+
+    let args: Vec<&str> = normalized.iter().skip(2).map(|arg| arg.as_str()).collect();
+    let parsed = parse_send_keys_args(&args);
+    assert_eq!(parsed.target, Some("%1"));
+    assert_eq!(parsed.repeat_count, 2);
+    assert_eq!(parsed.operands, vec!["A"]);
+}
+
+#[test]
+fn send_keys_alias_expands_before_operand_normalization() {
+    let parsed = expand_command_alias_and_normalize(
+        parse_command_line("sk -t=%9"),
+        Some("send-keys -l --"),
+    );
+    assert_eq!(parsed, vec!["send-keys", "-l", "--", "-t=%9"]);
+
+    let args: Vec<&str> = parsed.iter().skip(1).map(|arg| arg.as_str()).collect();
+    let send_keys = parse_send_keys_args(&args);
+    assert_eq!(send_keys.target, None);
+    assert_eq!(send_keys.operands, vec!["-t=%9"]);
+}
+
+#[test]
+fn send_keys_equals_target_is_normalized_before_coalescing() {
+    let (target, bytes) = decode("send-keys -l -t=%1 A").expect("must decode");
+    assert_eq!(target, "%1");
+    assert_eq!(bytes, b"A");
+}

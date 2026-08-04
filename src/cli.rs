@@ -13,25 +13,85 @@ use crate::types::{ParsedTarget, VERSION, build_version_string};
 ///   - Long flags (`--name=value`) pass through unchanged.
 ///   - Positional tokens without a leading `-` pass through unchanged.
 ///   - Bare `-` and degenerate `-=` pass through unchanged.
+///   - For `send-keys`, normalization follows its option boundary: only `-t=`
+///     and `-N=` before `--` or the first key operand are expanded.
 pub fn normalize_flag_equals(args: Vec<String>) -> Vec<String> {
+    let send_keys_index = find_send_keys_subcommand(&args);
     let mut out = Vec::with_capacity(args.len());
-    for arg in args {
-        // Must start with exactly one dash, followed by a single ASCII letter,
-        // then `=`, then at least one character of value.
-        if arg.len() >= 4
-            && arg.starts_with('-')
-            && !arg.starts_with("--")
-        {
-            let bytes = arg.as_bytes();
-            if bytes[1].is_ascii_alphabetic() && bytes[2] == b'=' {
-                out.push(format!("-{}", bytes[1] as char));
-                out.push(arg[3..].to_string());
+    let mut send_keys_options = send_keys_index.is_some();
+    let mut send_keys_value_pending = false;
+
+    for (index, arg) in args.into_iter().enumerate() {
+        if send_keys_index.is_some_and(|command_index| index > command_index) {
+            if !send_keys_options {
+                out.push(arg);
                 continue;
             }
+            if send_keys_value_pending {
+                out.push(arg);
+                send_keys_value_pending = false;
+                continue;
+            }
+            if arg == "--" {
+                out.push(arg);
+                send_keys_options = false;
+                continue;
+            }
+            if let Some((flag, value)) = split_short_flag_equals(&arg) {
+                if matches!(flag.as_str(), "-t" | "-N") {
+                    out.push(flag);
+                    out.push(value);
+                    continue;
+                }
+            }
+            if let Some(flags) = send_keys_option_cluster(&arg) {
+                send_keys_value_pending = flags.chars().last()
+                    .is_some_and(|flag| matches!(flag, 't' | 'N'));
+                out.push(arg);
+                continue;
+            }
+            send_keys_options = false;
+            out.push(arg);
+            continue;
         }
-        out.push(arg);
+
+        if let Some((flag, value)) = split_short_flag_equals(&arg) {
+            out.push(flag);
+            out.push(value);
+        } else {
+            out.push(arg);
+        }
     }
     out
+}
+
+fn split_short_flag_equals(arg: &str) -> Option<(String, String)> {
+    if arg.len() < 4 || !arg.starts_with('-') || arg.starts_with("--") {
+        return None;
+    }
+    let bytes = arg.as_bytes();
+    (bytes[1].is_ascii_alphabetic() && bytes[2] == b'=')
+        .then(|| (format!("-{}", bytes[1] as char), arg[3..].to_string()))
+}
+
+fn find_send_keys_subcommand(args: &[String]) -> Option<usize> {
+    if args.first().is_some_and(|arg| matches!(arg.as_str(), "send-keys" | "send" | "send-key")) {
+        return Some(0);
+    }
+
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-L" | "-f" | "-S" | "-t") && index + 1 < args.len() {
+            index += 2;
+        } else if arg.starts_with('-') {
+            index += 1;
+        } else {
+            return matches!(arg.as_str(), "send-keys" | "send" | "send-key")
+                .then_some(index);
+        }
+    }
+    None
 }
 
 /// Same as [`normalize_flag_equals`] but operates on `Vec<&str>`, returning
@@ -517,6 +577,126 @@ pub fn print_commands() {
   wait-for (wait)           - Wait for a signal
   zoom-pane (zoom)          - Toggle pane zoom
 "#);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedSendKeysArgs<'a> {
+    pub(crate) literal: bool,
+    pub(crate) paste_mode: bool,
+    pub(crate) copy_mode: bool,
+    pub(crate) hex_mode: bool,
+    pub(crate) reset: bool,
+    pub(crate) has_repeat: bool,
+    pub(crate) repeat_count: usize,
+    pub(crate) target: Option<&'a str>,
+    pub(crate) operands: Vec<&'a str>,
+}
+
+fn send_keys_option_cluster(arg: &str) -> Option<&str> {
+    arg.strip_prefix('-').filter(|flags| {
+        !flags.is_empty()
+            && !flags.starts_with('-')
+            && flags.chars().all(|c| matches!(c, 'l' | 'p' | 'R' | 'X' | 'H' | 'N' | 't'))
+    })
+}
+
+/// Parse the option prefix shared by the executable and every server-side
+/// `send`/`send-keys` path. Options end at `--` or the first key operand.
+/// From that point onward, every token is key input, including leading dashes.
+pub(crate) fn parse_send_keys_args<'a>(args: &[&'a str]) -> ParsedSendKeysArgs<'a> {
+    let mut parsed = ParsedSendKeysArgs {
+        literal: false,
+        paste_mode: false,
+        copy_mode: false,
+        hex_mode: false,
+        reset: false,
+        has_repeat: false,
+        repeat_count: 1,
+        target: None,
+        operands: Vec::new(),
+    };
+    let mut parsing_options = true;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i];
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            i += 1;
+            continue;
+        }
+
+        let option_cluster = if parsing_options {
+            send_keys_option_cluster(arg)
+        } else {
+            None
+        };
+
+        if let Some(flags) = option_cluster {
+            for flag in flags.chars() {
+                match flag {
+                    'l' => parsed.literal = true,
+                    'p' => parsed.paste_mode = true,
+                    'R' => parsed.reset = true,
+                    'X' => parsed.copy_mode = true,
+                    'H' => parsed.hex_mode = true,
+                    'N' => parsed.has_repeat = true,
+                    _ => {}
+                }
+            }
+
+            let consuming_flag = flags.chars().last()
+                .filter(|c| matches!(c, 't' | 'N'));
+            if let Some(flag) = consuming_flag {
+                if let Some(value) = args.get(i + 1).copied() {
+                    match flag {
+                        't' => parsed.target = Some(value),
+                        'N' => {
+                            parsed.repeat_count = value.parse::<usize>().unwrap_or(1).max(1);
+                        }
+                        _ => {}
+                    }
+                }
+                i += 2;
+                continue;
+            }
+
+            i += 1;
+            continue;
+        }
+
+        parsing_options = false;
+        parsed.operands.push(arg);
+        i += 1;
+    }
+
+    parsed
+}
+
+/// Rebuild a direct CLI `send-keys` invocation for the control connection.
+/// The normalized `--` keeps key operands from being reinterpreted when the
+/// server parses the line a second time. Every operand uses the maintained
+/// control-protocol quoting function so empty values, quotes, semicolons, and
+/// Windows backslashes survive that second parse exactly.
+pub(crate) fn build_send_keys_control_command(args: &[&str]) -> String {
+    let parsed = parse_send_keys_args(args);
+    let mut command = "send-keys".to_string();
+    if parsed.literal { command.push_str(" -l"); }
+    if parsed.paste_mode { command.push_str(" -p"); }
+    if parsed.reset { command.push_str(" -R"); }
+    if parsed.copy_mode { command.push_str(" -X"); }
+    if parsed.hex_mode { command.push_str(" -H"); }
+    if parsed.has_repeat {
+        command.push_str(&format!(" -N {}", parsed.repeat_count));
+    }
+    if !parsed.operands.is_empty() {
+        command.push_str(" --");
+        for operand in parsed.operands {
+            command.push(' ');
+            command.push_str(&crate::util::quote_arg(operand));
+        }
+    }
+    command
 }
 
 /// Parse a tmux-style target specification

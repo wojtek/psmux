@@ -1954,7 +1954,7 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
                 b"\x1b[Z".to_vec()
             }
         }
-        KeyCode::Backspace => b"\x08".to_vec(),
+        KeyCode::Backspace => b"\x7f".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
         // Arrow keys and special keys with xterm modifier encoding.
         // Format: \x1b[1;{mod}{letter} where mod = 1 + Shift*1 + Alt*2 + Ctrl*4
