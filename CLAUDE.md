@@ -71,6 +71,11 @@ In the send-keys handler, replace the broken `!a.starts_with('-')` filter with a
 flag-then-keys state machine using `parsing_flags` bool. This allows sending arguments
 that start with `-` (e.g., `send-keys -- --help Enter`).
 
+### send-keys help safety (`src/main.rs` + `src/cli.rs`)
+Resolve long-form help for every send alias before session lookup or control-pipe
+writes. Unknown long options must fail while flags are still being parsed; literal
+long-option text remains available after the explicit end-of-options separator.
+
 ### Backspace fix (`src/input.rs`)
 Change `KeyCode::Backspace` from `b"\x08"` (word-delete) to `b"\x7f"` (char-delete).
 There may be two locations — one in normal mode and one in passthrough mode.
