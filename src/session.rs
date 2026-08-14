@@ -1,7 +1,50 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::env;
 
 use crate::pipe;
+
+fn read_pipe_ack(stream: &mut pipe::PipeStream) -> io::Result<()> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        match stream.read(&mut byte)? {
+            0 => {
+                if line.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "pipe closed before auth acknowledgement",
+                    ));
+                }
+                break;
+            }
+            1 => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if byte[0] != b'\r' {
+                    line.push(byte[0]);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let ack = String::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 pipe acknowledgement"))?;
+    if ack.trim() == "OK" {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            if ack.is_empty() {
+                "empty pipe acknowledgement".to_string()
+            } else {
+                ack
+            },
+        ))
+    }
+}
 
 /// Clean up any stale session key files (where server pipe no longer exists)
 pub fn cleanup_stale_sessions() {
@@ -38,12 +81,12 @@ pub fn read_session_key(session: &str) -> io::Result<String> {
 
 /// Send an authenticated command to a session via named pipe
 pub fn send_auth_cmd(session_name: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
-    if let Ok(handle) = pipe::connect_to_pipe(session_name, 1000) {
-        let mut s = pipe::PipeStream::from_handle(handle);
-        let _ = write!(s, "AUTH {}\n", key);
-        let _ = s.write_all(cmd);
-        let _ = s.flush();
-    }
+    let handle = pipe::connect_to_pipe(session_name, 1000)?;
+    let mut s = pipe::PipeStream::from_handle(handle);
+    write!(s, "AUTH {}\n", key)?;
+    s.write_all(cmd)?;
+    s.flush()?;
+    read_pipe_ack(&mut s)?;
     Ok(())
 }
 
@@ -51,14 +94,13 @@ pub fn send_auth_cmd(session_name: &str, key: &str, cmd: &[u8]) -> io::Result<()
 pub fn send_auth_cmd_response(session_name: &str, key: &str, cmd: &[u8]) -> io::Result<String> {
     let handle = pipe::connect_to_pipe(session_name, 2000)?;
     let mut s = pipe::PipeStream::from_handle(handle);
-    let _ = write!(s, "AUTH {}\n", key);
-    let _ = s.write_all(cmd);
-    let _ = s.flush();
+    write!(s, "AUTH {}\n", key)?;
+    s.write_all(cmd)?;
+    s.flush()?;
+    read_pipe_ack(&mut s)?;
     let mut br = std::io::BufReader::new(&mut s);
-    let mut auth_line = String::new();
-    let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
     let mut buf = String::new();
-    let _ = std::io::Read::read_to_string(&mut br, &mut buf);
+    std::io::Read::read_to_string(&mut br, &mut buf)?;
     Ok(buf)
 }
 
@@ -69,18 +111,16 @@ pub fn send_control(line: String) -> io::Result<()> {
     if !pipe::pipe_exists(&target) {
         return Err(io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)));
     }
-    let session_key = read_session_key(&target).unwrap_or_default();
+    let session_key = read_session_key(&target)?;
     let handle = pipe::connect_to_pipe(&target, 2000)?;
     let mut stream = pipe::PipeStream::from_handle(handle);
-    let _ = write!(stream, "AUTH {}\n", session_key);
+    write!(stream, "AUTH {}\n", session_key)?;
     if let Some(ref ft) = full_target {
-        let _ = write!(stream, "TARGET {}\n", ft);
+        write!(stream, "TARGET {}\n", ft)?;
     }
-    let _ = write!(stream, "{}", line);
-    let _ = stream.flush();
-    // Read the "OK" response to drain the receive buffer before closing.
-    let mut buf = [0u8; 64];
-    let _ = std::io::Read::read(&mut stream, &mut buf);
+    write!(stream, "{}", line)?;
+    stream.flush()?;
+    read_pipe_ack(&mut stream)?;
     Ok(())
 }
 
@@ -90,15 +130,16 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     if !pipe::pipe_exists(&target) {
         return Err(io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)));
     }
-    let session_key = read_session_key(&target).unwrap_or_default();
+    let session_key = read_session_key(&target)?;
     let handle = pipe::connect_to_pipe(&target, 2000)?;
     let mut stream = pipe::PipeStream::from_handle(handle);
-    let _ = write!(stream, "AUTH {}\n", session_key);
+    write!(stream, "AUTH {}\n", session_key)?;
     if let Some(ref ft) = full_target {
-        let _ = write!(stream, "TARGET {}\n", ft);
+        write!(stream, "TARGET {}\n", ft)?;
     }
-    let _ = write!(stream, "{}", line);
-    let _ = stream.flush();
+    write!(stream, "{}", line)?;
+    stream.flush()?;
+    read_pipe_ack(&mut stream)?;
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     loop {
@@ -106,19 +147,10 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&temp[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
     }
-    let result = String::from_utf8_lossy(&buf).to_string();
-    // Strip the "OK\n" AUTH response prefix if present
-    let result = if result.starts_with("OK\n") {
-        result[3..].to_string()
-    } else if result.starts_with("OK\r\n") {
-        result[4..].to_string()
-    } else {
-        result
-    };
-    Ok(result)
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 pub fn resolve_last_session_name() -> Option<String> {
@@ -163,14 +195,16 @@ pub fn resolve_default_session_name() -> Option<String> {
     None
 }
 
-/// Send a control message to a session via named pipe (no auth).
+/// Send a control message to a session via named pipe.
 /// Used by app-mode to send commands to its own server.
 pub fn send_control_to_session(session_name: &str, msg: &str) -> io::Result<()> {
-    if let Ok(handle) = pipe::connect_to_pipe(session_name, 1000) {
-        let mut stream = pipe::PipeStream::from_handle(handle);
-        let _ = stream.write_all(msg.as_bytes());
-        let _ = stream.flush();
-    }
+    let handle = pipe::connect_to_pipe(session_name, 1000)?;
+    let mut stream = pipe::PipeStream::from_handle(handle);
+    let session_key = read_session_key(session_name)?;
+    write!(stream, "AUTH {}\n", session_key)?;
+    stream.write_all(msg.as_bytes())?;
+    stream.flush()?;
+    read_pipe_ack(&mut stream)?;
     Ok(())
 }
 

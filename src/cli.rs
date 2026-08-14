@@ -344,6 +344,27 @@ For more information: https://github.com/marlocarlo/psmux
 "#, prog = prog, ver = VERSION);
 }
 
+pub fn print_send_keys_help() {
+    let prog = get_program_name();
+    println!(r#"Send keys or text to a pane.
+
+USAGE:
+    {prog} send-keys [-l] [-N count] [-t target] [--] key ...
+    {prog} send      [-l] [-N count] [-t target] [--] key ...
+
+OPTIONS:
+    -l              Send literally (no key parsing)
+    -N <count>      Repeat the key sequence
+    -t <target>     Target pane
+    --help          Show this help without sending anything
+    --              End options; required when the first key starts with '--'
+
+EXAMPLES:
+    {prog} send "echo hello" Enter
+    {prog} send -- --help Enter
+"#);
+}
+
 pub fn print_version() {
     let prog = get_program_name();
     println!("{} {}", prog, VERSION);

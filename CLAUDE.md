@@ -75,6 +75,12 @@ that start with `-` (e.g., `send-keys -- --help Enter`).
 Change `KeyCode::Backspace` from `b"\x08"` (word-delete) to `b"\x7f"` (char-delete).
 There may be two locations — one in normal mode and one in passthrough mode.
 
+### Attach missing-session diagnostic (`src/main.rs`)
+Before entering raw terminal mode for `attach` / `attach-session`, verify that the
+target session pipe exists. Missing sessions must fail as:
+`no such session: '<name>'` with a `new-session -d -s <name>` hint, instead of
+leaking raw Win32 pipe errors such as `os error 1` or `os error 2`.
+
 ## Architecture Notes
 - Fork of marlocarlo/psmux — Windows terminal multiplexer (tmux clone)
 - Uses Windows named pipes (not TCP) for IPC — see `src/pipe.rs`

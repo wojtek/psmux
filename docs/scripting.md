@@ -39,6 +39,12 @@ psmux send-keys "ls -la" Enter
 # Send keys literally (no parsing)
 psmux send-keys -l "literal text"
 
+# Show command help without sending input to a pane
+psmux send-keys --help
+
+# Send text that begins with "--"
+psmux send-keys -- --help Enter
+
 # Special keys supported:
 # Enter, Tab, Escape, Space, Backspace
 # Up, Down, Left, Right, Home, End

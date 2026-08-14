@@ -38,7 +38,7 @@ use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
 use crate::platform::enable_virtual_terminal_processing;
-use crate::cli::{print_help, print_version, print_commands, extract_session_from_target};
+use crate::cli::{print_help, print_send_keys_help, print_version, print_commands, extract_session_from_target};
 use crate::session::{cleanup_stale_port_files, read_session_key, send_control,
     send_control_with_response, resolve_last_session_name, resolve_default_session_name,
     kill_remaining_server_processes};
@@ -55,6 +55,42 @@ fn main() {
         eprintln!("psmux: {}", msg);
         std::process::exit(1);
     }
+}
+
+fn ensure_attach_target_exists(session_name: &str) -> io::Result<()> {
+    if crate::pipe::pipe_exists(session_name) {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no such session: '{}'\nhint: create it with: psmux new-session -d -s {}",
+            session_name, session_name
+        ),
+    ))
+}
+
+fn apply_socket_namespace(session_name: String, socket_name: Option<&str>) -> String {
+    if let Some(socket_name) = socket_name {
+        let prefix = format!("{}__", socket_name);
+        if session_name.starts_with(&prefix) {
+            session_name
+        } else {
+            format!("{}{}", prefix, session_name)
+        }
+    } else {
+        session_name
+    }
+}
+
+fn resolve_startup_session_name(socket_name: Option<&str>) -> String {
+    let session_name = env::var("PSMUX_SESSION_NAME")
+        .ok()
+        .or_else(resolve_default_session_name)
+        .or_else(resolve_last_session_name)
+        .unwrap_or_else(|| "default".to_string());
+    apply_socket_namespace(session_name, socket_name)
 }
 
 fn run_main() -> io::Result<()> {
@@ -190,11 +226,27 @@ fn run_main() -> io::Result<()> {
     };
     
     let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
+
+    // Command help must be resolved before any session lookup or control-pipe write.
+    if matches!(cmd, "send-keys" | "send" | "send-key")
+        && cmd_args.iter().skip(1).take_while(|arg| arg.as_str() != "--").any(|arg| arg.as_str() == "--help")
+    {
+        print_send_keys_help();
+        return Ok(());
+    }
     
     // Handle help and version flags first
     match cmd {
-        "-h" | "--help" | "help" => {
+        "-h" | "--help" => {
             print_help();
+            return Ok(());
+        }
+        "help" => {
+            if matches!(cmd_args.get(1).map(|arg| arg.as_str()), Some("send-keys" | "send" | "send-key")) {
+                print_send_keys_help();
+            } else {
+                print_help();
+            }
             return Ok(());
         }
         "-V" | "-v" | "--version" | "version" => {
@@ -320,14 +372,19 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "a" | "at" | "attach" | "attach-session" => {
-                let name = args
+                let explicit_target = args
                     .iter()
                     .position(|a| a == "-t")
                     .and_then(|i| args.get(i + 1))
-                    .map(|s| s.clone())
-                    .or_else(resolve_default_session_name)
-                    .or_else(resolve_last_session_name)
-                    .unwrap_or_else(|| "default".to_string());
+                    .cloned();
+                let name = if let Some(target) = explicit_target {
+                    let target_session = env::var("PSMUX_TARGET_SESSION")
+                        .unwrap_or_else(|_| extract_session_from_target(&target));
+                    apply_socket_namespace(target_session, l_socket_name.as_deref())
+                } else {
+                    resolve_startup_session_name(l_socket_name.as_deref())
+                };
+                ensure_attach_target_exists(&name)?;
                 env::set_var("PSMUX_SESSION_NAME", name);
                 env::set_var("PSMUX_REMOTE_ATTACH", "1");
             }
@@ -757,13 +814,37 @@ fn run_main() -> io::Result<()> {
                 let mut keys: Vec<String> = Vec::new();
                 // Getopt-style parsing: -t consumes next arg, -l/-R are boolean
                 let mut i = 1;
+                let mut parsing_flags = true;
                 while i < cmd_args.len() {
+                    if !parsing_flags {
+                        keys.push(cmd_args[i].to_string());
+                        i += 1;
+                        continue;
+                    }
                     match cmd_args[i].as_str() {
+                        "--" => {
+                            parsing_flags = false;
+                            // Preserve the separator for the server-side parser so
+                            // option-looking key names remain literal operands.
+                            keys.push("--".to_string());
+                        }
                         "-l" => { literal = true; }
                         "-R" => { keys.push("__RESET__".to_string()); }
                         "-t" => { i += 1; } // consume target value (already handled globally)
                         "-N" => { i += 1; } // repeat count, consume value
-                        _ => { keys.push(cmd_args[i].to_string()); }
+                        option if option.starts_with("--") => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "unknown send-keys option '{}'; to send it literally, use: psmux send -- {}",
+                                    option, option
+                                ),
+                            ));
+                        }
+                        _ => {
+                            parsing_flags = false;
+                            keys.push(cmd_args[i].to_string());
+                        }
                     }
                     i += 1;
                 }
@@ -2188,7 +2269,7 @@ fn run_main() -> io::Result<()> {
     // This ensures sessions persist after detach.
     if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() != Some("1") {
         let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-        let session_name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
+        let session_name = resolve_startup_session_name(l_socket_name.as_deref());
         let key_path = format!("{}\\.psmux\\{}.key", home, session_name);
 
         // Check if named pipe exists (server is actually alive)
