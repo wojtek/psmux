@@ -164,15 +164,6 @@ pub struct Pane {
     /// When false, the child expects VT SGR mouse sequences (nvim, vim).
     /// Refreshed every 2 seconds.
     pub mouse_input_cache: Option<(Instant, bool)>,
-    /// Cached foreground-process classification for the scroll-wheel
-    /// alternate-scroll decision (issue #277): `(timestamp, is_shell,
-    /// foreground_exe_name)`. `is_shell` mirrors
-    /// `platform::process_info::foreground_is_shell`'s tri-state contract
-    /// (only a confirmed non-shell foreground enables alternate-scroll);
-    /// `foreground_exe_name` is used to special-case legacy DOS-heritage
-    /// pagers (`more.com`) that don't consume arrow keys. Refreshed every
-    /// 2 seconds, same TTL as the other mouse-inject detectors above.
-    pub scroll_fg_cache: Option<(Instant, bool, Option<String>)>,
     /// Last cursor shape requested by the child process via DECSCUSR (`\x1b[N q`).
     /// 0 = no override (use PSMUX_CURSOR_STYLE default), 1-6 = DECSCUSR values.
     pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -507,8 +498,8 @@ pub struct AppState {
     /// attached client (or the PSMUX_HOST_COLORS override).  None until a
     /// client reports; the responder then falls back to the Campbell palette.
     pub host_colors: Option<HostColors>,
-    /// scroll-enter-copy-mode: when off, mouse scroll at a shell prompt does NOT
-    /// auto-enter copy mode.  Default: on (tmux parity).
+    /// scroll-enter-copy-mode: when off, mouse scroll in a pane that did not
+    /// request mouse events does not auto-enter copy mode. Default: on.
     pub scroll_enter_copy_mode: bool,
     /// pwsh-mouse-selection: when on, client-side drag selection behaves like
     /// Windows 11 PowerShell — pane-aware clipping, no copy-on-release (copy

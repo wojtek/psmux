@@ -408,46 +408,6 @@ fn ensure_vti(pane: &mut Pane) {
     }
 }
 
-/// Classify the pane's foreground process for the scroll-wheel
-/// alternate-scroll decision (issue #277): is it a confirmed non-shell
-/// program, and if so what is it called?
-///
-/// Returns `(non_shell_fg, foreground_exe_name)`.  `non_shell_fg` is only
-/// true on a *confirmed* `Some(false)` from
-/// `platform::process_info::foreground_is_shell` — never on `None` (probe
-/// failure) or `Some(true)` (confirmed shell) — the same tri-state gating
-/// #381/#285 established for Ctrl+C routing, so a normal shell prompt keeps
-/// entering copy mode on wheel-up (#360) and a probe hiccup never changes
-/// behavior. `foreground_exe_name` lets the caller special-case legacy
-/// DOS-heritage pagers (`more.com`) that don't consume arrow keys.
-///
-/// Cached for 2 seconds per pane (same TTL/rationale as `detect_vt_bridge` /
-/// `detect_mouse_input` / `ensure_vti` above) since this walks the full
-/// system process snapshot twice (`foreground_is_shell` +
-/// `get_foreground_process_name`) — too expensive to redo on every wheel
-/// tick during a fast scroll flick.
-fn scroll_foreground_classify(pane: &mut Pane) -> (bool, Option<String>) {
-    if let Some((ts, non_shell, ref name)) = pane.scroll_fg_cache {
-        if ts.elapsed().as_secs() < 2 {
-            return (non_shell, name.clone());
-        }
-    }
-    if pane.child_pid.is_none() {
-        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
-    }
-    let (non_shell, name) = match pane.child_pid {
-        Some(pid) => {
-            let non_shell = crate::platform::process_info::foreground_is_shell(pid)
-                .map_or(false, |is_shell| !is_shell);
-            let name = crate::platform::process_info::get_foreground_process_name(pid);
-            (non_shell, name)
-        }
-        None => (false, None),
-    };
-    pane.scroll_fg_cache = Some((std::time::Instant::now(), non_shell, name.clone()));
-    (non_shell, name)
-}
-
 /// Helper: inject SGR mouse via WriteConsoleInputW KEY_EVENT records.
 ///
 /// Used ONLY for WSL/SSH bridge children where the PTY pipe doesn't reach
@@ -1263,69 +1223,12 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
         return;
     }
 
-    // Not mouse-aware and not on psmux's tracked alternate screen.  Before
-    // falling back to shell semantics (copy-mode entry / no-op), check
-    // whether the pane's foreground is a genuine non-shell program (e.g.
-    // legacy pagers like Windows' `more.com`, which never issues DECSET
-    // 1049/1000 at all — `pane_wants_scroll_forward` can never see it as
-    // "alt" — but is still a real foreground app, not the shell prompt).
-    //
-    // tmux's answer for a foreground program with no mouse tracking is
-    // alternate-scroll: translate each wheel notch into arrow-key presses
-    // so the program's own built-in paging moves (DECSET 1007 semantics).
-    // That is the general case below. `more.com` is a special case within
-    // it: it's a DOS-heritage getch()-style reader that parses no ANSI
-    // escape sequences at all, so arrow keys are a silent no-op for it —
-    // proven by direct keystroke testing (Enter advances one line, Space
-    // one page, arrows do nothing). It's also forward-only by design (MS
-    // docs: no backward paging), so only wheel-down gets the Enter-advance
-    // treatment; wheel-up falls through to copy-mode entry, which already
-    // works because psmux's own scrollback buffer captured everything
-    // `more` printed regardless of what `more` itself can rewind to.
-    //
-    // `non_shell_fg` is gated on a *confirmed* `Some(false)` from the
-    // process-identity check in platform::process_info::foreground_is_shell
-    // (the same tri-state helper Ctrl+C routing uses for issue #381/#285) —
-    // never on `None` (probe failure) or `Some(true)` (confirmed shell).
-    // This is deliberately NOT the content-based `is_fullscreen_tui`
-    // heuristic: that one already misclassifies a normal shell whose
-    // screen happens to be full (prompt at the bottom) as a TUI app, which
-    // is exactly the false positive #360 fixed for copy-mode entry. Process
-    // identity has no such ambiguity — a real shell binary is never
-    // misreported as "not a shell". The legacy-pager exe-name check is
-    // similarly precise (an exact allowlist, not a guess), so Enter is only
-    // ever forwarded to the one program confirmed to want it — never to an
-    // arbitrary non-shell foreground, where an unsolicited Enter could
-    // submit a REPL/confirmation prompt the user didn't intend to trigger.
-    let (non_shell_fg, fg_name) = active_pane_mut(&mut win.root, &win.active_path)
-        .map_or((false, None), scroll_foreground_classify);
-    // `get_foreground_process_name` returns the exe stem without extension
-    // (e.g. "more" for more.com/more.exe), matching how `is_shell_exe`'s own
-    // allowlist ("pwsh", "cmd", ...) is written — verified directly via
-    // PSMUX_MOUSE_DEBUG against a live `more.com` child (fg_name=Some("more")).
-    let is_legacy_pager = non_shell_fg && fg_name.as_deref()
-        .map_or(false, |n| n.eq_ignore_ascii_case("more"));
-
-    if is_legacy_pager && !up {
-        // `more.com`: Enter is its "advance one line" key.
-        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
-            for _ in 0..3 {
-                crate::input::write_key_seq(pane, b"\r");
-            }
-            let _ = pane.writer.flush();
-        }
-    } else if non_shell_fg && !is_legacy_pager {
-        // General alternate-scroll: arrow keys (tmux DECSET-1007 parity).
-        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
-            let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-            for _ in 0..3 {
-                crate::input::write_key_seq(pane, seq);
-            }
-            let _ = pane.writer.flush();
-        }
-    } else if up && app.scroll_enter_copy_mode {
-        // Shell prompt (or `more.com` wheel-up, or a probe failure) —
-        // enter copy mode and scroll psmux's own buffer.
+    // The child did not explicitly request mouse events. Scroll psmux's own
+    // history regardless of the foreground process type. Turning the wheel
+    // into synthetic arrow/Enter keys makes the viewport appear stuck and can
+    // change application state instead of moving through terminal output.
+    if up && app.scroll_enter_copy_mode {
+        // Enter copy mode and scroll psmux's own buffer.
         enter_copy_mode(app);
         scroll_copy_up(app, 3);
     } else if !app.scroll_enter_copy_mode {
@@ -1667,7 +1570,7 @@ mod window_ops_tests {
     }
 
     #[test]
-    fn wheel_up_enters_copy_mode_and_repeated_wheel_scrolls_further() {
+    fn wheel_up_for_non_mouse_pane_enters_copy_mode_and_scrolls_history() {
         let mut app = make_scrollback_app(true);
 
         super::handle_pane_scroll(&mut app, 41, true);
@@ -1683,6 +1586,24 @@ mod window_ops_tests {
             app.copy_scroll_offset > first_offset,
             "repeated wheel reports must continue scrolling"
         );
+    }
+
+    #[test]
+    fn wheel_for_mouse_tracking_pane_stays_with_child() {
+        let mut app = make_scrollback_app(true);
+        let win = &mut app.windows[0];
+        let Node::Leaf(pane) = &mut win.root else {
+            panic!("test window must contain one pane");
+        };
+        pane.term
+            .lock()
+            .expect("term lock")
+            .process(b"\x1b[?1000h");
+
+        super::handle_pane_scroll(&mut app, 41, true);
+
+        assert!(matches!(app.mode, Mode::Passthrough));
+        assert_eq!(app.copy_scroll_offset, 0);
     }
 
     #[test]
@@ -1980,7 +1901,6 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
-    pane.scroll_fg_cache = None;
     pane.dead = false;
     pane.spawned_at = Some(std::time::Instant::now());
 
@@ -2056,7 +1976,6 @@ pub fn heal_respawn_pane(
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
-    pane.scroll_fg_cache = None;
     pane.dead = false;
     pane.spawned_at = Some(std::time::Instant::now());
     Ok(())

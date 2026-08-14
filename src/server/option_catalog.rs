@@ -29,7 +29,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "display-panes-time", scope: "session", option_type: "number", default: "1000", description: "Duration of pane numbers display in ms" },
     OptionDef { name: "repeat-time", scope: "session", option_type: "number", default: "500", description: "Repeat timeout for prefix keys in ms" },
     OptionDef { name: "mouse", scope: "session", option_type: "boolean", default: "on", description: "Enable mouse support" },
-    OptionDef { name: "scroll-enter-copy-mode", scope: "session", option_type: "boolean", default: "on", description: "Enter copy mode on mouse scroll up at shell prompt" },
+    OptionDef { name: "scroll-enter-copy-mode", scope: "session", option_type: "boolean", default: "on", description: "Enter copy mode on mouse scroll when the child did not request mouse events" },
     OptionDef { name: "pwsh-mouse-selection", scope: "session", option_type: "boolean", default: "off", description: "Windows 11 PowerShell-style drag selection (pane-aware, right-click to copy, word/line multi-click)" },
     OptionDef { name: "mouse-selection", scope: "session", option_type: "boolean", default: "on", description: "Enable psmux's client-side drag-selection overlay. Set to off so apps inside a pane (opencode, etc.) can implement their own mouse selection without psmux drawing on top." },
     OptionDef { name: "paste-detection", scope: "session", option_type: "boolean", default: "on", description: "Detect Ctrl+V paste from console host and send as bracketed paste (disable to let Ctrl+V reach child apps)" },

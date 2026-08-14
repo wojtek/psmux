@@ -3127,9 +3127,8 @@ pub mod process_info {
     /// reached it: both are expanded on the server's per-output render path, so
     /// a status bar or window title referencing them took TWO full snapshots per
     /// repaint — i.e. per keystroke, on the same thread that delivers keystrokes
-    /// to ConPTY. `window_ops::scroll_foreground_classify` had already hit this
-    /// and worked around it with its own 2s per-pane cache; the format path had
-    /// no such guard.
+    /// to ConPTY. The format path had no freshness guard, so repeated renders
+    /// multiplied those full-system walks.
     ///
     /// `max_age` is per-caller on purpose rather than a single global TTL:
     /// reusing a snapshot changes what a caller can observe, and the paths that
