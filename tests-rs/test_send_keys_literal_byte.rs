@@ -112,3 +112,127 @@ fn non_send_commands_pass_through_untouched() {
         "an unrelated command between two sends must break the run and survive verbatim"
     );
 }
+
+#[test]
+fn option_separator_allows_a_leading_dash_key() {
+    let (_, bytes) = decode("send-keys -l -- --help").expect("must decode");
+    assert_eq!(bytes, b"--help");
+}
+
+#[test]
+fn option_parsing_stops_at_the_first_key() {
+    let (_, bytes) = decode("send-keys -l text -n").expect("must decode");
+    assert_eq!(bytes, b"text-n");
+}
+
+#[test]
+fn empty_key_operand_is_ignored() {
+    let parsed = parse_send_keys_args(&["-l", "text", "", "-n"]);
+    assert_eq!(parsed.operands, vec!["text", "-n"]);
+}
+
+#[test]
+fn shared_parser_preserves_clusters_targets_and_later_dash_keys() {
+    let parsed = parse_send_keys_args(&["-lt", "%1", "A", "-n"]);
+    assert!(parsed.literal);
+    assert_eq!(parsed.target, Some("%1"));
+    assert_eq!(parsed.operands, vec!["A", "-n"]);
+}
+
+#[test]
+fn unrecognized_single_dash_token_starts_key_input() {
+    let parsed = parse_send_keys_args(&["-z", "-t", "%9"]);
+    assert_eq!(parsed.target, None);
+    assert_eq!(parsed.operands, vec!["-z", "-t", "%9"]);
+}
+
+#[test]
+fn shared_dispatch_rejects_prefix_long_options_without_sending() {
+    let (tx, rx) = mpsc::channel();
+    let outcome = dispatch_send_keys(&["--hepl", "Enter"], &tx);
+    assert_eq!(
+        outcome,
+        SendKeysDispatchOutcome::InvalidLongOption(
+            "unknown send-keys option '--hepl'; to send it literally, use: psmux send -- --hepl".to_string()
+        )
+    );
+    assert!(rx.try_recv().is_err(), "invalid prefix input must not reach the pane");
+
+    let help = dispatch_send_keys(&["--help"], &tx);
+    assert_eq!(help, SendKeysDispatchOutcome::Help);
+    assert!(rx.try_recv().is_err(), "help must not reach the pane");
+}
+
+#[test]
+fn reset_dispatches_before_following_keys() {
+    let (tx, rx) = mpsc::channel();
+    let outcome = dispatch_send_keys(&["-R", "Enter"], &tx);
+    assert_eq!(outcome, SendKeysDispatchOutcome::Dispatched);
+    assert!(matches!(rx.recv().unwrap(), CtrlReq::ResetTerminal));
+    assert!(matches!(
+        rx.recv().unwrap(),
+        CtrlReq::SendKeys(keys, false) if keys == vec!["Enter"]
+    ));
+    assert!(rx.try_recv().is_err(), "reset plus one key must emit exactly two requests");
+}
+
+#[test]
+fn shared_dispatch_sends_leading_dash_operands_unchanged() {
+    let (tx, rx) = mpsc::channel();
+    dispatch_send_keys(&["-l", "--", "--help", "-n"], &tx);
+
+    match rx.recv().expect("one send request") {
+        CtrlReq::SendKeys(keys, literal) => {
+            assert!(literal);
+            assert_eq!(keys, vec!["--help", "-n"]);
+        }
+        _ => panic!("expected SendKeys"),
+    }
+    assert!(rx.try_recv().is_err(), "dispatch must emit exactly one request");
+}
+
+#[test]
+fn direct_cli_rebuild_protects_target_shaped_key_operands() {
+    let command = crate::cli::build_send_keys_control_command(
+        &["-t", "%1", "-l", "--", "-t", "%9"],
+    );
+    assert_eq!(command, "send-keys -l -- \"-t\" \"%9\"");
+}
+
+#[test]
+fn flag_equals_normalization_stops_at_first_send_keys_operand() {
+    let input = vec!["send-keys", "-l", "text", "-t=%9"];
+    let normalized = crate::cli::normalize_flag_equals(
+        input.iter().map(|arg| (*arg).to_string()).collect(),
+    );
+    assert_eq!(normalized, input);
+}
+
+#[test]
+fn flag_equals_normalization_keeps_pre_boundary_send_keys_options() {
+    let normalized = crate::cli::normalize_flag_equals(
+        ["psmux", "send-keys", "-t=%1", "-N=2", "A"]
+            .iter().map(|arg| (*arg).to_string()).collect(),
+    );
+    assert_eq!(normalized, vec!["psmux", "send-keys", "-t", "%1", "-N", "2", "A"]);
+
+    let args: Vec<&str> = normalized.iter().skip(2).map(|arg| arg.as_str()).collect();
+    let parsed = parse_send_keys_args(&args);
+    assert_eq!(parsed.target, Some("%1"));
+    assert_eq!(parsed.repeat_count, 2);
+    assert_eq!(parsed.operands, vec!["A"]);
+}
+
+#[test]
+fn send_keys_alias_expands_before_operand_normalization() {
+    let parsed = expand_command_alias_and_normalize(
+        parse_command_line("sk -t=%9"),
+        Some("send-keys -l --"),
+    );
+    assert_eq!(parsed, vec!["send-keys", "-l", "--", "-t=%9"]);
+
+    let args: Vec<&str> = parsed.iter().skip(1).map(|arg| arg.as_str()).collect();
+    let send_keys = parse_send_keys_args(&args);
+    assert_eq!(send_keys.target, None);
+    assert_eq!(send_keys.operands, vec!["-t=%9"]);
+}

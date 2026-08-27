@@ -1850,6 +1850,8 @@ pub enum CtrlReq {
     // re-split on whitespace — that collapsed runs of spaces inside quoted
     // arguments and stripped leading/trailing spaces.
     SendKeys(Vec<String>, bool),
+    /// send-keys -R: reset the target pane's parsed terminal state and screen.
+    ResetTerminal,
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),

@@ -50,7 +50,9 @@ use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
 use crate::platform::enable_virtual_terminal_processing;
-use crate::cli::{print_help, print_version, print_commands};
+use crate::cli::{build_send_keys_control_command, classify_send_keys_cli,
+    parse_send_keys_args, print_commands, print_help, print_kill_server_help,
+    print_send_keys_help, print_version, SendKeysCliAction};
 use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control,
     send_control_with_response, resolve_default_session_name,
     force_kill_targets, confirms_identity};
@@ -520,6 +522,27 @@ fn process_target_position(args: &[String], command_index: usize) -> Option<usiz
         .map(|position| command_index + 1 + position)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum KillServerCliAction<'a> {
+    Unrelated,
+    Execute,
+    Help,
+    Invalid(&'a str),
+}
+
+fn classify_kill_server_command<'a>(cmd: &str, cmd_args: &'a [&String]) -> KillServerCliAction<'a> {
+    if cmd != "kill-server" {
+        return KillServerCliAction::Unrelated;
+    }
+    match cmd_args.get(1) {
+        Some(arg) if cmd_args.len() == 2 && matches!(arg.as_str(), "-h" | "--help") => {
+            KillServerCliAction::Help
+        }
+        Some(arg) => KillServerCliAction::Invalid(arg.as_str()),
+        None => KillServerCliAction::Execute,
+    }
+}
+
 #[cfg(test)]
 mod process_command_arg_tests {
     use super::*;
@@ -557,6 +580,27 @@ mod process_command_arg_tests {
         let command = process_command_index(&args).unwrap();
         assert_eq!(process_target_position(&args, command), Some(1));
     }
+
+    #[test]
+    fn kill_server_help_and_typos_never_classify_as_execute() {
+        let help = strings(&["kill-server", "-h"]);
+        assert_eq!(classify_kill_server_command("kill-server", &help.iter().collect::<Vec<_>>()), KillServerCliAction::Help);
+
+        let long_help = strings(&["kill-server", "--help"]);
+        assert_eq!(classify_kill_server_command("kill-server", &long_help.iter().collect::<Vec<_>>()), KillServerCliAction::Help);
+
+        let typo = strings(&["kill-server", "--hepl"]);
+        assert_eq!(classify_kill_server_command("kill-server", &typo.iter().collect::<Vec<_>>()), KillServerCliAction::Invalid("--hepl"));
+
+        let mixed = strings(&["kill-server", "--hepl", "--help"]);
+        assert_eq!(classify_kill_server_command("kill-server", &mixed.iter().collect::<Vec<_>>()), KillServerCliAction::Invalid("--hepl"));
+
+        let help_with_extra = strings(&["kill-server", "--help", "extra"]);
+        assert_eq!(classify_kill_server_command("kill-server", &help_with_extra.iter().collect::<Vec<_>>()), KillServerCliAction::Invalid("--help"));
+
+        let execute = strings(&["kill-server"]);
+        assert_eq!(classify_kill_server_command("kill-server", &execute.iter().collect::<Vec<_>>()), KillServerCliAction::Execute);
+    }
 }
 
 fn run_main() -> io::Result<()> {
@@ -573,19 +617,6 @@ fn run_main() -> io::Result<()> {
     // like capture-pane, list-sessions, display-message, etc.) correctly
     // render multi-byte Unicode characters instead of mojibake.
     enable_virtual_terminal_processing();
-
-    // Clean up any stale port files at startup
-    cleanup_stale_port_files();
-    // Then drop registry files whose `.port` entry is already gone (issue
-    // #530). The sweep above is the only thing that can reach them, and it
-    // finds entries BY their `.port` file — so a satellite that outlives its
-    // port is invisible to it and accumulates forever.
-    crate::session::prune_orphaned_registry_files();
-    // Then reap any LIVE but orphaned server processes (issue #448): duplicates
-    // or crashed-client headless servers that cleanup_stale_port_files cannot
-    // see because they have no registry file. Bounds the process count so
-    // orphans can't accumulate to the point of exhausting Windows desktop-heap.
-    reap_orphaned_servers();
 
     // Parse -L flag early (tmux-compatible: names the server socket for namespace isolation)
     // In psmux, -L <name> creates a namespace prefix for session port/key files.
@@ -638,13 +669,103 @@ fn run_main() -> io::Result<()> {
     // the pane environment (e.g. a warm-pool shell frozen at `__warm__`) can never
     // hijack the current session. See issue #485.
     let command_index = process_command_index(&args);
-    let target_position = command_index.and_then(|index| process_target_position(&args, index));
+    let raw_cmd_args: Vec<&String> = command_index
+        .map(|index| args[index..].iter().collect())
+        .unwrap_or_default();
+    let raw_cmd = raw_cmd_args.first().map(|arg| arg.as_str()).unwrap_or("");
+
+    // Resolve every side-effect-free command and every destructive-command
+    // argument error before target routing performs registry or session reads.
+    if matches!(raw_cmd, "send-keys" | "send" | "send-key") {
+        let send_args: Vec<&str> = raw_cmd_args.iter().skip(1).map(|arg| arg.as_str()).collect();
+        match classify_send_keys_cli(&send_args) {
+            SendKeysCliAction::Help => {
+                print_send_keys_help();
+                return Ok(());
+            }
+            SendKeysCliAction::InvalidLongOption(arg) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown send-keys option '{}'; to send it literally, use: psmux send -- {}",
+                        arg, arg
+                    ),
+                ));
+            }
+            SendKeysCliAction::Execute => {}
+        }
+    }
+    match classify_kill_server_command(raw_cmd, &raw_cmd_args) {
+        KillServerCliAction::Help => {
+            print_kill_server_help();
+            return Ok(());
+        }
+        KillServerCliAction::Invalid(arg) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown kill-server argument '{}'\nhint: run 'psmux kill-server --help'",
+                    arg
+                ),
+            ));
+        }
+        KillServerCliAction::Unrelated | KillServerCliAction::Execute => {}
+    }
+    match raw_cmd {
+        "-h" | "--help" => {
+            print_help();
+            return Ok(());
+        }
+        "help" => {
+            match raw_cmd_args.get(1).map(|arg| arg.as_str()) {
+                Some("send-keys" | "send" | "send-key") => print_send_keys_help(),
+                Some("kill-server") => print_kill_server_help(),
+                _ => print_help(),
+            }
+            return Ok(());
+        }
+        "-V" | "-v" | "--version" | "version" => {
+            print_version();
+            return Ok(());
+        }
+        "list-commands" | "lscm" => {
+            print_commands();
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let parsed_cli_send_keys = command_index
+        .filter(|index| matches!(args[*index].as_str(), "send-keys" | "send" | "send-key"))
+        .map(|index| {
+            let tail: Vec<&str> = args[index + 1..].iter().map(String::as_str).collect();
+            parse_send_keys_args(&tail)
+        });
+    let global_target_position = command_index.and_then(|index| {
+        args[1..index]
+            .iter()
+            .position(|arg| arg == "-t")
+            .map(|position| position + 1)
+    });
+    let target_position = if parsed_cli_send_keys.is_some() {
+        global_target_position
+    } else {
+        command_index.and_then(|index| process_target_position(&args, index))
+    };
     let strip_target_position = command_index
         .filter(|index| !matches!(args[*index].as_str(), "detach-client" | "detach"))
+        .filter(|_| parsed_cli_send_keys.is_none())
         .and(target_position);
     let mut explicit_session_target = false;
-    if let Some(pos) = target_position {
-        if let Some(target) = args.get(pos + 1) {
+    let explicit_target = parsed_cli_send_keys
+        .as_ref()
+        .and_then(|parsed| {
+            global_target_position
+                .and_then(|position| args.get(position + 1).map(String::as_str))
+                .or(parsed.target)
+        })
+        .or_else(|| target_position.and_then(|position| args.get(position + 1).map(String::as_str)));
+    if let Some(target) = explicit_target {
             // move-window/swap-window: a bare -t that names a WINDOW (tmux
             // target-window semantics), not a session. Coerce "N" -> ":N" so the
             // generic parser treats it as a window and routing stays on the current
@@ -714,7 +835,6 @@ fn run_main() -> io::Result<()> {
                 env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
                 explicit_session_target = true;
             }
-        }
     }
     if !explicit_session_target {
         // No explicit `-t session` on this command line: `$TMUX` (set inside
@@ -778,20 +898,8 @@ fn run_main() -> io::Result<()> {
         cli_validate_window_pane_target(l_socket_name.as_deref());
     }
 
-    // Handle help and version flags first
+    // Handle side-effect-free internal rendering before startup maintenance.
     match cmd {
-        "-h" | "--help" | "help" => {
-            print_help();
-            return Ok(());
-        }
-        "-V" | "-v" | "--version" | "version" => {
-            print_version();
-            return Ok(());
-        }
-        "list-commands" | "lscm" => {
-            print_commands();
-            return Ok(());
-        }
         // Hidden internal command for empirical preview rendering tests.
         // Usage: psmux _render-preview <session> <win_id> <width> <height>
         // Fetches the window-dump and renders it via the SAME render_layout_json
@@ -862,6 +970,11 @@ fn run_main() -> io::Result<()> {
         }
         _ => {}
     }
+
+    // Mutating startup maintenance belongs after every side-effect-free path.
+    cleanup_stale_port_files();
+    crate::session::prune_orphaned_registry_files();
+    reap_orphaned_servers();
 
     match cmd {
         // kill-server MUST be handled early before any potential fall-through
@@ -2099,38 +2212,8 @@ fn run_main() -> io::Result<()> {
             }
             // send-keys - Send keys to a pane (critical for scripting)
             "send-keys" | "send" | "send-key" => {
-                let mut literal = false;
-                let mut has_x = false;
-                let mut has_hex = false;
-                let mut keys: Vec<String> = Vec::new();
-                // Getopt-style parsing: -t consumes next arg, -l/-R/-X/-H are flags
-                let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-l" => { literal = true; }
-                        "-R" => { keys.push("__RESET__".to_string()); }
-                        "-X" => { has_x = true; }
-                        "-H" => { has_hex = true; }
-                        "-t" => { i += 1; } // consume target value (already handled globally)
-                        "-N" => { i += 1; } // repeat count, consume value
-                        _ => { keys.push(cmd_args[i].to_string()); }
-                    }
-                    i += 1;
-                }
-                let mut cmd = "send-keys".to_string();
-                if literal { cmd.push_str(" -l"); }
-                if has_x { cmd.push_str(" -X"); }
-                if has_hex { cmd.push_str(" -H"); }
-                // Quote arguments that need it. quote_arg_if_needed escapes
-                // backslashes as well as quotes inside the wrapping quotes,
-                // matching what parse_command_line decodes there (#547) —
-                // the old encoder escaped only `"`, so a quoted key ending
-                // in `\` consumed the closing quote and swallowed the rest.
-                // Unquoted values keep literal backslashes byte-exact
-                // (Windows path separators).
-                for k in keys {
-                    cmd.push_str(&format!(" {}", crate::util::quote_arg_if_needed(&k)));
-                }
+                let send_args: Vec<&str> = cmd_args.iter().skip(1).map(|arg| arg.as_str()).collect();
+                let mut cmd = build_send_keys_control_command(&send_args);
                 cmd.push('\n');
                 send_control(cmd)?;
                 return Ok(());

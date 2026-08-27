@@ -2582,6 +2582,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::SendBytes(bytes) => {
                     send_bytes_to_active(&mut app, &bytes)?;
                 }
+                CtrlReq::ResetTerminal => {
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if let Ok(mut terminal) = pane.term.lock() {
+                            // tmux send-keys -R resets the parser and clears the
+                            // pane screen without writing a marker to the child.
+                            terminal.process(b"\x1bc");
+                        }
+                        pane.data_version.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
+                }
                 CtrlReq::SendKeys(keys, literal) => {
                     let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
                     if in_copy {
