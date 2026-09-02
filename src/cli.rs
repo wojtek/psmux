@@ -337,6 +337,7 @@ SESSION COMMANDS:
     kill-server             Kill all sessions and the server
     rename-session, rename  Rename the current session
     switch-client, switchc  Switch to another session
+    pick                    Attach and open the session picker
     list-clients, lsc       List connected clients
     detach-client, detach   Detach attached client(s); session keeps running
         -t <client>         Target a specific client (tty path or %id)
@@ -538,6 +539,7 @@ SET OPTIONS (use with: set -g <option> <value>):
     aggressive-resize   Bool Resize to smallest client (default: off)
     set-titles          Bool Update terminal title (default: off)
     set-titles-string   Str  Terminal title format
+    tab-colour          Str  Windows Terminal tab colour (empty clears it)
     default-shell       Str  Shell to launch (default: pwsh)
     default-command     Str  Alias for default-shell
     word-separators     Str  Copy-mode word delimiters (default: " -_@")
@@ -731,6 +733,7 @@ pub fn print_commands() {
   break-pane                - Break a pane into a new window
   capture-pane              - Capture the contents of a pane
   choose-buffer (chooseb)   - Choose a paste buffer interactively
+  pick                      - Attach and choose a session interactively
   choose-tree               - Choose a session, window or pane from a tree
   clear-history (clearhist) - Clear pane scrollback history
   clock-mode                - Display a large clock in current pane

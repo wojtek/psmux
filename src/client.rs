@@ -12,12 +12,115 @@ use crate::help;
 use crate::util::{WinTree, base64_encode, quote_arg};
 use crate::session::read_session_key;
 use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_rect, fix_border_intersections};
-use crate::style::parse_tmux_style_components;
+use crate::style::{parse_tmux_color, parse_tmux_style_components};
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
+
+const WINDOWS_TERMINAL_FRAME_FG_INDEX: u16 = 263;
+const WINDOWS_TERMINAL_FRAME_BG_INDEX: u16 = 264;
+const WINDOWS_TERMINAL_TAB_COLOR_INDEX: u16 = 264;
+
+fn indexed_tab_color_rgb(index: u8, host_colors: &crate::types::HostColors) -> (u8, u8, u8) {
+    if index < 16 {
+        return host_colors.palette[index as usize]
+            .or_else(|| crate::types::HostColors::campbell().palette[index as usize])
+            .expect("Campbell defines all 16 ANSI palette entries");
+    }
+    if index < 232 {
+        const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let offset = index - 16;
+        return (
+            CUBE[(offset / 36) as usize],
+            CUBE[((offset % 36) / 6) as usize],
+            CUBE[(offset % 6) as usize],
+        );
+    }
+    let gray = 8 + (index - 232) * 10;
+    (gray, gray, gray)
+}
+
+fn tab_color_rgb(
+    value: &str,
+    host_colors: &crate::types::HostColors,
+) -> Option<(u8, u8, u8)> {
+    let color = parse_tmux_color(value)?;
+    let index = match color {
+        Color::Rgb(r, g, b) => return Some((r, g, b)),
+        Color::Indexed(index) => return Some(indexed_tab_color_rgb(index, host_colors)),
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Reset => return None,
+    };
+    Some(indexed_tab_color_rgb(index, host_colors))
+}
+
+fn host_tab_color_sequence(
+    value: Option<&str>,
+    host_colors: &crate::types::HostColors,
+) -> Option<String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Some(format!(
+            "\x1b]104;{}\x1b\\\x1b[2;{};{},|",
+            WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+            WINDOWS_TERMINAL_FRAME_FG_INDEX,
+            WINDOWS_TERMINAL_FRAME_BG_INDEX,
+        ));
+    };
+    if matches!(parse_tmux_color(value), Some(Color::Reset)) {
+        return Some(format!(
+            "\x1b]104;{}\x1b\\\x1b[2;{};{},|",
+            WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+            WINDOWS_TERMINAL_FRAME_FG_INDEX,
+            WINDOWS_TERMINAL_FRAME_BG_INDEX,
+        ));
+    }
+    let (r, g, b) = tab_color_rgb(value, host_colors)?;
+    // Slot 264 is outside the normal 0-255 text palette, so redefining it does
+    // not change cells rendered with a normal palette colour. Windows Terminal
+    // 1.24 also accepted and read back this extended slot directly.
+    Some(format!(
+        "\x1b]4;{};rgb:{:02x}/{:02x}/{:02x}\x1b\\\x1b[2;{};{},|",
+        WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+        r,
+        g,
+        b,
+        WINDOWS_TERMINAL_FRAME_FG_INDEX,
+        WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+    ))
+}
+
+fn emit_host_tab_color<W: Write>(
+    out: &mut W,
+    current: Option<String>,
+    last_emitted: &mut Option<String>,
+    host_colors: &crate::types::HostColors,
+) {
+    if current == *last_emitted {
+        return;
+    }
+    if let Some(sequence) = host_tab_color_sequence(current.as_deref(), host_colors) {
+        let _ = out.write_all(sequence.as_bytes());
+        let _ = out.flush();
+    }
+    *last_emitted = current;
+}
 
 /// A floating pane (tmux new-pane) as shipped from the server: position, size,
 /// border style, focus, title, and the pane's rendered rows.
@@ -217,6 +320,173 @@ pub(crate) fn popup_overlay_rect(content_chunk: Rect, want_w: u16, want_h: u16) 
         width: w,
         height: h,
     }
+}
+
+/// Screen rect of the choose-session overlay. Its height still follows the
+/// preview/list rules, but the session list is a navigation surface and uses
+/// every available content column in either mode.
+pub(crate) fn session_chooser_popup_rect(
+    content_chunk: Rect,
+    preview_enabled: bool,
+    entry_count: usize,
+    buffer_rows: u16,
+    popup_offset: (i32, i32),
+) -> Rect {
+    let avail_w = content_chunk.width;
+    let avail_h = content_chunk.height;
+    let popup_w = avail_w;
+    let popup_h = if preview_enabled {
+        let want_h = ((avail_h as u32 * 75) / 100) as u16;
+        want_h.max(10).min(avail_h)
+    } else {
+        (entry_count as u16)
+            .saturating_add(2)
+            .saturating_add(buffer_rows)
+            .max(5)
+            .min(content_chunk.height.saturating_sub(2))
+    };
+    let base_x = content_chunk.x + (avail_w.saturating_sub(popup_w)) / 2;
+    let base_y = content_chunk.y + (avail_h.saturating_sub(popup_h)) / 2;
+    let max_dx = (avail_w.saturating_sub(popup_w)) as i32 / 2;
+    let max_dy = (avail_h.saturating_sub(popup_h)) as i32 / 2;
+    let dx = popup_offset.0.clamp(-max_dx, max_dx);
+    let dy = popup_offset.1.clamp(-max_dy, max_dy);
+    Rect {
+        x: ((base_x as i32) + dx).max(content_chunk.x as i32) as u16,
+        y: ((base_y as i32) + dy).max(content_chunk.y as i32) as u16,
+        width: popup_w,
+        height: popup_h,
+    }
+}
+
+#[derive(Debug)]
+struct SessionChooserEntry {
+    name: String,
+    info: String,
+    attached: bool,
+}
+
+fn session_info_has_attached_client(info: &str) -> bool {
+    info.split_once(": ")
+        .map_or(false, |(_, details)| details.ends_with(" (attached)"))
+}
+
+fn truncate_to_display_width(value: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut width = 0;
+    value
+        .chars()
+        .take_while(|ch| {
+            let char_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+            if width + char_width > max_width {
+                return false;
+            }
+            width += char_width;
+            true
+        })
+        .collect()
+}
+
+fn truncate_end_to_display_width(value: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut width = 0;
+    let mut chars: Vec<char> = value
+        .chars()
+        .rev()
+        .take_while(|ch| {
+            let char_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+            if width + char_width > max_width {
+                return false;
+            }
+            width += char_width;
+            true
+        })
+        .collect();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+/// Keep both identifying ends of a long session name. Display-cell widths,
+/// rather than bytes or scalar counts, keep CJK and emoji rows aligned.
+fn middle_ellipsize(value: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    // Below three cells there is no room for a useful head, ellipsis, and tail.
+    if max_width < 3 {
+        return truncate_to_display_width(value, max_width);
+    }
+
+    let text_width = max_width - 1;
+    let head_width = (text_width + 1) / 2;
+    let tail_width = text_width / 2;
+    let head = truncate_to_display_width(value, head_width);
+    let tail = truncate_end_to_display_width(value, tail_width);
+    if head.is_empty() || tail.is_empty() {
+        return truncate_to_display_width(value, max_width);
+    }
+    format!("{}…{}", head, tail)
+}
+
+fn session_info_for_row(
+    info: &str,
+    row_width: usize,
+    visible_idx: usize,
+    num_width: usize,
+    marker: &str,
+) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let Some((name, details)) = info.split_once(": ") else {
+        return info.to_string();
+    };
+    let prefix = format!("{:>w$}. {} ", visible_idx + 1, marker, w = num_width);
+    let fixed_width = UnicodeWidthStr::width(prefix.as_str())
+        + UnicodeWidthStr::width(": ")
+        + UnicodeWidthStr::width(details);
+    if fixed_width >= row_width {
+        return info.to_string();
+    }
+    let name = middle_ellipsize(name, row_width.saturating_sub(fixed_width));
+    format!("{}: {}", name, details)
+}
+
+fn session_chooser_row_line(
+    visible_idx: usize,
+    num_width: usize,
+    marker: &str,
+    info: &str,
+    attached: bool,
+    selected: bool,
+    mode_style: Style,
+) -> Line<'static> {
+    let digits = (visible_idx + 1).to_string();
+    let padding = " ".repeat(num_width.saturating_sub(digits.len()));
+    let row_style = if selected { mode_style } else { Style::default() };
+    let number_style = if selected {
+        mode_style
+    } else if attached {
+        // The border uses the full mode style. Reuse its background accent as
+        // a foreground here; fg-only mode styles still work.
+        mode_style
+            .bg
+            .or(mode_style.fg)
+            .map_or_else(Style::default, |color| Style::default().fg(color))
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(padding, row_style),
+        Span::styled(digits, number_style),
+        Span::styled(format!(". {} {}", marker, info), row_style),
+    ])
 }
 
 /// Screen position of a PTY popup's cursor, given the popup-inner cursor cell
@@ -1559,9 +1829,138 @@ pub(crate) fn no_such_session(name: &str) -> io::Error {
     )
 }
 
-pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
-    let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
-    let path = crate::paths::port_file(&name);
+/// Reset and populate choose-session from the live registry. Keypress opens and
+/// startup opens share this function so stale-session probing, reaping, and the
+/// initial cursor can never diverge between the two entry paths.
+fn open_session_chooser(
+    current_session: &str,
+    choose_tree_preview_default: bool,
+    opened_at_startup: bool,
+    session_chooser: &mut bool,
+    session_entries: &mut Vec<SessionChooserEntry>,
+    session_selected: &mut usize,
+    session_scroll: &mut usize,
+    session_num_buffer: &mut String,
+    session_filter_active: &mut bool,
+    session_filter: &mut String,
+    popup_offset: &mut (i32, i32),
+    popup_dragging: &mut bool,
+    popup_rect_last: &mut Option<Rect>,
+    preview_enabled: &mut bool,
+) {
+    *session_chooser = true;
+    session_entries.clear();
+    *session_selected = 0;
+    *session_scroll = 0;
+    session_num_buffer.clear();
+    *session_filter_active = false;
+    session_filter.clear();
+    *popup_offset = (0, 0);
+    *popup_dragging = false;
+    *popup_rect_last = None;
+    if choose_tree_preview_default {
+        *preview_enabled = true;
+    }
+
+    let dir = crate::paths::psmux_dir();
+    // Collect every port file, then run one bounded liveness probe per session
+    // in parallel. Total wall time stays near one probe window rather than
+    // growing with the number of sessions.
+    let mut targets: Vec<(String, String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Some(fname) = entry.file_name().to_str() {
+                if let Some((base, ext)) = fname.rsplit_once('.') {
+                    if ext == "port" {
+                        if crate::session::is_warm_session(base) {
+                            continue;
+                        }
+                        if let Ok(port_str) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(port) = port_str.trim().parse::<u16>() {
+                                let session_addr = format!("127.0.0.1:{}", port);
+                                let session_key = read_session_key(base).unwrap_or_default();
+                                targets.push((base.to_string(), session_addr, session_key));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Directory enumeration order is not stable on Windows; alphabetical
+    // order is the picker contract used by g/G and Home/End (issue #259).
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    let verdicts = crate::session::classify_sessions_parallel(
+        targets,
+        Duration::from_millis(50),
+        Duration::from_millis(250),
+    );
+    for (label, liveness) in verdicts {
+        match liveness {
+            crate::session::SessionLiveness::Alive(info) => {
+                let attached = session_info_has_attached_client(&info);
+                session_entries.push(SessionChooserEntry {
+                    name: label,
+                    info,
+                    attached,
+                });
+            }
+            crate::session::SessionLiveness::Dead => {
+                // Server gone or its port was reused. Reap it so the chooser
+                // never presents a dead registry entry as merely slow.
+                if crate::debug_log::session_log_enabled() {
+                    crate::debug_log::session_log(
+                        "picker",
+                        &format!("reaping dead session '{}' from chooser", label),
+                    );
+                }
+                crate::session::remove_session_registry(&label);
+            }
+            crate::session::SessionLiveness::Unreachable => {
+                session_entries.push(SessionChooserEntry {
+                    name: label.clone(),
+                    info: format!("{}: (not responding)", label),
+                    attached: false,
+                });
+            }
+        }
+    }
+    if session_entries.is_empty() {
+        session_entries.push(SessionChooserEntry {
+            name: current_session.to_string(),
+            info: format!("{}: (current)", current_session),
+            attached: false,
+        });
+    }
+    for (index, entry) in session_entries.iter().enumerate() {
+        if entry.name == current_session {
+            *session_selected = index;
+            break;
+        }
+    }
+
+    // The startup marker is a nonvisual witness that the overlay state was set
+    // before the first draw; ordinary keypress opens do not emit it.
+    if opened_at_startup && crate::debug_log::session_log_enabled() {
+        crate::debug_log::session_log(
+            "picker",
+            &format!(
+                "opened session chooser at client startup for '{}' with {} entries",
+                current_session,
+                session_entries.len(),
+            ),
+        );
+    }
+}
+
+pub fn run_remote(
+    terminal: &mut Terminal<crate::platform::PsmuxBackend>,
+    input: &crate::ssh_input::InputSource,
+    socket_name: Option<&str>,
+    start_in_session_chooser: bool,
+) -> io::Result<()> {
+    let mut name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
+    let mut path = crate::paths::port_file(&name);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
         .ok_or_else(|| no_such_session(&name))?;
     let addr = format!("127.0.0.1:{}", port);
@@ -1596,7 +1995,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     crate::session::touch_session_activity(&name);
     // The name this client keeps restamping while the user types. `None` for a
     // warm (standby) session, which is internal and never a routing candidate.
-    let activity_name: Option<String> =
+    let mut activity_name: Option<String> =
         if crate::session::is_warm_session(&name) { None } else { Some(name.clone()) };
 
     // ── Open persistent TCP connection ───────────────────────────────────
@@ -1679,7 +2078,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Digit-jump buffer for the choose-buffer picker.
     let mut buffer_num_buffer = String::new();
     let mut session_chooser = false;
-    let mut session_entries: Vec<(String, String)> = Vec::new();
+    let mut session_entries: Vec<SessionChooserEntry> = Vec::new();
     let mut session_selected: usize = 0;
     let mut session_scroll: usize = 0;
     // Digits typed while the picker is open accumulate here and are consumed
@@ -1687,6 +2086,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut session_num_buffer = String::new();
     let mut session_filter_active = false;
     let mut session_filter = String::new();
+    // Picker rename is deliberately separate from the attached-session
+    // rename prompt: it targets whichever session row is highlighted.
+    let mut picker_rename_target: Option<String> = None;
+    let mut picker_rename_buf = String::new();
+    let mut picker_rename_error: Option<String> = None;
+    let mut picker_rename_pending: Option<PickerRenamePending> = None;
     // Digit-jump buffer for the customize-mode picker. Customize lives on
     // the server, so Enter computes a navigate delta and dispatches
     // `customize-navigate <delta>` instead of mutating local state directly.
@@ -1707,6 +2112,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // pickers open with `preview_enabled` already set so the user does not
     // need to press `p` each time. Configured via `set -g choose-tree-preview on`.
     let mut choose_tree_preview_default: bool = false;
+    let mut startup_session_chooser_pending = start_in_session_chooser;
     // Draggable popup state (shared across pickers). Offset is applied on top
     // of the centered rect; resets when no picker is open.
     let mut popup_offset: (i32, i32) = (0, 0);
@@ -1715,7 +2121,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut popup_initial_offset: (i32, i32) = (0, 0);
     let mut popup_rect_last: Option<Rect> = None;
     let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
-    let current_session = name.clone();
+    let mut current_session = name.clone();
     let mut last_sent_size: (u16, u16) = (0, 0);
     let mut last_status_lines: u16 = 1; // track server's status_lines for correct client-size height
     let mut last_dump_time = Instant::now() - Duration::from_millis(250);
@@ -1791,6 +2197,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Release ~80ms later.  This flag suppresses that phantom duplicate.
     #[cfg(windows)]
     let mut modified_enter_press_handled: bool = false;
+    // Windows clipboard injection can deliver a paste as individual key events.
+    // Once three characters arrive in the same short burst, a following Enter
+    // is text from that paste, not prompt acceptance.
+    #[cfg(windows)]
+    let mut picker_key_burst_start: Option<Instant> = None;
+    #[cfg(windows)]
+    let mut picker_key_burst_len: usize = 0;
+    #[cfg(windows)]
+    let mut picker_key_burst_active: bool = false;
+    #[cfg(windows)]
+    let mut picker_key_burst_last: Option<Instant> = None;
 
     // list-keys overlay state (C-b ?)
     let mut keys_viewer = false;
@@ -2063,6 +2480,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// iTerm2, etc.) follow the active pane / window title.
         #[serde(default)]
         host_title: Option<String>,
+        /// Session tab colour forwarded by the server. The client emits the
+        /// Windows Terminal frame-colour sequences after drawing.
+        #[serde(default)]
+        host_tab_color: Option<String>,
         /// Issue #269: OSC 9;4 progress indicator from the active pane,
         /// formatted as "<state>;<value>".  Client emits OSC 9;4 to its host
         /// terminal so apps inside a pane (Copilot CLI, build tools) keep
@@ -2228,6 +2649,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Last OSC 0 (host terminal title) value emitted to the host terminal.
     // Tracked across iterations so we only re-emit when the title changes.
     let mut last_emitted_host_title: Option<String> = None;
+    // Last Windows Terminal frame/tab colour emitted to the host terminal.
+    // Same debounce pattern as host_title and host_progress.
+    let mut last_emitted_host_tab_color: Option<String> = None;
     // Issue #269: last OSC 9;4 (host terminal progress) value emitted.
     // Same debounce pattern as host_title.
     let mut last_emitted_host_progress: Option<String> = None;
@@ -2349,6 +2773,73 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
         }
         if quit && !got_frame { break; }
+
+        // The rename command and registry confirmation run on a worker so a
+        // slow server or before-rename-session hook cannot stall drawing or
+        // input. Only publish the new identity after both .port and .key have
+        // been observed by that worker.
+        let picker_rename_result = picker_rename_pending.as_ref().and_then(|pending| {
+            match pending.result_rx.try_recv() {
+                Ok(confirmed) => Some(Ok(confirmed)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(())),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = picker_rename_result {
+            let pending = picker_rename_pending.take().unwrap();
+            if matches!(result, Ok(true)) {
+                if session_chooser {
+                    for entry in &mut session_entries {
+                        if entry.name == pending.old_base {
+                            entry.name = pending.new_base.clone();
+                            if let Some(colon) = entry.info.find(':') {
+                                let suffix = entry.info[colon..].to_string();
+                                entry.info = format!("{}{}", pending.logical_name, suffix);
+                            }
+                        }
+                    }
+                } else {
+                    let old_prefix = format!("{}:", pending.old_base);
+                    for (_, window_id, _, label, session_name) in &mut tree_entries {
+                        if session_name == &pending.old_base {
+                            *session_name = pending.new_base.clone();
+                            if *window_id == usize::MAX && label.starts_with(&old_prefix) {
+                                label.replace_range(..pending.old_base.len(), &pending.new_base);
+                            }
+                        }
+                    }
+                }
+
+                if current_session == pending.old_base {
+                    current_session = pending.new_base.clone();
+                    activity_name = Some(pending.new_base.clone());
+                    name = pending.new_base.clone();
+                    path = crate::paths::port_file(&name);
+                    let _ = std::fs::write(&last_path, &name);
+                    env::set_var("PSMUX_SESSION_NAME", &name);
+                    env::set_var("PSMUX_TARGET_SESSION", &name);
+                    env::set_var("PSMUX_SESSION_DISPLAY_NAME", &pending.logical_name);
+                }
+
+                let old_cache_prefix = format!("{}\t", pending.old_base);
+                let old_list_tree_key = format!("__lt__\t{}", pending.old_base);
+                preview_cache.retain(|key, _| {
+                    key != &old_list_tree_key && !key.starts_with(&old_cache_prefix)
+                });
+                dump_cache.retain(|key, _| !key.starts_with(&old_cache_prefix));
+                picker_rename_target = None;
+                picker_rename_buf.clear();
+                picker_rename_error = None;
+            } else if result.is_err() {
+                picker_rename_error = Some("rename confirmation stopped unexpectedly".to_string());
+            } else {
+                picker_rename_error = Some(format!(
+                    "rename outcome was not confirmed within {} seconds",
+                    PICKER_RENAME_CONFIRM_TIMEOUT.as_secs(),
+                ));
+            }
+            force_dump = true;
+        }
 
         // ── STEP 1: Poll events with adaptive timeout ────────────────────
         let since_dump = last_dump_time.elapsed().as_millis() as u64;
@@ -2559,19 +3050,161 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                 }
                 match _cur_evt {
-                    // ── Windows Ctrl+V paste interception ────────────────
-                    // ── Suppress phantom modified-Enter Release (Windows Terminal) ──
-                    // Windows Terminal fires a real Press then a phantom Release
-                    // ~80ms later for Shift+Enter.  If we already handled the
-                    // Press, drop the Release so it does not trigger the WezTerm
-                    // Release-only acceptance path and produce a double newline.
+                    // Windows Terminal fires a real modified-Enter Press and a
+                    // phantom Release. Drop that Release before any overlay sees
+                    // it, including a picker rename prompt left open by an error.
                     #[cfg(windows)]
                     Event::Key(key) if key.kind == KeyEventKind::Release
                         && matches!(key.code, KeyCode::Enter)
                         && modified_enter_press_handled =>
                     {
-                        // drop the phantom Release
+                        modified_enter_press_handled = false;
                     }
+                    // The picker rename prompt owns the keyboard completely. This
+                    // branch must precede prefix, overlay, picker, and pane handling:
+                    // unused modified/navigation keys are consumed by the wildcard.
+                    Event::Key(key) if picker_rename_target.is_some() => {
+                        let mut prompt_key_action =
+                            key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat;
+                        #[cfg(windows)]
+                        {
+                            // WezTerm can emit modified Enter as Release-only.
+                            prompt_key_action |= key.kind == KeyEventKind::Release
+                                && matches!(key.code, KeyCode::Enter)
+                                && !key.modifiers.is_empty();
+                            // Clipboard-injected character events precede the
+                            // Ctrl+V Release. Once it arrives, the burst is over;
+                            // a later Enter is the user's explicit acceptance.
+                            if key.kind == KeyEventKind::Release
+                                && matches!(key.code, KeyCode::Char('v'))
+                                && key.modifiers == KeyModifiers::CONTROL
+                            {
+                                picker_key_burst_start = None;
+                                picker_key_burst_len = 0;
+                                picker_key_burst_active = false;
+                                picker_key_burst_last = None;
+                            }
+                        }
+                        if prompt_key_action {
+                            #[cfg(windows)]
+                            if picker_key_burst_last
+                                .map_or(false, |last| last.elapsed() > Duration::from_millis(300))
+                            {
+                                picker_key_burst_start = None;
+                                picker_key_burst_len = 0;
+                                picker_key_burst_active = false;
+                                picker_key_burst_last = None;
+                            }
+                            #[cfg(windows)]
+                            let prompt_paste_burst_active =
+                                paste_suppress_until.map_or(false, |t| Instant::now() < t);
+                            #[cfg(not(windows))]
+                            let prompt_paste_burst_active = false;
+
+                            if picker_rename_pending.is_none() {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        picker_rename_target = None;
+                                        picker_rename_buf.clear();
+                                        picker_rename_error = None;
+                                        #[cfg(windows)]
+                                        {
+                                            picker_key_burst_start = None;
+                                            picker_key_burst_len = 0;
+                                            picker_key_burst_active = false;
+                                            picker_key_burst_last = None;
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                    #[cfg(windows)]
+                                    if key.kind != KeyEventKind::Release && !key.modifiers.is_empty() {
+                                        modified_enter_press_handled = true;
+                                    }
+                                    #[cfg(windows)]
+                                    let injected_paste_newline = key.modifiers.is_empty()
+                                        && picker_key_burst_active;
+                                    #[cfg(not(windows))]
+                                    let injected_paste_newline = false;
+
+                                    if injected_paste_newline {
+                                        picker_rename_buf.push('\n');
+                                        picker_rename_error = None;
+                                    } else {
+                                        let old_base = picker_rename_target.clone().unwrap_or_default();
+                                        let logical_name = picker_logical_rename_name(socket_name, &picker_rename_buf);
+                                        let new_base = picker_registry_name_for_logical(socket_name, &logical_name);
+
+                                        if let Err(reason) = validate_picker_session_name(&logical_name, &new_base) {
+                                            picker_rename_error = Some(reason.to_string());
+                                        } else {
+                                            let name_conflicts = if session_chooser {
+                                                picker_session_name_conflicts(
+                                                    session_entries.iter().map(|entry| entry.name.as_str()),
+                                                    &old_base,
+                                                    &new_base,
+                                                )
+                                            } else {
+                                                picker_session_name_conflicts(
+                                                    tree_entries.iter().map(|(_, _, _, _, name)| name.as_str()),
+                                                    &old_base,
+                                                    &new_base,
+                                                )
+                                            };
+
+                                            if name_conflicts {
+                                                picker_rename_error = Some(format!("session '{}' already exists", logical_name));
+                                            } else {
+                                                let port = std::fs::read_to_string(crate::paths::port_file(&old_base))
+                                                    .ok()
+                                                    .and_then(|value| value.trim().parse::<u16>().ok());
+                                                let session_key = read_session_key(&old_base).ok();
+                                                if let (Some(port), Some(session_key)) = (port, session_key) {
+                                                    picker_rename_error = None;
+                                                    picker_rename_pending = Some(begin_picker_rename(
+                                                        old_base,
+                                                        logical_name,
+                                                        new_base,
+                                                        port,
+                                                        session_key,
+                                                    ));
+                                                } else {
+                                                    picker_rename_error = Some(format!("session '{}' is no longer available", old_base));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    picker_rename_buf.pop();
+                                    picker_rename_error = None;
+                                }
+                                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !prompt_paste_burst_active => {
+                                    #[cfg(windows)]
+                                    {
+                                        let now = Instant::now();
+                                        if picker_key_burst_active {
+                                            picker_key_burst_last = Some(now);
+                                        } else if picker_key_burst_start
+                                            .map_or(false, |start| now.duration_since(start) <= Duration::from_millis(20))
+                                        {
+                                            picker_key_burst_len += 1;
+                                            picker_key_burst_active = picker_key_burst_len >= 3;
+                                            picker_key_burst_last = Some(now);
+                                        } else {
+                                            picker_key_burst_start = Some(now);
+                                            picker_key_burst_len = 1;
+                                            picker_key_burst_last = Some(now);
+                                        }
+                                    }
+                                    picker_rename_buf.push(c);
+                                    picker_rename_error = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    }
+                    // ── Windows Ctrl+V paste interception ────────────────
                     // On Windows, Windows Terminal intercepts Ctrl+V Press,
                     // reads the clipboard, and injects the paste content as
                     // a byte stream into the ConPTY input pipe — bypassing
@@ -3299,84 +3932,22 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 }
                             }
                             if do_choose_session {
-                                session_chooser = true;
-                                session_entries.clear();
-                                session_selected = 0;
-                                session_scroll = 0;
-                                session_num_buffer.clear();
-                                session_filter_active = false;
-                                session_filter.clear();
-                                popup_offset = (0, 0);
-                                popup_dragging = false;
-                                popup_rect_last = None;
-                                if choose_tree_preview_default { preview_enabled = true; }
-                                let dir = crate::paths::psmux_dir();
-                                // Collect (label, addr, key) for every port file, then run ONE
-                                // bounded liveness probe per session in parallel. This both lists
-                                // and prunes: total wall time is ~one probe window regardless of
-                                // how many sessions exist, so the picker stays responsive (no
-                                // sequential O(N * timeout) cleanup pass).
-                                let mut targets: Vec<(String, String, String)> = Vec::new();
-                                if let Ok(entries) = std::fs::read_dir(&dir) {
-                                    for e in entries.flatten() {
-                                        if let Some(fname) = e.file_name().to_str() {
-                                            if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                if ext == "port" {
-                                                    if crate::session::is_warm_session(base) { continue; }
-                                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                        if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                            let sess_addr = format!("127.0.0.1:{}", p);
-                                                            let sess_key = read_session_key(base).unwrap_or_default();
-                                                            targets.push((base.to_string(), sess_addr, sess_key));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Issue #259 (batch D): sort by label so the picker's order is
-                                // deterministic, matching the tree_chooser's established
-                                // convention (session.rs::list_all_sessions_tree sorts by name)
-                                // and the g/G Home/End contract. Without this, order followed
-                                // raw directory-enumeration order, which the Win32 API
-                                // explicitly does not guarantee to be stable or alphabetical.
-                                targets.sort_by(|a, b| a.0.cmp(&b.0));
-                                let verdicts = crate::session::classify_sessions_parallel(
-                                    targets,
-                                    Duration::from_millis(50),
-                                    Duration::from_millis(250),
+                                open_session_chooser(
+                                    &current_session,
+                                    choose_tree_preview_default,
+                                    false,
+                                    &mut session_chooser,
+                                    &mut session_entries,
+                                    &mut session_selected,
+                                    &mut session_scroll,
+                                    &mut session_num_buffer,
+                                    &mut session_filter_active,
+                                    &mut session_filter,
+                                    &mut popup_offset,
+                                    &mut popup_dragging,
+                                    &mut popup_rect_last,
+                                    &mut preview_enabled,
                                 );
-                                for (label, liveness) in verdicts {
-                                    match liveness {
-                                        crate::session::SessionLiveness::Alive(info) => {
-                                            session_entries.push((label, info));
-                                        }
-                                        crate::session::SessionLiveness::Dead => {
-                                            // Server gone (crashed, killed by a reboot, or its
-                                            // port reused by another server). Reap it so it never
-                                            // shows as a "(not responding)" zombie. A live-but-slow
-                                            // server self-heals on its next 5s registry tick.
-                                            if crate::debug_log::session_log_enabled() {
-                                                crate::debug_log::session_log("picker",
-                                                    &format!("reaping dead session '{}' from chooser", label));
-                                            }
-                                            crate::session::remove_session_registry(&label);
-                                        }
-                                        crate::session::SessionLiveness::Unreachable => {
-                                            // Could not connect (transient, non-refused). Keep it
-                                            // and show the honest "(not responding)" rather than
-                                            // deleting on an ambiguous failure.
-                                            session_entries.push((label.clone(), format!("{}: (not responding)", label)));
-                                        }
-                                    }
-                                }
-                                if session_entries.is_empty() {
-                                    session_entries.push((current_session.clone(), format!("{}: (current)", current_session)));
-                                }
-                                for (i, (sname, _)) in session_entries.iter().enumerate() {
-                                    if sname == &current_session { session_selected = i; break; }
-                                }
                             }
                             if do_choose_buffer {
                                 buffer_chooser = true;
@@ -3517,6 +4088,23 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         session_num_buffer.clear();
                                     }
                                 }
+                                KeyCode::Char('$') if session_chooser => {
+                                    let selected_entry = session_filtered_indices(&session_entries, &session_filter)
+                                        .get(session_selected)
+                                        .and_then(|idx| session_entries.get(*idx));
+                                    if let Some(entry) = selected_entry {
+                                        picker_rename_target = Some(entry.name.clone());
+                                        picker_rename_buf.clear();
+                                        picker_rename_error = None;
+                                        #[cfg(windows)]
+                                        {
+                                            picker_key_burst_start = None;
+                                            picker_key_burst_len = 0;
+                                            picker_key_burst_active = false;
+                                            picker_key_burst_last = None;
+                                        }
+                                    }
+                                }
                                 // hjkl parity with tmux mode-tree (issue #259): for flat lists
                                 // tmux treats h/k as up and j/l as down. g/G map to Home/End.
                                 KeyCode::Char('k') if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
@@ -3556,10 +4144,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         }
                                     };
                                     if let Some(idx) = target_idx.and_then(|i| filtered_indices.get(i).copied()) {
-                                        if let Some((sname, _)) = session_entries.get(idx) {
-                                            if sname != &current_session {
+                                        if let Some(entry) = session_entries.get(idx) {
+                                            if entry.name != current_session {
                                                 cmd_batch.push("client-detach\n".into());
-                                                env::set_var("PSMUX_SWITCH_TO", sname);
+                                                env::set_var("PSMUX_SWITCH_TO", &entry.name);
                                                 quit = true;
                                             }
                                             session_chooser = false;
@@ -3577,8 +4165,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     let selected_entry = session_filtered_indices(&session_entries, &session_filter)
                                         .get(session_selected)
                                         .copied();
-                                    if let Some((sname, _)) = selected_entry.and_then(|i| session_entries.get(i)) {
-                                        let sname = sname.clone();
+                                    if let Some(entry) = selected_entry.and_then(|i| session_entries.get(i)) {
+                                        let sname = entry.name.clone();
                                         if sname == current_session {
                                             // Killing current session — exit after kill
                                             cmd_batch.push("kill-session\n".into());
@@ -3637,6 +4225,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // Absorb any other char while the session picker is open so
                                 // it cannot leak through to the focused pane's PTY.
                                 KeyCode::Char(_) if session_chooser => {}
+                                KeyCode::Char('$') if tree_chooser => {
+                                    if let Some((_, _, _, _, session_name)) = tree_entries.get(tree_selected) {
+                                        picker_rename_target = Some(session_name.clone());
+                                        picker_rename_buf.clear();
+                                        picker_rename_error = None;
+                                        #[cfg(windows)]
+                                        {
+                                            picker_key_burst_start = None;
+                                            picker_key_burst_len = 0;
+                                            picker_key_burst_active = false;
+                                            picker_key_burst_last = None;
+                                        }
+                                    }
+                                }
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 // hjkl parity with tmux mode-tree (issue #259): h/k = up, j/l = down
@@ -4259,13 +4861,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // Route paste into the active client-side text overlay
                         // (issue #290) so it does not leak past the command
                         // prompt / rename prompts into the underlying pane.
-                        let consumed = route_paste_to_overlay(
-                            &data,
-                            command_input, &mut command_buf, &mut command_cursor,
-                            renaming, &mut rename_buf,
-                            pane_renaming, &mut pane_title_buf,
-                            window_idx_input, &mut window_idx_buf,
-                        );
+                        let consumed = if picker_rename_target.is_some() {
+                            if picker_rename_pending.is_none() {
+                                picker_rename_buf.push_str(&data);
+                                picker_rename_error = None;
+                            }
+                            true
+                        } else {
+                            route_paste_to_overlay(
+                                &data,
+                                command_input, &mut command_buf, &mut command_cursor,
+                                renaming, &mut rename_buf,
+                                pane_renaming, &mut pane_title_buf,
+                                window_idx_input, &mut window_idx_buf,
+                            )
+                        };
                         if !consumed {
                             let encoded = base64_encode(&data);
                             cmd_batch.push(format!("send-paste {}\n", encoded));
@@ -4289,6 +4899,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                     Event::Mouse(me) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
+                        if picker_rename_target.is_some() {
+                            _pending_evt = input.try_read()?;
+                            continue;
+                        }
                         // Intercept mouse events while a draggable picker is open
                         // so the user can move the popup by dragging its border
                         // and so clicks behind the popup don't leak through to
@@ -5165,7 +5779,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // Rate-limit dump-state requests to avoid flooding the server.
         // dump_in_flight prevents >1 concurrent request; the interval check
         // ensures we don't re-request faster than ~100fps when typing.
-        let overlays_active = command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
+        let overlays_active = command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || picker_rename_target.is_some() || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
         let should_dump = if force_dump || size_changed {
             true
         } else if typing_active {
@@ -5230,6 +5844,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         #[cfg(windows)]
         { paste_detection_enabled = state.paste_detection; }
         choose_tree_preview_default = state.choose_tree_preview;
+        if startup_session_chooser_pending {
+            open_session_chooser(
+                &current_session,
+                choose_tree_preview_default,
+                true,
+                &mut session_chooser,
+                &mut session_entries,
+                &mut session_selected,
+                &mut session_scroll,
+                &mut session_num_buffer,
+                &mut session_filter_active,
+                &mut session_filter,
+                &mut popup_offset,
+                &mut popup_dragging,
+                &mut popup_rect_last,
+                &mut preview_enabled,
+            );
+            startup_session_chooser_pending = false;
+        }
         client_zoomed = state.zoomed;
         let dim_preds = state.prediction_dimming;
         clock_active = state.clock_mode;
@@ -5332,6 +5965,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // new OSC 0 sequence if it has changed.  Stored as a local so
         // it survives `state` being moved into its other fields below.
         let host_title_this_frame: Option<String> = state.host_title.clone();
+        // Capture host_tab_color for post-draw OSC 4/104 + DECAC emit.
+        let host_tab_color_this_frame: Option<String> = state.host_tab_color.clone();
         // Issue #269: capture host_progress for post-draw OSC 9;4 emit.
         let host_progress_this_frame: Option<String> = state.host_progress.clone();
 
@@ -5637,44 +6272,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             if session_chooser {
                 let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
                 let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
-                // Popup size: when preview is OFF use the original
-                // pre-#257 dynamic sizing (compact, list-only). When preview
-                // is ON expand to 85x75% so the right-side preview has room.
                 let jump_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
                 let filter_rows: u16 = if session_filter_active { 2 } else { 0 };
                 let buffer_rows = jump_rows.saturating_add(filter_rows);
-                let avail_w = content_chunk.width;
-                let avail_h = content_chunk.height;
-                let (popup_w, popup_h) = if preview_enabled {
-                    let want_w = ((avail_w as u32 * 85) / 100) as u16;
-                    let want_h = ((avail_h as u32 * 75) / 100) as u16;
-                    (want_w.max(40).min(avail_w), want_h.max(10).min(avail_h))
-                } else {
-                    let sess_h = (filtered_indices.len() as u16)
-                        .saturating_add(2)
-                        .saturating_add(buffer_rows)
-                        .max(5)
-                        .min(content_chunk.height.saturating_sub(2));
-                    let pw = ((avail_w as u32 * 70) / 100) as u16;
-                    (pw.max(20).min(avail_w), sess_h)
-                };
-                let base_x = content_chunk.x + (avail_w.saturating_sub(popup_w)) / 2;
-                let base_y = content_chunk.y + (avail_h.saturating_sub(popup_h)) / 2;
-                let max_dx = (avail_w.saturating_sub(popup_w)) as i32 / 2;
-                let max_dy = (avail_h.saturating_sub(popup_h)) as i32 / 2;
-                let dx = popup_offset.0.clamp(-max_dx, max_dx);
-                let dy = popup_offset.1.clamp(-max_dy, max_dy);
-                let oa = Rect {
-                    x: ((base_x as i32) + dx).max(content_chunk.x as i32) as u16,
-                    y: ((base_y as i32) + dy).max(content_chunk.y as i32) as u16,
-                    width: popup_w,
-                    height: popup_h,
-                };
+                let oa = session_chooser_popup_rect(
+                    content_chunk,
+                    preview_enabled,
+                    filtered_indices.len(),
+                    buffer_rows,
+                    popup_offset,
+                );
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close, drag border to move) "
+                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, $=rename, p=preview, esc=clear/close, drag border to move) "
                 } else {
-                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close) "
+                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, $=rename, p=preview, esc=clear/close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -5713,15 +6325,24 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let num_width = filtered_indices.len().max(1).to_string().len();
                 let mut lines: Vec<Line> = Vec::new();
                 for (visible_idx, entry_idx) in filtered_indices.iter().copied().enumerate().skip(session_scroll).take(visible_h) {
-                    let (sname, info) = &session_entries[entry_idx];
-                    let marker = if sname == &current_session { "*" } else { " " };
-                    let row = format!("{:>w$}. {} {}", visible_idx + 1, marker, info, w = num_width);
-                    let line = if visible_idx == session_selected {
-                        Line::from(Span::styled(row, sel_style))
-                    } else {
-                        Line::from(row)
-                    };
-                    lines.push(line);
+                    let entry = &session_entries[entry_idx];
+                    let marker = if entry.name == current_session { "*" } else { " " };
+                    let info = session_info_for_row(
+                        &entry.info,
+                        list_area.width as usize,
+                        visible_idx,
+                        num_width,
+                        marker,
+                    );
+                    lines.push(session_chooser_row_line(
+                        visible_idx,
+                        num_width,
+                        marker,
+                        &info,
+                        entry.attached,
+                        visible_idx == session_selected,
+                        sel_style,
+                    ));
                 }
                 if filtered_indices.is_empty() && visible_h > 0 {
                     lines.push(Line::from("(no matching sessions)"));
@@ -5752,10 +6373,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     // Issue #257 follow-up: render the first window of the
                     // highlighted session with its full split layout.
                     let mut rendered = false;
-                    if let Some((sname, _info)) = filtered_indices
+                    if let Some(entry) = filtered_indices
                         .get(session_selected)
                         .and_then(|idx| session_entries.get(*idx))
                     {
+                        let sname = &entry.name;
                         // Resolve first window id via cached list-tree fetch.
                         let lt_key = format!("__lt__\t{}", sname);
                         let win_id = if let Some((cached, ts)) = preview_cache.get(&lt_key) {
@@ -5803,7 +6425,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         let preview_text: Option<String> = filtered_indices
                             .get(session_selected)
                             .and_then(|idx| session_entries.get(*idx))
-                            .and_then(|(sname, _info)| {
+                            .and_then(|entry| {
+                                let sname = &entry.name;
                                 let lt_key = format!("__lt__\t{}", sname);
                                 let win_id = if let Some((cached, ts)) = preview_cache.get(&lt_key) {
                                     if ts.elapsed() < crate::preview::PREVIEW_TTL {
@@ -5876,9 +6499,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 };
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-tree (digits+enter=jump  Enter=switch  p=preview  Esc=close  drag border to move) "
+                    " choose-tree (digits+enter=jump  Enter=switch  $=rename  p=preview  Esc=close  drag border to move) "
                 } else {
-                    " choose-tree (digits+enter=jump  Enter=switch  p=preview  Esc=close) "
+                    " choose-tree (digits+enter=jump  Enter=switch  $=rename  p=preview  Esc=close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -6424,6 +7047,24 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let para = Paragraph::new(format!("name: {}", rename_buf));
                 f.render_widget(para, overlay.inner(oa));
             }
+            if let Some(target) = picker_rename_target.as_ref() {
+                let overlay = Block::default().borders(Borders::ALL)
+                    .title(format!("rename session {}", target));
+                let prompt_height = if picker_rename_error.is_some() || picker_rename_pending.is_some() { 4 } else { 3 };
+                let oa = centered_rect(60, prompt_height, content_chunk);
+                f.render_widget(Clear, oa);
+                f.render_widget(&overlay, oa);
+                let mut lines = vec![Line::from(format!("name: {}", picker_rename_buf))];
+                if picker_rename_pending.is_some() {
+                    lines.push(Line::from(Span::styled(
+                        "renaming...",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                } else if let Some(error) = picker_rename_error.as_ref() {
+                    lines.push(Line::from(Span::styled(error, Style::default().fg(Color::Red))));
+                }
+                f.render_widget(Paragraph::new(Text::from(lines)), overlay.inner(oa));
+            }
             if pane_renaming {
                 let overlay = Block::default().borders(Borders::ALL).title("set pane title");
                 let oa = centered_rect(60, 3, content_chunk);
@@ -6778,6 +7419,24 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             last_emitted_host_title = host_title_this_frame;
         }
 
+        // ── Post-draw: forward Windows Terminal tab colour ────────────
+        // OSC 4/104 defines or resets the proven high palette slot; DECAC
+        // points the frame background at it, or back to slot 264 on clear.
+        if host_tab_color_this_frame != last_emitted_host_tab_color {
+            let host_colors = crate::types::HOST_COLORS_SPEC
+                .get()
+                .and_then(|spec| spec.as_deref())
+                .map(crate::types::HostColors::from_spec)
+                .unwrap_or_else(crate::types::HostColors::campbell);
+            let mut out = std::io::stdout().lock();
+            emit_host_tab_color(
+                &mut out,
+                host_tab_color_this_frame,
+                &mut last_emitted_host_tab_color,
+                &host_colors,
+            );
+        }
+
         // ── Post-draw: forward OSC 9;4 progress (issue #269) ─────────
         // host_progress is "<state>;<value>" e.g. "1;50" (default, 50%) or
         // "0;0" (hide).  Re-emit ESC ] 9 ; 4 ; <state> ; <value> ESC \ to
@@ -6961,7 +7620,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     Ok(())
 }
 
-fn session_filtered_indices(entries: &[(String, String)], filter: &str) -> Vec<usize> {
+fn session_filtered_indices(entries: &[SessionChooserEntry], filter: &str) -> Vec<usize> {
     if filter.is_empty() {
         return (0..entries.len()).collect();
     }
@@ -6970,12 +7629,12 @@ fn session_filtered_indices(entries: &[(String, String)], filter: &str) -> Vec<u
     entries
         .iter()
         .enumerate()
-        .filter_map(|(idx, (name, _))| name.to_lowercase().contains(&filter).then_some(idx))
+        .filter_map(|(idx, entry)| entry.name.to_lowercase().contains(&filter).then_some(idx))
         .collect()
 }
 
 fn session_filter_escape_selection(
-    entries: &[(String, String)],
+    entries: &[SessionChooserEntry],
     filter: &str,
     selected: usize,
 ) -> Option<usize> {
@@ -6989,6 +7648,168 @@ fn session_filter_escape_selection(
             .copied()
             .unwrap_or(0),
     )
+}
+
+fn picker_session_name_conflicts<'a, I>(
+    existing_names: I,
+    current_name: &str,
+    new_name: &str,
+) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let current_name = current_name.to_lowercase();
+    let new_name = new_name.to_lowercase();
+    existing_names
+        .into_iter()
+        .map(str::to_lowercase)
+        .any(|name| name != current_name && name == new_name)
+}
+
+fn picker_session_names_equal(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
+}
+
+const PICKER_RENAME_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct PickerRenamePending {
+    old_base: String,
+    logical_name: String,
+    new_base: String,
+    result_rx: std::sync::mpsc::Receiver<bool>,
+}
+
+fn begin_picker_rename(
+    old_base: String,
+    logical_name: String,
+    new_base: String,
+    port: u16,
+    session_key: String,
+) -> PickerRenamePending {
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker_old_base = old_base.clone();
+    let worker_logical_name = logical_name.clone();
+    let worker_new_base = new_base.clone();
+    std::thread::spawn(move || {
+        let addr = format!("127.0.0.1:{}", port);
+        let command = format!("rename-session {}\n", quote_arg(&worker_logical_name));
+        let _ = crate::session::fetch_authed_response_multi(
+            &addr,
+            &session_key,
+            command.as_bytes(),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+
+        let old_path = crate::paths::port_file(&worker_old_base);
+        let new_path = crate::paths::port_file(&worker_new_base);
+        let same_registry_path =
+            picker_session_names_equal(&worker_old_base, &worker_new_base);
+        let expected_port = port.to_string();
+        let logical_info_prefix = format!("{}:", worker_logical_name);
+        let deadline = Instant::now() + PICKER_RENAME_CONFIRM_TIMEOUT;
+        let mut rename_observed = false;
+        while Instant::now() < deadline {
+            let new_port_matches = std::fs::read_to_string(&new_path)
+                .ok()
+                .map(|value| value.trim() == expected_port)
+                .unwrap_or(false);
+            let new_key_matches = read_session_key(&worker_new_base)
+                .ok()
+                .map(|value| value == session_key)
+                .unwrap_or(false);
+            let old_is_gone =
+                same_registry_path || !std::path::Path::new(&old_path).exists();
+            if new_port_matches && new_key_matches && old_is_gone {
+                if !same_registry_path {
+                    rename_observed = true;
+                    break;
+                }
+                // A case-only rename uses the same Windows path. Ask the server
+                // for its logical name so a pre-existing file cannot confirm it.
+                let info = crate::session::fetch_authed_response_multi(
+                    &addr,
+                    &session_key,
+                    b"session-info\n",
+                    Duration::from_millis(50),
+                    Duration::from_millis(100),
+                );
+                if info
+                    .as_deref()
+                    .map_or(false, |value| value.starts_with(&logical_info_prefix))
+                {
+                    rename_observed = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = result_tx.send(rename_observed);
+    });
+
+    PickerRenamePending {
+        old_base,
+        logical_name,
+        new_base,
+        result_rx,
+    }
+}
+
+fn picker_logical_rename_name(socket_name: Option<&str>, entered_name: &str) -> String {
+    if let Some(socket_name) = socket_name {
+        let prefix = format!("{}__", socket_name);
+        if entered_name
+            .get(..prefix.len())
+            .map_or(false, |entered_prefix| entered_prefix.eq_ignore_ascii_case(&prefix))
+        {
+            return entered_name[prefix.len()..].to_string();
+        }
+    }
+    entered_name.to_string()
+}
+
+fn picker_registry_name_for_logical(socket_name: Option<&str>, logical_name: &str) -> String {
+    if let Some(socket_name) = socket_name {
+        format!("{}__{}", socket_name, logical_name)
+    } else {
+        logical_name.to_string()
+    }
+}
+
+fn validate_picker_session_name(
+    logical_name: &str,
+    registry_name: &str,
+) -> Result<(), &'static str> {
+    let name = logical_name;
+    if name.trim().is_empty() {
+        return Err("session name cannot be empty or contain only spaces");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("session name cannot contain control characters");
+    }
+    if name.chars().any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')) {
+        return Err("session name cannot contain \\ / : * ? \" < > |");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("session name cannot end with a dot or space");
+    }
+    let device_stem = name.split('.').next().unwrap_or_default();
+    let upper_stem = device_stem.to_ascii_uppercase();
+    let is_numbered_device = |prefix: &str| {
+        upper_stem
+            .strip_prefix(prefix)
+            .map_or(false, |suffix| matches!(suffix.as_bytes(), [b'1'..=b'9']))
+    };
+    if matches!(upper_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || is_numbered_device("COM")
+        || is_numbered_device("LPT")
+    {
+        return Err("session name cannot be a reserved Windows device name");
+    }
+    if registry_name.encode_utf16().count() + ".port".len() > 255 {
+        return Err("session name is too long for its registry file");
+    }
+    Ok(())
 }
 
 /// Flush the paste-pending buffer as individual send-text / send-key commands.
@@ -7120,6 +7941,10 @@ fn route_paste_to_overlay(
 #[cfg(test)]
 #[path = "../tests-rs/test_client.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_host_tab_color.rs"]
+mod test_host_tab_color;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_zoom_bleed.rs"]

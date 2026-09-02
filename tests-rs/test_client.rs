@@ -2,10 +2,14 @@
 use super::*;
 
 #[cfg(windows)]
-fn session_entries(names: &[&str]) -> Vec<(String, String)> {
+fn session_entries(names: &[&str]) -> Vec<SessionChooserEntry> {
     names
         .iter()
-        .map(|name| (name.to_string(), format!("{}: info", name)))
+        .map(|name| SessionChooserEntry {
+            name: name.to_string(),
+            info: format!("{}: info", name),
+            attached: false,
+        })
         .collect()
 }
 
@@ -21,8 +25,16 @@ fn session_filter_matches_names_case_insensitively() {
 #[test]
 fn session_filter_does_not_match_session_info() {
     let entries = vec![
-        ("alpha".to_string(), "contains needle in details".to_string()),
-        ("needle-session".to_string(), "other details".to_string()),
+        SessionChooserEntry {
+            name: "alpha".to_string(),
+            info: "contains needle in details".to_string(),
+            attached: false,
+        },
+        SessionChooserEntry {
+            name: "needle-session".to_string(),
+            info: "other details".to_string(),
+            attached: false,
+        },
     ];
     assert_eq!(session_filtered_indices(&entries, "needle"), vec![1]);
 }
@@ -42,6 +54,66 @@ fn session_filter_escape_restores_selected_entry_in_full_list() {
 fn session_filter_escape_without_query_closes_picker() {
     let entries = session_entries(&["alpha"]);
     assert_eq!(session_filter_escape_selection(&entries, "", 0), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn picker_rename_collision_is_case_insensitive_and_namespace_aware() {
+    let names = ["alpha", "Beta", "production"];
+    assert!(picker_session_name_conflicts(names, "alpha", "beta"));
+    assert!(!picker_session_name_conflicts(names, "alpha", "ALPHA"));
+
+    let namespaced = ["team__alpha", "team__beta"];
+    let logical = picker_logical_rename_name(Some("team"), "beta");
+    let projected = picker_registry_name_for_logical(Some("team"), &logical);
+    assert_eq!(logical, "beta");
+    assert_eq!(projected, "team__beta");
+    assert!(picker_session_name_conflicts(namespaced, "team__alpha", &projected));
+    assert_eq!(picker_logical_rename_name(Some("team"), "team__alpha"), "alpha");
+}
+
+#[cfg(windows)]
+#[test]
+fn picker_rename_namespace_uses_the_known_socket_value() {
+    let socket = Some("team__blue");
+    let logical = picker_logical_rename_name(socket, "team__blue__alpha__dev");
+    assert_eq!(logical, "alpha__dev");
+    assert_eq!(
+        picker_registry_name_for_logical(socket, &logical),
+        "team__blue__alpha__dev",
+    );
+
+    assert_eq!(picker_logical_rename_name(None, "plain__name"), "plain__name");
+    assert_eq!(
+        picker_registry_name_for_logical(None, "plain__name"),
+        "plain__name",
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn picker_rename_validation_rejects_blank_and_windows_forbidden_names() {
+    assert!(validate_picker_session_name("", "").is_err());
+    assert!(validate_picker_session_name("   ", "   ").is_err());
+    assert!(validate_picker_session_name("bad/name", "bad/name").is_err());
+    assert!(validate_picker_session_name("bad\u{0007}name", "bad\u{0007}name").is_err());
+    assert!(validate_picker_session_name("valid session", "valid session").is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn picker_rename_validation_rejects_windows_filename_edge_cases() {
+    for name in ["CON", "prn.txt", "Aux.log", "nul", "COM1", "com9.ext", "LPT1", "lpt9.log"] {
+        assert!(validate_picker_session_name(name, name).is_err(), "{name}");
+    }
+    assert!(validate_picker_session_name("COM10", "COM10").is_ok());
+    assert!(validate_picker_session_name("name.", "name.").is_err());
+    assert!(validate_picker_session_name("name ", "name ").is_err());
+
+    let longest_valid = "a".repeat(250);
+    assert!(validate_picker_session_name(&longest_valid, &longest_valid).is_ok());
+    let too_long = "a".repeat(251);
+    assert!(validate_picker_session_name(&too_long, &too_long).is_err());
 }
 
 #[cfg(windows)]
@@ -707,4 +779,179 @@ fn paste_command_prompt_takes_precedence_over_other_overlays() {
     assert!(rename_buf.is_empty());
     assert!(pane_title_buf.is_empty());
     assert!(window_idx_buf.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn session_info_detects_attached_suffix() {
+    assert!(session_info_has_attached_client(
+        "alpha: 2 windows (created today) (attached)",
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn session_info_rejects_unattached_details() {
+    assert!(!session_info_has_attached_client(
+        "alpha: 2 windows (created today)",
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn session_info_rejects_not_responding() {
+    assert!(!session_info_has_attached_client("alpha: (not responding)"));
+}
+
+#[cfg(windows)]
+#[test]
+fn session_info_ignores_attached_text_in_name() {
+    assert!(!session_info_has_attached_client(
+        "alpha (attached): 2 windows (created today)",
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn middle_ellipsis_leaves_fitting_name_unchanged() {
+    assert_eq!(middle_ellipsize("alpha", 5), "alpha");
+    assert_eq!(middle_ellipsize("alpha", 8), "alpha");
+}
+
+#[cfg(windows)]
+#[test]
+fn middle_ellipsis_keeps_both_ends_at_exact_budget() {
+    use unicode_width::UnicodeWidthStr;
+
+    let shortened = middle_ellipsize("abcdefghijklmnop", 9);
+    assert_eq!(shortened, "abcd…mnop");
+    assert_eq!(UnicodeWidthStr::width(shortened.as_str()), 9);
+}
+
+#[cfg(windows)]
+#[test]
+fn middle_ellipsis_uses_display_cells_for_wide_names() {
+    use unicode_width::UnicodeWidthStr;
+
+    let shortened = middle_ellipsize("東京大阪", 5);
+    assert_eq!(shortened, "東…阪");
+    assert_eq!(UnicodeWidthStr::width(shortened.as_str()), 5);
+}
+
+#[cfg(windows)]
+#[test]
+fn middle_ellipsis_handles_tiny_budget_without_splitting_utf8() {
+    assert_eq!(middle_ellipsize("éclair", 0), "");
+    assert_eq!(middle_ellipsize("éclair", 1), "é");
+    assert_eq!(middle_ellipsize("éclair", 2), "éc");
+    assert_eq!(middle_ellipsize("東京", 1), "");
+    assert_eq!(middle_ellipsize("東京", 3), "東");
+}
+
+#[cfg(windows)]
+#[test]
+fn session_name_budget_accounts_for_the_complete_row() {
+    use unicode_width::UnicodeWidthStr;
+
+    let info = session_info_for_row("abcdefghijklmnop: 2 windows", 20, 0, 1, "*");
+    assert_eq!(info, "ab…p: 2 windows");
+    let line = session_chooser_row_line(
+        0,
+        1,
+        "*",
+        &info,
+        false,
+        false,
+        Style::default(),
+    );
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert_eq!(UnicodeWidthStr::width(text.as_str()), 20);
+}
+
+#[cfg(windows)]
+#[test]
+fn session_name_stays_visible_when_details_alone_overflow() {
+    let info = "alpha: 1 windows (created Wed Sep 2 21:52:48 2026)";
+    assert_eq!(session_info_for_row(info, 31, 0, 1, "*"), info);
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_colours_attached_number_from_mode_style() {
+    let mode_style = crate::rendering::parse_tmux_style("bg=magenta,fg=cyan");
+    let line = session_chooser_row_line(
+        0,
+        2,
+        " ",
+        "alpha: info",
+        true,
+        false,
+        mode_style,
+    );
+
+    assert_eq!(line.spans[1].content.as_ref(), "1");
+    assert_eq!(line.spans[1].style, Style::default().fg(Color::Magenta));
+    assert_eq!(line.spans[0].style, Style::default());
+    assert_eq!(line.spans[2].style, Style::default());
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_keeps_unattached_number_default() {
+    let mode_style = crate::rendering::parse_tmux_style("bg=magenta,fg=cyan");
+    let line = session_chooser_row_line(
+        0,
+        1,
+        " ",
+        "alpha: info",
+        false,
+        false,
+        mode_style,
+    );
+
+    assert_eq!(line.spans[1].content.as_ref(), "1");
+    assert_eq!(line.spans[1].style, Style::default());
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_keeps_selected_row_in_full_mode_style() {
+    let mode_style = crate::rendering::parse_tmux_style("bg=magenta,fg=cyan,bold");
+    let line = session_chooser_row_line(
+        0,
+        2,
+        "*",
+        "alpha: info",
+        true,
+        true,
+        mode_style,
+    );
+
+    assert!(line.spans.iter().all(|span| span.style == mode_style));
+}
+
+#[test]
+fn session_chooser_popup_is_full_width_with_preview() {
+    for width in [1, 5, 19, 20, 39, 40, 80, 160] {
+        let content = Rect::new(7, 3, width, 30);
+        let popup = session_chooser_popup_rect(content, true, 12, 0, (50, 0));
+        assert_eq!(popup.width, content.width, "terminal width {width}");
+        assert_eq!(popup.x, content.x, "horizontal drag at width {width}");
+        assert_eq!(popup.height, 22, "preview height rule at width {width}");
+    }
+}
+
+#[test]
+fn session_chooser_popup_is_full_width_without_preview() {
+    for width in [1, 5, 19, 20, 39, 40, 80, 160] {
+        let content = Rect::new(7, 3, width, 30);
+        let popup = session_chooser_popup_rect(content, false, 3, 0, (-50, 0));
+        assert_eq!(popup.width, content.width, "terminal width {width}");
+        assert_eq!(popup.x, content.x, "horizontal drag at width {width}");
+        assert_eq!(popup.height, 5, "list height rule at width {width}");
+    }
 }

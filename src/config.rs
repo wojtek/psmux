@@ -1166,6 +1166,9 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         "set-titles-string" => {
             app.set_titles_string = value.to_string();
         }
+        "tab-colour" => {
+            app.tab_colour = value.to_string();
+        }
         "status-keys" => { app.user_options.insert(key.to_string(), value.to_string()); }
         "pane-border-style" => { app.pane_border_style = value.to_string(); }
         "pane-active-border-style" => { app.pane_active_border_style = value.to_string(); }

@@ -275,6 +275,7 @@ pub fn cli_command_lines() -> Vec<String> {
 const CLI_COMMANDS: &[(&str, &str, &str)] = &[
     // Session
     ("attach-session",    "attach",   "Attach to an existing session"),
+    ("pick",              "",         "Attach and open the session picker"),
     ("detach-client",     "detach",   "Detach from the current session"),
     ("has-session",       "has",      "Check if a session exists"),
     ("kill-server",       "",         "Kill the server and all sessions"),
@@ -441,6 +442,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("copy-command",               "\"\""),
     ("set-clipboard",              "on"),
     ("set-titles-string",          "\"\""),
+    ("tab-colour",                "\"\""),
     // psmux extensions
     ("cursor-style",               "\"\""),
     ("cursor-blink",               "off"),

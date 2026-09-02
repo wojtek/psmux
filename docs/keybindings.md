@@ -188,6 +188,10 @@ Each overlay owns its own keymap. Remember that these keys are consumed before a
 Open with `Prefix + w` (tree) or `Prefix + s` (sessions). This matches tmux's `mode-tree` behavior,
 so muscle memory carries over.
 
+From a normal shell, `psmux pick` attaches a client and opens the session chooser on its first
+frame. `psmux choose-session` keeps its tmux-compatible role: it only asks an already-attached
+client to render the chooser.
+
 | Key | Action |
 |-----|--------|
 | `Up` / `k` / `h` | Move selection up |

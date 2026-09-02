@@ -106,6 +106,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         } else {
             app.set_titles_string.clone()
         },
+        "tab-colour" => app.tab_colour.clone(),
         // repeat-time had no arm at all, so `show-options -v repeat-time`
         // returned an empty string even though the option works.
         "repeat-time" => app.repeat_time_ms.to_string(),
@@ -464,6 +465,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
         "exit-empty" => { app.exit_empty = matches!(value, "on" | "true" | "1" | "yes"); }
         "set-titles" => { app.set_titles = matches!(value, "on" | "true" | "1" | "yes"); }
         "set-titles-string" => { app.set_titles_string = value.to_string(); }
+        "tab-colour" => { app.tab_colour = value.to_string(); }
         "default-command" | "default-shell" => {
             // Strip surrounding quotes only when the entire value is wrapped
             // in matching quotes.  This handles `"C:/Program Files/..."` but

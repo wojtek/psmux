@@ -80,6 +80,7 @@ This is the reference for the commands **psmux itself** accepts and the flags **
 | `next-layout` | `nextl` (not at the CLI) | none | CLI, SRV, CFG, CTL |
 | `next-window` | `next` | none | CLI, SRV, CFG, CTL |
 | `paste-buffer` | `pasteb` | `dpb:t:` | CLI, SRV, CFG |
+| `pick` | *(none)* | `t:` | CLI |
 | `pipe-pane` | `pipep` | `IOot:` | CLI, SRV, CFG |
 | `previous-layout` | `prevl` (not at the CLI) | none | CLI, SRV, CFG |
 | `previous-window` | `prev` | none | CLI, SRV, CFG, CTL |
@@ -154,6 +155,11 @@ Five mouse wire commands are an exception and are genuinely usable for scripting
 - Value: `-t` (target session)
 - A bare positional argument is also accepted as the session name, so `psmux attach work` works.
 - Not accepted: `-d`, `-D`, `-E`, `-r`, `-c`, `-f`, `-x`, `-y`
+
+**pick**
+- Value: `-t` (target session); a bare positional session name is also accepted.
+- Attaches a client and opens `choose-session` on its first rendered frame. `pick` has no aliases.
+- `choose-session` remains a control message for an already-attached client and does not use this startup path.
 
 **has-session** (`has`)
 - Value: `-t` (target session). A leading `=` is stripped, matching tmux exact match semantics.

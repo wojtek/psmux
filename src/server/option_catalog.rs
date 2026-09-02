@@ -61,6 +61,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "renumber-windows", scope: "session", option_type: "boolean", default: "off", description: "Renumber windows on close" },
     OptionDef { name: "set-titles", scope: "session", option_type: "boolean", default: "off", description: "Set terminal title" },
     OptionDef { name: "set-titles-string", scope: "session", option_type: "string", default: "#S:#I:#W", description: "Terminal title format string" },
+    OptionDef { name: "tab-colour", scope: "session", option_type: "string", default: "", description: "Windows Terminal tab colour" },
     OptionDef { name: "word-separators", scope: "session", option_type: "string", default: " -_@", description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: "session", option_type: "choice", default: "off", description: "Allow passthrough escape sequences" },
     OptionDef { name: "allow-rename", scope: "session", option_type: "boolean", default: "on", description: "Allow programs to rename windows" },

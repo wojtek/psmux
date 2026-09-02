@@ -523,6 +523,89 @@ fn process_target_position(args: &[String], command_index: usize) -> Option<usiz
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum PickCliAction {
+    Unrelated,
+    ForwardToAttachedClient,
+    StartInPicker,
+}
+
+fn classify_pick_command(cmd: &str, attached_client_context: bool) -> PickCliAction {
+    if cmd != "pick" {
+        return PickCliAction::Unrelated;
+    }
+    if attached_client_context {
+        PickCliAction::ForwardToAttachedClient
+    } else {
+        PickCliAction::StartInPicker
+    }
+}
+
+struct AttachResolution {
+    name: String,
+    shown: String,
+    explicit_target: bool,
+}
+
+/// Resolve the session an attaching client should use. `pick` needs this exact
+/// precedence too: its picker is a client overlay, so starting there must select
+/// the same client/server pair as `attach` before opening it.
+fn resolve_attach_target(
+    args: &[String],
+    command_args: &[&String],
+    socket_name: Option<&str>,
+) -> AttachResolution {
+    // Skip command_args[0], which is the subcommand itself; otherwise it would
+    // be mistaken for the positional target.
+    let sub_args: Vec<&String> = command_args.iter().skip(1).copied().collect();
+    let explicit_target = args.iter().any(|a| a == "-t")
+        || sub_args.iter().any(|a| !a.starts_with('-'));
+    let name = args
+        .iter()
+        .position(|a| a == "-t")
+        .and_then(|i| args.get(i + 1))
+        .map(|target| {
+            let session = crate::cli::parse_target(target)
+                .session
+                .unwrap_or_else(|| target.clone());
+            if let Some(socket) = socket_name {
+                format!("{}__{}", socket, session)
+            } else {
+                session
+            }
+        })
+        .or_else(|| {
+            // Keep attach's positional target compatibility even though -t is
+            // the documented spelling.
+            let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
+            sub_args.iter().enumerate().find_map(|(i, a)| {
+                if !a.starts_with('-') && Some(i) != t_val_idx {
+                    Some(if let Some(socket) = socket_name {
+                        format!("{}__{}", socket, a)
+                    } else {
+                        (*a).clone()
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(resolve_default_session_name)
+        .or_else(|| crate::session::resolve_last_session_name_ns(socket_name))
+        .unwrap_or_else(|| {
+            if let Some(socket) = socket_name {
+                format!("{}__0", socket)
+            } else {
+                "0".to_string()
+            }
+        });
+    let shown = socket_name
+        .and_then(|socket| name.strip_prefix(&format!("{}__", socket)))
+        .unwrap_or(&name)
+        .to_string();
+    AttachResolution { name, shown, explicit_target }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum KillServerCliAction<'a> {
     Unrelated,
     Execute,
@@ -600,6 +683,33 @@ mod process_command_arg_tests {
 
         let execute = strings(&["kill-server"]);
         assert_eq!(classify_kill_server_command("kill-server", &execute.iter().collect::<Vec<_>>()), KillServerCliAction::Execute);
+    }
+
+    #[test]
+    fn pick_cli_starts_picker_from_cold_shell() {
+        assert_eq!(
+            classify_pick_command("pick", false),
+            PickCliAction::StartInPicker,
+        );
+    }
+
+    #[test]
+    fn pick_cli_preserves_attached_client_forwarding() {
+        assert_eq!(
+            classify_pick_command("pick", true),
+            PickCliAction::ForwardToAttachedClient,
+        );
+    }
+
+    #[test]
+    fn choose_session_and_removed_aliases_are_not_picker_start_commands() {
+        for command in ["choose-session", "choose", "cs", "choose-tree"] {
+            assert_eq!(
+                classify_pick_command(command, false),
+                PickCliAction::Unrelated,
+                "{command}",
+            );
+        }
     }
 }
 
@@ -899,6 +1009,7 @@ fn run_main() -> io::Result<()> {
     }
 
     // Handle side-effect-free internal rendering before startup maintenance.
+    let mut start_in_session_chooser = false;
     match cmd {
         // Hidden internal command for empirical preview rendering tests.
         // Usage: psmux _render-preview <session> <win_id> <width> <height>
@@ -1232,60 +1343,12 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "a" | "at" | "attach" | "attach-session" => {
-                // Search cmd_args (skips binary name + global flags). Skip
-                // cmd_args[0] which is the subcommand itself ("a"/"attach"/etc),
-                // otherwise argv[0] (the exe path or subcommand name) gets
-                // picked up as the target session name.
-                let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
-                // Explicit -t target takes precedence over every fallback (issue #408).
-                // The global argument scan above STRIPS -t (and its value) out of
-                // cmd_args, so re-reading it from sub_args here always missed and the
-                // resolution fell through to resolve_last_session_name_ns — meaning
-                // `attach-session -t NAME` reattached to whatever session was used
-                // last instead of NAME. Read -t from the full, unstripped argv so the
-                // requested target always wins. Works for both subcommand-position
-                // (`attach-session -t s2`) and global-position (`-t s2 attach-session`).
-                let explicit_target = args.iter().any(|a| a == "-t")
-                    || sub_args.iter().any(|a| !a.starts_with('-'));
-                let name = args
-                    .iter()
-                    .position(|a| a == "-t")
-                    .and_then(|i| args.get(i + 1))
-                    .map(|target| {
-                        let session = crate::cli::parse_target(target)
-                            .session
-                            .unwrap_or_else(|| target.clone());
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, session)
-                        } else {
-                            session
-                        }
-                    })
-                    .or_else(|| {
-                        // Accept positional argument as target session name
-                        // (e.g. "psmux attach work" without -t flag)
-                        let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
-                        sub_args.iter().enumerate().find_map(|(i, a)| {
-                            if !a.starts_with('-') && Some(i) != t_val_idx {
-                                Some(if let Some(ref l) = l_socket_name {
-                                    format!("{}__{}", l, a)
-                                } else {
-                                    (*a).clone()
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .or_else(resolve_default_session_name)
-                    .or_else(|| crate::session::resolve_last_session_name_ns(l_socket_name.as_deref()))
-                    .unwrap_or_else(|| {
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__0", l)
-                        } else {
-                            "0".to_string()
-                        }
-                    });
+                // Explicit -t target takes precedence over every fallback
+                // (issue #408); the shared resolver reads it from the full,
+                // unstripped argv before default-session and last-session.
+                let resolution = resolve_attach_target(&args, &cmd_args, l_socket_name.as_deref());
+                let explicit_target = resolution.explicit_target;
+                let name = resolution.name;
                 // #362: tmux runs `new-session` from the config at server start,
                 // so `attach-session` works even with no server running. psmux has
                 // no persistent server, so when no session exists yet and the
@@ -1319,11 +1382,7 @@ fn run_main() -> io::Result<()> {
                 // complete means no server, whatever error the OS chose to
                 // report. The lenient reading let a stale registry entry pass
                 // the gate and the raw winsock error surfaced from the client.
-                let shown = l_socket_name
-                    .as_deref()
-                    .and_then(|l| name.strip_prefix(&format!("{}__", l)))
-                    .unwrap_or(&name)
-                    .to_string();
+                let shown = resolution.shown;
                 if !probe_session_alive_strict(&name) {
                     // Nothing is listening on the registered port. Reap the
                     // entry so the next `ls`/`attach` does not re-litigate it,
@@ -4322,6 +4381,36 @@ fn run_main() -> io::Result<()> {
                 send_control(format!("{}\n", cmd))?;
                 return Ok(());
             }
+            // `pick` is the cold-shell entry point for the client-side session
+            // chooser. Inside psmux, the existing attached client still owns it.
+            "pick" => {
+                match classify_pick_command(cmd, crate::util::psmux_drawn_terminal()) {
+                    PickCliAction::ForwardToAttachedClient => {
+                        send_control("choose-session\n".to_string())?;
+                        return Ok(());
+                    }
+                    PickCliAction::StartInPicker => {
+                        let resolution = resolve_attach_target(&args, &cmd_args, l_socket_name.as_deref());
+                        let name = resolution.name;
+                        if !probe_session_alive_strict(&name) {
+                            if crate::session::registry_pid_anchor_alive(&name) != Some(true) {
+                                crate::session::remove_session_registry(&name);
+                            }
+                            if crate::session::list_session_names_ns(l_socket_name.as_deref()).is_empty() {
+                                eprintln!("psmux: no sessions");
+                            } else {
+                                eprintln!("psmux: can't find session: {}", resolution.shown);
+                            }
+                            std::process::exit(1);
+                        }
+                        env::set_var("PSMUX_SESSION_NAME", name);
+                        env::set_var("PSMUX_SESSION_DISPLAY_NAME", resolution.shown);
+                        env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                        start_in_session_chooser = true;
+                    }
+                    PickCliAction::Unrelated => unreachable!(),
+                }
+            }
             // command-prompt - Open interactive command prompt
             "command-prompt" => {
                 let mut cmd = "command-prompt".to_string();
@@ -4920,8 +5009,15 @@ fn run_main() -> io::Result<()> {
     }
 
     // Loop to handle session switching without spawning new processes
+    let mut open_session_chooser_on_attach = start_in_session_chooser;
     let result = loop {
-        let result = run_remote(&mut terminal, &input);
+        let result = run_remote(
+            &mut terminal,
+            &input,
+            l_socket_name.as_deref(),
+            open_session_chooser_on_attach,
+        );
+        open_session_chooser_on_attach = false;
         
         // Check if we should switch to another session
         if let Ok(switch_to) = env::var("PSMUX_SWITCH_TO") {

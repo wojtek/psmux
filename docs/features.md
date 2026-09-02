@@ -108,6 +108,7 @@ See [scripting.md](scripting.md) for full command reference and examples, and
 
 - **Prefix + s** opens an interactive session/window/pane tree chooser
 - **Prefix + (** and **Prefix + )** cycle through sessions
+- `psmux pick` attaches from a normal shell and opens the session chooser on its first frame
 - `switch-client -t sessionname` switches to a named session
 - `switch-client -l` returns to the last (most recently used) session
 - Create multiple sessions with `new-session -s name` and switch freely between them
@@ -164,6 +165,7 @@ See [claude-code.md](claude-code.md) for detailed setup and troubleshooting.
 
 - `choose-tree` (`Prefix + w`): browse and select sessions, windows, and panes interactively, with optional [live preview pane](preview.md) (`p` to toggle, `set -g choose-tree-preview on` to default on)
 - `choose-session` (`Prefix + s`): browse sessions only, same live preview support
+- `pick`: attach from a normal shell and start in `choose-session`; this is the only CLI spelling for that startup path
 - `choose-buffer` (`Prefix + =`): pick from paste buffers with preview
 - `choose-client`: view connected clients
 - `customize-mode`: interactive options editor
