@@ -4925,6 +4925,25 @@ fn run_main() -> io::Result<()> {
     }
     env::set_var("PSMUX_ACTIVE", "1");
 
+    // Console-backed VT input must use the target server's escape-time. Query
+    // it before starting the reader thread; a missing or invalid value is a
+    // startup error, not permission to substitute a client-side timeout.
+    let use_vt_input = crate::ssh_input::needs_vt_input();
+    let vt_escape_timeout_ms = if use_vt_input && !pipe_vt {
+        let raw = send_control_with_response("show-options -gv escape-time\n".to_string())
+            .map_err(|e| io::Error::new(
+                e.kind(),
+                format!("cannot resolve server escape-time for VT input: {e}"),
+            ))?;
+        let value = raw.trim().parse::<u32>().map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("server returned invalid escape-time value {:?}", raw.trim()),
+        ))?;
+        Some(value)
+    } else {
+        None
+    };
+
     let mut stdout = crate::platform::create_writer();
     enable_virtual_terminal_processing();
     if pipe_vt {
@@ -4950,11 +4969,6 @@ fn run_main() -> io::Result<()> {
         let _ = crate::types::HOST_COLORS_SPEC.set(crate::platform::query_host_terminal_colors());
     }
 
-    // Detect terminal type for input handling.
-    // Use VT input parsing for SSH sessions and terminals that send VT mouse
-    // sequences through ConPTY (e.g. JetBrains JediTerm).
-    let use_vt_input = crate::ssh_input::needs_vt_input();
-
     // For standard terminals (not SSH), clear VTI flag from stdin if
     // crossterm or another layer set it. Keeps normal ReadConsoleInputW
     // behavior via proper INPUT_RECORDs.
@@ -4968,7 +4982,7 @@ fn run_main() -> io::Result<()> {
     let input = if pipe_vt {
         InputSource::new_pipe()?
     } else {
-        InputSource::new(use_vt_input)?
+        InputSource::new(use_vt_input, vt_escape_timeout_ms)?
     };
 
     if pipe_vt {

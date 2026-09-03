@@ -568,6 +568,17 @@ fn bare_cr_without_esc_is_plain_enter() {
 }
 
 #[test]
+fn bare_lf_without_esc_is_ctrl_j_and_round_trips_as_lf() {
+    // Ground-state bytes are transparent: LF is Ctrl+J, not plain Enter.
+    let events = parse("\n");
+    assert_eq!(events.len(), 1);
+    let k = key_event(&events[0]).expect("expected a Key event");
+    assert_eq!(k.code, KeyCode::Char('j'));
+    assert_eq!(k.modifiers, KeyModifiers::CONTROL);
+    assert_eq!(crate::input::encode_key_event(k), Some(vec![b'\n']));
+}
+
+#[test]
 fn esc_printable_still_decodes_as_alt_char() {
     // The new Enter arm must not disturb Alt+<printable> handling.
     let events = parse("\x1bx");

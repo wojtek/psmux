@@ -459,7 +459,7 @@ pub fn keepalive_reasserts_mouse_input() -> bool {
 ///
 /// # Usage
 /// ```ignore
-/// let input = InputSource::new(is_ssh)?;
+/// let input = InputSource::new(is_ssh, escape_timeout_ms)?;
 /// loop {
 ///     if let Some(evt) = input.read_timeout(Duration::from_millis(50))? {
 ///         match evt { /* … */ }
@@ -482,14 +482,20 @@ impl InputSource {
     /// When `ssh == true` **and** running on Windows, spawns the SSH VT reader
     /// thread with raw console input.  Otherwise wraps `crossterm::event`
     /// with zero overhead.
-    pub fn new(ssh: bool) -> io::Result<Self> {
+    pub fn new(ssh: bool, escape_timeout_ms: Option<u32>) -> io::Result<Self> {
         if !ssh {
             return Ok(InputSource::Crossterm);
         }
 
         #[cfg(windows)]
         {
-            match start_ssh_reader() {
+            let escape_timeout_ms = escape_timeout_ms.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSH VT input requires the server's escape-time option",
+                )
+            })?;
+            match start_ssh_reader(escape_timeout_ms) {
                 Ok(rx) => Ok(InputSource::Ssh { rx }),
                 Err(e) => {
                     // Log to file instead of stderr (raw mode garbles eprintln).
@@ -503,6 +509,7 @@ impl InputSource {
         {
             // On Unix, crossterm already reads raw VT bytes and handles mouse.
             let _ = ssh;
+            let _ = escape_timeout_ms;
             Ok(InputSource::Crossterm)
         }
     }
@@ -851,7 +858,7 @@ impl VtParser {
             '\x1b' => {
                 self.state = PS::Escape;
             }
-            '\r' | '\n' => emit(make_key(KeyCode::Enter, KeyModifiers::empty())),
+            '\r' => emit(make_key(KeyCode::Enter, KeyModifiers::empty())),
             '\t' => emit(make_key(KeyCode::Tab, KeyModifiers::empty())),
             '\x7f' => emit(make_key(KeyCode::Backspace, KeyModifiers::empty())),
             '\x08' => emit(make_key(KeyCode::Backspace, KeyModifiers::empty())),
@@ -1493,7 +1500,7 @@ fn ssh_verbose() -> bool {
 // ─── Windows: SSH reader thread + Win32 FFI ──────────────────────────────────
 
 #[cfg(windows)]
-fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
+fn start_ssh_reader(escape_timeout_ms: u32) -> io::Result<std::sync::mpsc::Receiver<Event>> {
     use std::ffi::c_void;
     use std::sync::mpsc;
 
@@ -1730,9 +1737,6 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
             let mut records: Vec<INPUT_RECORD> = Vec::with_capacity(64);
             records.resize_with(64, || unsafe { std::mem::zeroed() });
 
-            // Escape-timeout: 50 ms matches tmux's default.
-            const ESC_TIMEOUT_MS: u32 = 50;
-
             let mut alive = true;
             let verbose = ssh_verbose();
             let mut total_records: u64 = 0;
@@ -1748,7 +1752,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // Dynamic timeout: short when the parser has a pending Esc
                 // or is inside a paste (need to detect stale paste quickly).
                 let wait_ms = if parser.has_pending_escape() {
-                    ESC_TIMEOUT_MS
+                    escape_timeout_ms
                 } else if parser.is_in_paste() || parser.state == PS::PasteDrain {
                     200 // check paste timeout / drain expiry frequently
                 } else {
@@ -1912,7 +1916,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // After processing all records from this batch, flush any
                 // pending escape if no more input is immediately available.
                 if parser.has_pending_escape() {
-                    let peek_wait = unsafe { WaitForSingleObject(handle, ESC_TIMEOUT_MS) };
+                    let peek_wait = unsafe { WaitForSingleObject(handle, escape_timeout_ms) };
                     if peek_wait == WAIT_TIMEOUT {
                         parser.flush_escape(&mut |evt| {
                             if tx.send(evt).is_err() { alive = false; }
