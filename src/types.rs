@@ -870,6 +870,8 @@ pub struct AppState {
     pub set_titles: bool,
     /// set-titles-string: format for terminal title
     pub set_titles_string: String,
+    /// tab-colour: host terminal tab colour (empty resets the terminal default)
+    pub tab_colour: String,
     /// update-environment: list of env var names to update from client on attach
     pub update_environment: Vec<String>,
     /// Environment variables set via set-environment
@@ -1679,6 +1681,7 @@ impl AppState {
             aggressive_resize: false,
             set_titles: false,
             set_titles_string: String::new(),
+            tab_colour: String::new(),
             update_environment: vec![
                 "DISPLAY".to_string(),
                 "KRB5CCNAME".to_string(),
@@ -2015,6 +2018,8 @@ pub enum CtrlReq {
     // re-split on whitespace — that collapsed runs of spaces inside quoted
     // arguments and stripped leading/trailing spaces.
     SendKeys(Vec<String>, bool),
+    /// send-keys -R: reset the target pane's parsed terminal state and screen.
+    ResetTerminal,
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
@@ -2039,7 +2044,7 @@ pub enum CtrlReq {
     },
     KillSession,
     HasSession(mpsc::Sender<bool>),
-    RenameSession(String),
+    RenameSession(String, mpsc::Sender<Result<(), String>>),
     /// Claim a warm server: rename session + send response so CLI knows it's done.
     /// Fields: session name, optional client CWD, optional client priority,
     /// response sender.

@@ -1,5 +1,19 @@
 # Agent Instructions
 
+## Upstream-First Fork Maintenance
+
+- Treat current `marlocarlo/master` as the base for all psmux work. Before
+  changing fork behavior, fetch that branch and bring the fork forward first.
+- Rebuild from the current upstream tip and reapply only the deliberate
+  differences recorded in `FORK.md`. Do not merge accumulated fork history over
+  a newer upstream or revive an older fork change because it still exists in
+  history.
+- When upstream provides a maintained difference, use the upstream
+  implementation, remove the redundant fork patch, and update `FORK.md` in the
+  same change.
+- Keep the fork current as part of every fork-specific change; a stale upstream
+  base is a blocker, not a supported development state.
+
 ## Test Isolation
 
 - Never run psmux tests or commands that may create sessions in the default

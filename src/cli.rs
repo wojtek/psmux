@@ -14,24 +14,82 @@ use crate::types::{ParsedTarget, VERSION, build_version_string};
 ///   - Positional tokens without a leading `-` pass through unchanged.
 ///   - Bare `-` and degenerate `-=` pass through unchanged.
 pub fn normalize_flag_equals(args: Vec<String>) -> Vec<String> {
+    let send_keys_index = find_send_keys_subcommand(&args);
     let mut out = Vec::with_capacity(args.len());
-    for arg in args {
-        // Must start with exactly one dash, followed by a single ASCII letter,
-        // then `=`, then at least one character of value.
-        if arg.len() >= 4
-            && arg.starts_with('-')
-            && !arg.starts_with("--")
-        {
-            let bytes = arg.as_bytes();
-            if bytes[1].is_ascii_alphabetic() && bytes[2] == b'=' {
-                out.push(format!("-{}", bytes[1] as char));
-                out.push(arg[3..].to_string());
+    let mut send_keys_options = send_keys_index.is_some();
+    let mut send_keys_value_pending = false;
+
+    for (index, arg) in args.into_iter().enumerate() {
+        if send_keys_index.is_some_and(|command_index| index > command_index) {
+            if !send_keys_options {
+                out.push(arg);
                 continue;
             }
+            if send_keys_value_pending {
+                out.push(arg);
+                send_keys_value_pending = false;
+                continue;
+            }
+            if arg == "--" {
+                out.push(arg);
+                send_keys_options = false;
+                continue;
+            }
+            if let Some((flag, value)) = split_short_flag_equals(&arg) {
+                if matches!(flag.as_str(), "-t" | "-N") {
+                    out.push(flag);
+                    out.push(value);
+                    continue;
+                }
+            }
+            if let Some(flags) = send_keys_option_cluster(&arg) {
+                send_keys_value_pending = flags.chars().last()
+                    .is_some_and(|flag| matches!(flag, 't' | 'N'));
+                out.push(arg);
+                continue;
+            }
+            send_keys_options = false;
+            out.push(arg);
+            continue;
         }
-        out.push(arg);
+
+        if let Some((flag, value)) = split_short_flag_equals(&arg) {
+            out.push(flag);
+            out.push(value);
+        } else {
+            out.push(arg);
+        }
     }
     out
+}
+
+fn split_short_flag_equals(arg: &str) -> Option<(String, String)> {
+    if arg.len() < 4 || !arg.starts_with('-') || arg.starts_with("--") {
+        return None;
+    }
+    let bytes = arg.as_bytes();
+    (bytes[1].is_ascii_alphabetic() && bytes[2] == b'=')
+        .then(|| (format!("-{}", bytes[1] as char), arg[3..].to_string()))
+}
+
+fn find_send_keys_subcommand(args: &[String]) -> Option<usize> {
+    if args.first().is_some_and(|arg| matches!(arg.as_str(), "send-keys" | "send" | "send-key")) {
+        return Some(0);
+    }
+
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(arg.as_str(), "-L" | "-f" | "-S" | "-t") && index + 1 < args.len() {
+            index += 2;
+        } else if arg.starts_with('-') {
+            index += 1;
+        } else {
+            return matches!(arg.as_str(), "send-keys" | "send" | "send-key")
+                .then_some(index);
+        }
+    }
+    None
 }
 
 /// Split tmux-style ATTACHED short-option arguments in the GLOBAL (pre
@@ -123,9 +181,12 @@ pub fn normalize_attached_global_args(args: Vec<String>) -> Vec<String> {
 ///     this rewrite is parity even where the token was meant as text; the
 ///     tmux-blessed way to pass literal `-t...` text is after `--`.
 pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
+    let send_keys_index = find_send_keys_subcommand(&args);
     let mut out = Vec::with_capacity(args.len());
     let mut seen_subcommand = false;
     let mut seen_dashdash = false;
+    let mut send_keys_options = send_keys_index.is_some();
+    let mut send_keys_value_pending = false;
     for (idx, arg) in args.into_iter().enumerate() {
         if idx == 0 {
             out.push(arg); // binary name
@@ -140,6 +201,36 @@ pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
             if !arg.starts_with('-') || arg == "-" {
                 seen_subcommand = true;
             }
+            out.push(arg);
+            continue;
+        }
+        if send_keys_index.is_some_and(|command_index| idx > command_index) {
+            if !send_keys_options {
+                out.push(arg);
+                continue;
+            }
+            if send_keys_value_pending {
+                out.push(arg);
+                send_keys_value_pending = false;
+                continue;
+            }
+            if seen_dashdash {
+                send_keys_options = false;
+                out.push(arg);
+                continue;
+            }
+            if arg.len() > 2 && arg.starts_with("-t") && !arg.starts_with("--") {
+                out.push("-t".to_string());
+                out.push(arg[2..].to_string());
+                continue;
+            }
+            if let Some(flags) = send_keys_option_cluster(&arg) {
+                send_keys_value_pending = flags.chars().last()
+                    .is_some_and(|flag| matches!(flag, 't' | 'N'));
+                out.push(arg);
+                continue;
+            }
+            send_keys_options = false;
             out.push(arg);
             continue;
         }
@@ -236,6 +327,7 @@ SESSION COMMANDS:
     a, at, attach, attach-session
                             Attach to an existing session
         -t <name>           Target session name
+    pick                    Attach and open the session picker
     ls, list-sessions       List all active sessions
     has-session, has        Check if a session exists (exit code 0 = yes)
         -t <name>           Target session name
@@ -447,6 +539,7 @@ SET OPTIONS (use with: set -g <option> <value>):
     aggressive-resize   Bool Resize to smallest client (default: off)
     set-titles          Bool Update terminal title (default: off)
     set-titles-string   Str  Terminal title format
+    tab-colour          Str  Windows Terminal tab colour (empty clears it)
     default-shell       Str  Shell to launch (default: pwsh)
     default-command     Str  Alias for default-shell
     word-separators     Str  Copy-mode word delimiters (default: " -_@")
@@ -582,6 +675,45 @@ For more information: https://github.com/psmux/psmux
 "#, prog = prog, ver = VERSION);
 }
 
+pub(crate) fn send_keys_help_text() -> String {
+    let prog = get_program_name();
+    format!(r#"Send keys or text to a pane.
+
+USAGE:
+    {prog} send-keys [-l] [-N count] [-t target] [--] key ...
+    {prog} send      [-l] [-N count] [-t target] [--] key ...
+
+OPTIONS:
+    -l              Send literally (no key parsing)
+    -N <count>      Repeat the key sequence
+    -t <target>     Target pane
+    --help          Show this help without sending anything
+    --              End options; required when the first key starts with '--'
+
+EXAMPLES:
+    {prog} send "echo hello" Enter
+    {prog} send -- --help Enter
+"#)
+}
+
+pub fn print_send_keys_help() {
+    print!("{}", send_keys_help_text());
+}
+
+pub fn print_kill_server_help() {
+    let prog = get_program_name();
+    println!(r#"Kill psmux server processes and their sessions.
+
+USAGE:
+    {prog} kill-server
+    {prog} -L <name> kill-server
+
+OPTIONS:
+    -h, --help      Show this help without killing any sessions
+    -L <name>       Kill only sessions in this namespace; must precede the command
+"#);
+}
+
 pub fn print_version() {
     // First line MUST stay "tmux <version>" (and nothing else) for
     // compatibility with tools like libtmux/tmuxp that read the first line of
@@ -617,6 +749,7 @@ pub fn print_commands() {
   has-session               - Check if a session exists
   if-shell (if)             - Conditional command execution
   join-pane                 - Join a pane to a window
+  pick                      - Attach and open the session picker
   kill-pane                 - Kill a pane
   kill-server               - Kill the psmux server
   kill-session              - Kill a session
@@ -675,6 +808,136 @@ pub fn print_commands() {
   wait-for (wait)           - Wait for a signal
   zoom-pane (zoom)          - Toggle pane zoom
 "#);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedSendKeysArgs<'a> {
+    pub(crate) literal: bool,
+    pub(crate) paste_mode: bool,
+    pub(crate) copy_mode: bool,
+    pub(crate) hex_mode: bool,
+    pub(crate) reset: bool,
+    pub(crate) has_repeat: bool,
+    pub(crate) repeat_count: usize,
+    pub(crate) target: Option<&'a str>,
+    pub(crate) operands: Vec<&'a str>,
+}
+
+fn send_keys_option_cluster(arg: &str) -> Option<&str> {
+    arg.strip_prefix('-').filter(|flags| {
+        !flags.is_empty()
+            && !flags.starts_with('-')
+            && flags.chars().all(|c| matches!(c, 'l' | 'p' | 'R' | 'X' | 'H' | 'N' | 't'))
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendKeysCliAction<'a> {
+    Execute,
+    Help,
+    InvalidLongOption(&'a str),
+}
+
+pub(crate) fn classify_send_keys_cli<'a>(args: &[&'a str]) -> SendKeysCliAction<'a> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--" {
+            return SendKeysCliAction::Execute;
+        }
+        if arg == "--help" {
+            return SendKeysCliAction::Help;
+        }
+        if arg.starts_with("--") {
+            return SendKeysCliAction::InvalidLongOption(arg);
+        }
+        let Some(flags) = send_keys_option_cluster(arg) else {
+            return SendKeysCliAction::Execute;
+        };
+        i += if flags.chars().last().is_some_and(|flag| matches!(flag, 't' | 'N')) {
+            2
+        } else {
+            1
+        };
+    }
+    SendKeysCliAction::Execute
+}
+
+pub(crate) fn parse_send_keys_args<'a>(args: &[&'a str]) -> ParsedSendKeysArgs<'a> {
+    let mut parsed = ParsedSendKeysArgs {
+        literal: false,
+        paste_mode: false,
+        copy_mode: false,
+        hex_mode: false,
+        reset: false,
+        has_repeat: false,
+        repeat_count: 1,
+        target: None,
+        operands: Vec::new(),
+    };
+    let mut parsing_options = true;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i];
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            i += 1;
+            continue;
+        }
+        let option_cluster = parsing_options.then(|| send_keys_option_cluster(arg)).flatten();
+        if let Some(flags) = option_cluster {
+            for flag in flags.chars() {
+                match flag {
+                    'l' => parsed.literal = true,
+                    'p' => parsed.paste_mode = true,
+                    'R' => parsed.reset = true,
+                    'X' => parsed.copy_mode = true,
+                    'H' => parsed.hex_mode = true,
+                    'N' => parsed.has_repeat = true,
+                    _ => {}
+                }
+            }
+            if let Some(flag) = flags.chars().last().filter(|c| matches!(c, 't' | 'N')) {
+                if let Some(value) = args.get(i + 1).copied() {
+                    match flag {
+                        't' => parsed.target = Some(value),
+                        'N' => parsed.repeat_count = value.parse::<usize>().unwrap_or(1).max(1),
+                        _ => {}
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        parsing_options = false;
+        if !arg.is_empty() {
+            parsed.operands.push(arg);
+        }
+        i += 1;
+    }
+    parsed
+}
+
+pub(crate) fn build_send_keys_control_command(args: &[&str]) -> String {
+    let parsed = parse_send_keys_args(args);
+    let mut command = "send-keys".to_string();
+    if parsed.literal { command.push_str(" -l"); }
+    if parsed.paste_mode { command.push_str(" -p"); }
+    if parsed.reset { command.push_str(" -R"); }
+    if parsed.copy_mode { command.push_str(" -X"); }
+    if parsed.hex_mode { command.push_str(" -H"); }
+    if parsed.has_repeat { command.push_str(&format!(" -N {}", parsed.repeat_count)); }
+    if !parsed.operands.is_empty() {
+        command.push_str(" --");
+        for operand in parsed.operands {
+            command.push(' ');
+            command.push_str(&crate::util::quote_arg(operand));
+        }
+    }
+    command
 }
 
 /// Strip the tmux exact-match marker from a raw target specification.
@@ -1025,6 +1288,19 @@ pub fn has_short_flag(args: &[&str], flag_char: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_keys_cli_classification_stops_at_the_operand_boundary() {
+        assert_eq!(classify_send_keys_cli(&["-l", "--help"]), SendKeysCliAction::Help);
+        assert_eq!(classify_send_keys_cli(&["-lt", "%1", "--help"]), SendKeysCliAction::Help);
+        assert_eq!(
+            classify_send_keys_cli(&["--hepl"]),
+            SendKeysCliAction::InvalidLongOption("--hepl")
+        );
+        assert_eq!(classify_send_keys_cli(&["--", "--help"]), SendKeysCliAction::Execute);
+        assert_eq!(classify_send_keys_cli(&["text", "--help"]), SendKeysCliAction::Execute);
+        assert_eq!(classify_send_keys_cli(&["-z", "--help"]), SendKeysCliAction::Execute);
+    }
 
     #[test]
     fn parse_target_window_name() {

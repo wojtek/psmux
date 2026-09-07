@@ -201,12 +201,15 @@ so muscle memory carries over.
 | `f` | Enter session-name filter mode (choose-session only) |
 | `p` | Toggle live preview |
 | `x` | Kill the highlighted entry (session in choose-session, window in choose-tree) |
+| `$` | Rename the highlighted session |
 | `Esc` | Clear an active session filter; otherwise close the chooser |
 
 In the session picker, `f` starts filter mode, which matches session names
 case-insensitively as you type. `Backspace` edits the filter. `Esc` with filter
 text entered clears the filter and shows every session again; `Esc` with no
 filter text closes the picker.
+
+Run `psmux pick` from a normal shell to attach and open the session picker in one step.
 
 `q` does **not** close these two choosers. Every printable key other than the ones above is
 swallowed so it cannot leak into the focused pane, and `q` falls into that group. Use `Esc`.

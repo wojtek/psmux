@@ -188,7 +188,7 @@ const UNVALIDATED_CHOICE: OptionType = Choice(Unvalidated);
 
 pub static OPTION_CATALOG: &[OptionDef] = &[
     // ── Server options ──
-    OptionDef { name: "escape-time", scope: Server, option_type: Number(U64), default: "500", description: "Time in ms to wait for escape sequence" },
+    OptionDef { name: "escape-time", scope: Server, option_type: Number(U64), default: "500", description: "Time in ms to wait for an escape sequence; larger values tolerate SSH jitter but delay a standalone Escape key" },
     OptionDef { name: "focus-events", scope: Server, option_type: Boolean, default: "off", description: "Send focus events to applications" },
     OptionDef { name: "bold-is-bright", scope: Server, option_type: Boolean, default: "on", description: "Rewrite crossterm's 256-indexed basic colors to standard SGR so the terminal applies bold-is-bright (issue #425); off keeps explicit 256-indexed low colors byte-accurate" },
     OptionDef { name: "history-limit", scope: Server, option_type: Number(Usize), default: "2000", description: "Maximum scrollback lines per pane" },
@@ -240,6 +240,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "renumber-windows", scope: Session, option_type: Boolean, default: "off", description: "Renumber windows on close" },
     OptionDef { name: "set-titles", scope: Session, option_type: Boolean, default: "off", description: "Set terminal title" },
     OptionDef { name: "set-titles-string", scope: Session, option_type: OptionType::String, default: "#S:#I:#W", description: "Terminal title format string" },
+    OptionDef { name: "tab-colour", scope: Session, option_type: OptionType::String, default: "", description: "Windows Terminal tab colour" },
     OptionDef { name: "word-separators", scope: Session, option_type: OptionType::String, default: " -_@", description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: Session, option_type: UNVALIDATED_CHOICE, default: "off", description: "Allow passthrough escape sequences" },
     OptionDef { name: "allow-rename", scope: Session, option_type: Boolean, default: "on", description: "Allow programs to rename windows" },
