@@ -186,6 +186,13 @@ fn plain_char_no_modifiers() {
 }
 
 #[test]
+fn backspace_sends_del() {
+    let ev = key(KeyCode::Backspace, KeyModifiers::NONE);
+    let bytes = encode_key_event(&ev).unwrap();
+    assert_eq!(bytes, vec![0x7f]);
+}
+
+#[test]
 fn alt_a_produces_esc_a() {
     let ev = key(KeyCode::Char('a'), KeyModifiers::ALT);
     let bytes = encode_key_event(&ev).unwrap();

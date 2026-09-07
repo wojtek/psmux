@@ -463,6 +463,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("codepoint-widths",           "\"\""),
     ("set-clipboard",              "on"),
     ("set-titles-string",          "\"\""),
+    ("tab-colour",                 "\"\""),
     // psmux extensions
     ("cursor-style",               "\"\""),
     ("cursor-blink",               "off"),
