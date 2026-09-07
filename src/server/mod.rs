@@ -856,6 +856,28 @@ fn rekey_session_guard(guard: &mut Option<crate::platform::SessionMutex>, new_ba
     }
 }
 
+fn reserve_session_rename_target(
+    old_base: &str,
+    new_base: &str,
+) -> Result<crate::platform::SessionMutex, String> {
+    let target_guard = crate::platform::acquire_session_mutex(new_base)
+        .ok_or_else(|| format!("session '{}' already exists", new_base))?;
+    if !old_base.eq_ignore_ascii_case(new_base) {
+        let occupied = [
+            crate::paths::port_file(new_base),
+            crate::paths::key_file(new_base),
+            crate::paths::sid_file(new_base),
+            crate::paths::pid_file(new_base),
+        ]
+        .iter()
+        .any(|path| std::path::Path::new(path).exists());
+        if occupied {
+            return Err(format!("session '{}' already exists", new_base));
+        }
+    }
+    Ok(target_guard)
+}
+
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
@@ -2381,6 +2403,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 combined_buf.push_str("\"}");
                             }
                         }
+                        // tab-colour: forward the configured colour so the client
+                        // can update its host terminal after drawing the frame.
+                        if !app.tab_colour.is_empty() && combined_buf.ends_with('}') {
+                            combined_buf.pop();
+                            combined_buf.push_str(",\"host_tab_color\":\"");
+                            combined_buf.push_str(&json_escape_string(&app.tab_colour));
+                            combined_buf.push_str("\"}");
+                        }
                         // Issue #269: forward OSC 9;4 progress from the active
                         // pane so the client emits the same sequence to the
                         // host terminal (Windows Terminal taskbar/tab progress).
@@ -2693,6 +2723,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SendBytes(bytes) => {
                     send_bytes_to_active(&mut app, &bytes)?;
+                }
+                CtrlReq::ResetTerminal => {
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if let Ok(mut terminal) = pane.term.lock() {
+                            terminal.process(b"\x1bc");
+                        }
+                        pane.data_version.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                    }
                 }
                 CtrlReq::SendKeys(keys, literal) => {
                     let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
@@ -3455,16 +3497,26 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::HasSession(resp) => {
                     let _ = resp.send(true);
                 }
-                CtrlReq::RenameSession(name) => {
-                    if let Some(cmds) = app.hooks.get("before-rename-session") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    let old_path = crate::paths::port_file(&app.port_file_base());
-                    let old_keypath = crate::paths::key_file(&app.port_file_base());
+                CtrlReq::RenameSession(name, resp) => {
+                    let old_base = app.port_file_base();
                     // Compute new port file base with socket_name prefix
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {
                         name.clone()
                     };
+                    let target_guard = match reserve_session_rename_target(&old_base, &new_base) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            app.status_message = Some((error.clone(), Instant::now(), None));
+                            state_dirty = true;
+                            let _ = resp.send(Err(error));
+                            continue;
+                        }
+                    };
+                    if let Some(cmds) = app.hooks.get("before-rename-session") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
+                    let old_path = crate::paths::port_file(&old_base);
+                    let old_keypath = crate::paths::key_file(&old_base);
                     let new_path = crate::paths::port_file(&new_base);
                     let new_keypath = crate::paths::key_file(&new_base);
                     if let Some(port) = app.control_port {
@@ -3480,9 +3532,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // The activity stamp follows the session across the rename
                         // (issue #603); it must move BEFORE remove_session_id_file
                         // drops the old base's stamp with its .sid/.pid.
-                        crate::session::carry_session_activity_file(&app.port_file_base(), &new_base);
+                        crate::session::carry_session_activity_file(&old_base, &new_base);
                         // Rename .sid file to match new session name
-                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::remove_session_id_file(&old_base);
                         crate::session::write_session_id_file(&new_base, app.session_id);
                         // Re-anchor the PID sentinel to the new base (issue #448):
                         // remove_session_id_file above dropped the old .pid.
@@ -3493,12 +3545,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = std::fs::write(&new_path, port.to_string());
                     }
                     app.session_name = name;
-                    // Move the single-server-per-name guard onto the new name, or the
-                    // old name stays locked forever and blocks re-creating it (#505).
-                    rekey_session_guard(&mut session_guard, &app.port_file_base());
+                    // The target guard was acquired before any registry mutation,
+                    // while the old guard was still held. This makes collision
+                    // refusal authoritative even when two servers rename at once.
+                    let old_guard = session_guard.replace(target_guard);
+                    drop(old_guard);
                     // Update env so run-shell/hooks from this server target the new name
                     env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
                     hook_event = Some("after-rename-session");
+                    let _ = resp.send(Ok(()));
                 }
                 CtrlReq::ClaimSession(name, client_cwd, client_priority, resp) => {
                     // Guard against clobbering an already-claimed session. Under
@@ -4429,6 +4484,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if !app.set_titles_string.is_empty() {
                         output.push_str(&format!("set-titles-string \"{}\"\n", app.set_titles_string));
                     }
+                    output.push_str(&format!("tab-colour \"{}\"\n", app.tab_colour));
                     output.push_str(&format!(
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }
@@ -6592,6 +6648,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         combined_buf.push_str(&json_escape_string(title));
                         combined_buf.push_str("\"}");
                     }
+                }
+                // tab-colour: forward the configured colour to the client.
+                if !app.tab_colour.is_empty() && combined_buf.ends_with('}') {
+                    combined_buf.pop();
+                    combined_buf.push_str(",\"host_tab_color\":\"");
+                    combined_buf.push_str(&json_escape_string(&app.tab_colour));
+                    combined_buf.push_str("\"}");
                 }
                 // Issue #269: forward OSC 9;4 progress from the active pane.
                 if combined_buf.ends_with('}') {

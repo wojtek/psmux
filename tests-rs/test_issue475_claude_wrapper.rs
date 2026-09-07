@@ -60,6 +60,73 @@ fn neutral_cwd(tag: &str) -> std::path::PathBuf {
     d
 }
 
+#[test]
+fn wrapper_preserves_existing_claude_function_defaults() {
+    let dir = std::env::temp_dir().join("psmux_test475_user_claude_function");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("claude.ps1"),
+        "Write-Output \"FAKE_CLAUDE_ARGS=$args\"\r\n",
+    )
+    .unwrap();
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = vec![dir.clone()];
+    dirs.extend(std::env::split_paths(&path).filter(|d| !d.join("claude.exe").exists()));
+    let new_path = std::env::join_paths(dirs).unwrap();
+
+    let script = format!(
+        "$f='owner-profile-value'; function Global:claude {{ & claude.ps1 --dangerously-skip-permissions --effort max @args }}; {0}; {0}; claude --print hi; Write-Output \"PROFILE_F=$f\"",
+        ENV_SHIM_PS
+    );
+    let out = run_pwsh(&script, &new_path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success(), "composed wrapper failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("FAKE_CLAUDE_ARGS=--dangerously-skip-permissions --effort max --teammate-mode tmux --print hi"),
+        "psmux replaced the user's claude defaults or lost teammate arguments.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(stdout.matches("--dangerously-skip-permissions").count(), 1);
+    assert_eq!(stdout.matches("--teammate-mode").count(), 1);
+    assert!(stdout.contains("PROFILE_F=owner-profile-value"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn existing_claude_function_receives_explicit_teammate_mode_once() {
+    let dir = std::env::temp_dir().join("psmux_test475_user_claude_explicit");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("claude.ps1"),
+        "Write-Output \"FAKE_CLAUDE_ARGS=$args\"\r\n",
+    )
+    .unwrap();
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> = vec![dir.clone()];
+    dirs.extend(std::env::split_paths(&path).filter(|d| !d.join("claude.exe").exists()));
+    let new_path = std::env::join_paths(dirs).unwrap();
+
+    let script = format!(
+        "function Global:claude {{ & claude.ps1 --dangerously-skip-permissions --effort max @args }}; {}; claude --teammate-mode off --print hi",
+        ENV_SHIM_PS
+    );
+    let out = run_pwsh(&script, &new_path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("FAKE_CLAUDE_ARGS=--dangerously-skip-permissions --effort max --teammate-mode off --print hi"),
+        "explicit teammate mode did not pass through the user's wrapper.\nstdout: {stdout}"
+    );
+    assert_eq!(stdout.matches("--teammate-mode").count(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Functional proof: with a PATH that contains only npm-style claude.cmd /
 /// claude.ps1 (no claude.exe anywhere), invoking `claude` through the real
 /// shipped shim must run the npm shim and auto-inject --teammate-mode.

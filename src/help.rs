@@ -443,6 +443,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("copy-command",               "\"\""),
     ("set-clipboard",              "on"),
     ("set-titles-string",          "\"\""),
+    ("tab-colour",                 "\"\""),
     // psmux extensions
     ("cursor-style",               "\"\""),
     ("cursor-blink",               "off"),

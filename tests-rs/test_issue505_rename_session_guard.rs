@@ -215,3 +215,34 @@ fn rekey_onto_a_name_owned_elsewhere_runs_unguarded_instead_of_dying() {
     release_tx.send(()).unwrap();
     holder.join().unwrap();
 }
+
+#[test]
+#[cfg(windows)]
+fn rename_reservation_refuses_a_name_owned_by_another_server() {
+    let old = key("reserved-old");
+    let busy = key("reserved-busy");
+    let old_guard = crate::platform::acquire_session_mutex(&old);
+    assert!(old_guard.is_some(), "setup: should hold the current session name");
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let busy_owned = busy.clone();
+    let holder = std::thread::spawn(move || {
+        let held = crate::platform::acquire_session_mutex(&busy_owned);
+        assert!(held.is_some(), "setup: competing server should own the target name");
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(held);
+    });
+    started_rx.recv().unwrap();
+
+    let error = reserve_session_rename_target(&old, &busy)
+        .err()
+        .expect("rename must refuse a target held by another live server");
+    assert!(error.contains("already exists"));
+    assert!(!name_is_free(&old), "a refused rename must preserve the old guard");
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    drop(old_guard);
+}

@@ -166,7 +166,8 @@ See [claude-code.md](claude-code.md) for detailed setup and troubleshooting.
 ## Interactive Choosers
 
 - `choose-tree` (`Prefix + w`): browse and select sessions, windows, and panes interactively, with optional [live preview pane](preview.md) (`p` to toggle, `set -g choose-tree-preview on` to default on)
-- `choose-session` (`Prefix + s`): browse sessions only, same live preview support
+- `choose-session` (`Prefix + s`): browse sessions in a full-width list, with attached sessions accented and long names shortened in the middle; press `$` to rename the highlighted session
+- `psmux pick`: attach from a normal shell and open the same session picker immediately
 - `choose-buffer` (`Prefix + =`): pick from paste buffers with preview
 - `choose-client`: view connected clients
 - `customize-mode`: interactive options editor

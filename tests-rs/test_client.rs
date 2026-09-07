@@ -46,6 +46,74 @@ fn session_filter_escape_without_query_closes_picker() {
 
 #[cfg(windows)]
 #[test]
+fn picker_rename_collision_is_case_insensitive_and_namespace_aware() {
+    let names = ["alpha", "Beta", "production"];
+    assert!(picker_session_name_conflicts(names, "alpha", "beta"));
+    assert!(!picker_session_name_conflicts(names, "alpha", "ALPHA"));
+
+    let namespaced = ["team__alpha", "team__beta"];
+    let logical = picker_logical_rename_name(Some("team"), "beta");
+    let projected = picker_registry_name_for_logical(Some("team"), &logical);
+    assert_eq!(logical, "beta");
+    assert_eq!(projected, "team__beta");
+    assert!(picker_session_name_conflicts(namespaced, "team__alpha", &projected));
+    assert_eq!(picker_logical_rename_name(Some("team"), "team__alpha"), "alpha");
+}
+
+#[cfg(windows)]
+#[test]
+fn picker_rename_validation_rejects_windows_filename_edge_cases() {
+    for name in ["", "   ", "bad/name", "CON", "prn.txt", "nul", "COM1", "LPT9.log", "name.", "name "] {
+        assert!(validate_picker_session_name(name, name).is_err(), "{name}");
+    }
+    assert!(validate_picker_session_name("COM10", "COM10").is_ok());
+    assert!(validate_picker_session_name("valid session", "valid session").is_ok());
+    assert!(validate_picker_session_name(&"a".repeat(250), &"a".repeat(250)).is_ok());
+    assert!(validate_picker_session_name(&"a".repeat(251), &"a".repeat(251)).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn middle_ellipsis_preserves_both_identifying_ends() {
+    use unicode_width::UnicodeWidthStr;
+    let shortened = middle_ellipsize("abcdefghijklmnop", 9);
+    assert_eq!(shortened, "abcd…mnop");
+    assert_eq!(UnicodeWidthStr::width(shortened.as_str()), 9);
+
+    let wide = middle_ellipsize("東京大阪", 5);
+    assert_eq!(wide, "東…阪");
+    assert_eq!(UnicodeWidthStr::width(wide.as_str()), 5);
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_colours_attached_number_from_mode_style() {
+    let mode_style = crate::style::parse_tmux_style("bg=magenta,fg=cyan");
+    let line = session_chooser_row_line(0, 2, " ", "alpha: info", true, false, mode_style);
+    assert_eq!(line.spans[1].content.as_ref(), "1");
+    assert_eq!(line.spans[1].style, Style::default().fg(Color::Magenta));
+    assert_eq!(line.spans[0].style, Style::default());
+    assert_eq!(line.spans[2].style, Style::default());
+}
+
+#[test]
+fn session_chooser_popup_is_full_width() {
+    for width in [1, 5, 19, 20, 39, 40, 80, 160] {
+        let content = Rect::new(7, 3, width, 30);
+        let preview = session_chooser_popup_rect(content, true, 12, 0, (50, 0));
+        assert_eq!(preview.width, content.width);
+        assert_eq!(preview.x, content.x);
+        assert_eq!(preview.height, 22);
+
+        let list = session_chooser_popup_rect(content, false, 3, 0, (-50, 0));
+        assert_eq!(list.width, content.width);
+        assert_eq!(list.x, content.x);
+        assert_eq!(list.height, 5);
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn ime_detection_ascii_only() {
     // Pure ASCII text should NOT be detected as IME input
     assert!(!paste_buffer_has_non_ascii("abc"));

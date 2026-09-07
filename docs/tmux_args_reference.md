@@ -26,6 +26,7 @@ This is the reference for the commands **psmux itself** accepts and the flags **
 | Command | Aliases | Flags psmux parses | Layers |
 |---|---|---|---|
 | `attach-session` | `attach`, `a`, `at` | `t:` | CLI, SRV, CFG |
+| `pick` | *(psmux extension)* | `t:` | CLI |
 | `bind-key` | `bind` | `nrT:` | CLI, SRV, CFG, CTL |
 | `break-pane` | `breakp` | `dt:` | CLI, SRV, CFG, CTL |
 | `capture-pane` | `capturep` | `eJpb:E:S:t:` | CLI, SRV, CFG, CTL |
@@ -154,6 +155,10 @@ Five mouse wire commands are an exception and are genuinely usable for scripting
 - Value: `-t` (target session)
 - A bare positional argument is also accepted as the session name, so `psmux attach work` works.
 - Not accepted: `-d`, `-D`, `-E`, `-r`, `-c`, `-f`, `-x`, `-y`
+
+**pick** (psmux extension)
+- Uses attach-session target resolution, then opens the full-width session picker immediately.
+- Inside an attached psmux client, forwards `choose-session` to that client.
 
 **has-session** (`has`)
 - Value: `-t` (target session). A leading `=` is stripped, matching tmux exact match semantics.
