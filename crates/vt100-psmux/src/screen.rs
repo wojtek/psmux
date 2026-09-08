@@ -54,6 +54,7 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MODE_WIN32_INPUT: u8 = 0b0010_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
@@ -784,6 +785,13 @@ impl Screen {
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.mode(MODE_BRACKETED_PASTE)
+    }
+
+    /// Returns whether the application requested Windows Terminal's Win32
+    /// input protocol with DEC private mode 9001.
+    #[must_use]
+    pub fn win32_input_mode(&self) -> bool {
+        self.mode(MODE_WIN32_INPUT)
     }
 
     /// Returns the currently active [`MouseProtocolMode`].
@@ -1683,6 +1691,7 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 [2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                [9001] => self.set_mode(MODE_WIN32_INPUT),
                 _ => unhandled(self),
             }
         }
@@ -1723,6 +1732,7 @@ impl Screen {
                     self.decrc();
                 }
                 [2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                [9001] => self.clear_mode(MODE_WIN32_INPUT),
                 _ => unhandled(self),
             }
         }

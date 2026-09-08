@@ -2135,6 +2135,26 @@ pub(crate) fn win32_input_key_seq(vk: u16, scan: u16, uchar: u16, ctrl_state: u3
     )
 }
 
+/// Translate modified newline keys into the Win32 input records requested by
+/// Windows console applications through DEC private mode 9001.
+#[cfg(windows)]
+pub(crate) fn win32_input_special_key_seq(bytes: &[u8]) -> Option<String> {
+    const VK_RETURN: u16 = 0x0D;
+    const LEFT_ALT_PRESSED: u32 = 0x0002;
+    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+
+    if bytes == b"\n" {
+        let vk = crate::platform::mouse_inject::char_to_vk('j');
+        let scan = crate::platform::mouse_inject::vk_to_scan(vk);
+        return Some(win32_input_key_seq(vk, scan, b'\n'.into(), LEFT_CTRL_PRESSED));
+    }
+    if bytes == b"\x1b\r" {
+        let scan = crate::platform::mouse_inject::vk_to_scan(VK_RETURN);
+        return Some(win32_input_key_seq(VK_RETURN, scan, b'\r'.into(), LEFT_ALT_PRESSED));
+    }
+    None
+}
+
 /// Write key bytes into ONE pane's ConPTY input pipe.
 ///
 /// Every key psmux delivers to a pane goes through here so the one byte that
@@ -2160,6 +2180,19 @@ pub(crate) fn write_pane_input(p: &mut crate::types::Pane, bytes: &[u8]) {
     use std::io::Write as _;
     #[cfg(windows)]
     {
+        let is_win32_special = bytes == b"\x1b" || bytes == b"\n" || bytes == b"\x1b\r";
+        if is_win32_special && !p.win32_input_latched {
+            p.win32_input_latched = p.term.lock()
+                .map(|parser| parser.screen().win32_input_mode())
+                .unwrap_or(false);
+        }
+        if p.win32_input_latched {
+            if let Some(seq) = win32_input_special_key_seq(bytes) {
+                let _ = p.writer.write_all(seq.as_bytes());
+                let _ = p.writer.flush();
+                return;
+            }
+        }
         if bytes == b"\x1b" && p.win32_input_latched {
             const VK_ESCAPE: u16 = 0x1B;
             let scan = crate::platform::mouse_inject::vk_to_scan(VK_ESCAPE);
@@ -3370,8 +3403,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                         crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
                     }
                 }
-                let _ = p.writer.write_all(&[ctrl_char]);
-                let _ = p.writer.flush();
+                write_pane_input(p, &[ctrl_char]);
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('a');
@@ -3432,14 +3464,14 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 if !injected {
                     if has_ctrl && !has_shift && !has_alt {
                         // Fallback: plain Ctrl+Enter is LF, matching WT (#409).
-                        let _ = p.writer.write_all(b"\n");
+                        write_pane_input(p, b"\n");
                     } else if (has_shift || has_alt) && !has_ctrl {
                         // Fallback: ESC + CR for VT-native apps (Claude Code, etc.)
-                        let _ = p.writer.write_all(b"\x1b\r");
+                        write_pane_input(p, b"\x1b\r");
                     } else {
                         // Ctrl+Shift/Ctrl+Alt+Enter and other combos: CSI encoding
                         if let Some(seq) = parse_modified_special_key(s) {
-                            let _ = p.writer.write_all(seq.as_bytes());
+                            write_pane_input(p, seq.as_bytes());
                         }
                     }
                 }

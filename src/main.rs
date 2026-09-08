@@ -5154,6 +5154,7 @@ fn run_main() -> io::Result<()> {
         }
 
         // Now attach to the session
+        env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
         env::set_var("PSMUX_SESSION_NAME", &port_file_base);
         env::set_var("PSMUX_REMOTE_ATTACH", "1");
     }

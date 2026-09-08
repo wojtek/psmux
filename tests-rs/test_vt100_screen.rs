@@ -81,6 +81,18 @@ fn screen_set_title_empty_string() {
 }
 
 #[test]
+fn win32_input_mode_tracks_private_mode_9001() {
+    let mut parser = crate::Parser::new(24, 80, 0);
+    assert!(!parser.screen().win32_input_mode());
+
+    parser.process(b"\x1b[?9001h");
+    assert!(parser.screen().win32_input_mode());
+
+    parser.process(b"\x1b[?9001l");
+    assert!(!parser.screen().win32_input_mode());
+}
+
+#[test]
 fn screen_set_title_invalid_utf8_ignored() {
     let mut screen = Screen::new(crate::grid::Size { rows: 24, cols: 80 }, 0);
     screen.set_title(b"good");

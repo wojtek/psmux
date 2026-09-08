@@ -202,10 +202,12 @@ pub struct Pane {
     /// Windows default, so it does NOT mean the child asked), while the raw
     /// mode shape says the child deliberately configured itself to read them.
     pub mouse_input_cache: Option<(Instant, Option<u32>)>,
-    /// True once psmux has written a WIN32 INPUT MODE key sequence
+    /// True once the pane application has requested WIN32 INPUT MODE or psmux
+    /// has written a WIN32 INPUT MODE key sequence
     /// (`ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`) into this pane's ConPTY input
-    /// pipe — today only `send-keys C-<letter>`, which needs that form so the
-    /// child sees a real `VK + LEFT_CTRL_PRESSED` record (issue #305).
+    /// pipe. Console TUIs request it with DEC private mode 9001; `send-keys
+    /// C-<letter>` also needs that form so the child sees a real
+    /// `VK + LEFT_CTRL_PRESSED` record (issue #305).
     ///
     /// It has to be remembered because writing one is a ONE-WAY latch on the
     /// other side: conhost's input state machine concludes the terminal speaks
@@ -218,8 +220,8 @@ pub struct Pane {
     /// sequence and is swallowed after it, while the same key written AS a
     /// win32 sequence arrives correctly either way.
     ///
-    /// So once this is set, `input::write_pane_input` encodes a lone Escape in
-    /// win32 form too, which is the only thing conhost still accepts.  It
+    /// So once this is set, `input::write_pane_input` encodes a lone Escape and
+    /// modified newline keys in win32 form, which is what conhost accepts. It
     /// belongs to the pane because the latch belongs to that one ConPTY: a new
     /// window is unaffected, and `respawn_active_pane` clears it with the rest
     /// of the per-ConPTY caches.

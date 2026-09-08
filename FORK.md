@@ -25,14 +25,17 @@ still requires and upstream does not yet provide.
 - The session option `tab-colour` applies a Windows Terminal tab color without
   rewriting the normal 0-255 text palette and resets it when cleared.
 - Console-backed SSH VT input keeps bare LF as Ctrl+J/LF while CR remains Enter,
-  and uses the target server's `escape-time` for pending Escape sequences.
+  uses the target server's `escape-time` for pending Escape sequences, and
+  translates Ctrl+J, modified Enter, and Escape into Win32 input records when
+  a Windows pane application such as Codex requests DEC private mode 9001.
 
 ## Upstream-owned and excluded behavior
 
-Current upstream owns the Win32-input-mode Escape repair, local Windows
+Current upstream owns the base Win32-input-mode Escape repair, local Windows
 Ctrl+Enter-to-LF delivery used by physical Ctrl+J, modified-Enter behavior,
 Ctrl+Backspace handling, and the current mouse/scroll implementation. Keep those
-implementations rather than duplicating older fork patches.
+implementations rather than duplicating older fork patches; the SSH bridge above
+extends their delivery into a pane that requested Win32 input mode.
 
 The control plane remains upstream's authenticated loopback TCP transport. The
 old named-pipe fork and superseded Elysium mouse patch are intentionally not
