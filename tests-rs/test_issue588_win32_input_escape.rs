@@ -22,7 +22,7 @@
 // is what issue #305 (Set-PSReadLineKeyHandler) needs, the Escape one is what
 // issue #588 needs to survive it.
 
-use crate::input::win32_input_key_seq;
+use crate::input::{win32_input_key_seq, win32_input_special_key_seq};
 
 /// `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, press (Kd=1) then release (Kd=0).
 #[test]
@@ -53,4 +53,20 @@ fn escape_in_win32_form_is_the_measured_sequence() {
 #[test]
 fn vk_escape_maps_to_scan_code_one() {
     assert_eq!(crate::platform::mouse_inject::vk_to_scan(0x1B), 1);
+}
+
+#[test]
+fn ctrl_j_uses_the_win32_record_codex_accepts() {
+    assert_eq!(
+        win32_input_special_key_seq(b"\n").as_deref(),
+        Some("\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_")
+    );
+}
+
+#[test]
+fn modified_enter_uses_the_win32_record_codex_accepts() {
+    assert_eq!(
+        win32_input_special_key_seq(b"\x1b\r").as_deref(),
+        Some("\x1b[13;28;13;1;2;1_\x1b[13;28;13;0;2;1_")
+    );
 }
