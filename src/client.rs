@@ -636,6 +636,27 @@ fn middle_ellipsize(value: &str, max_width: usize) -> String {
     format!("{}…{}", head, tail)
 }
 
+fn compact_session_info_details(details: &str) -> Option<String> {
+    let (window_count, created_and_suffix) = details.split_once(" (created ")?;
+    let count = window_count.strip_suffix(" windows")?;
+    count.parse::<usize>().ok()?;
+    let (created, suffix) = created_and_suffix.split_once(')')?;
+    let (_, created_without_weekday) = created.split_once(' ')?;
+    let created = chrono::NaiveDateTime::parse_from_str(
+        created_without_weekday,
+        "%b %e %H:%M:%S %Y",
+    ).ok()?;
+    let (suffix, attached) = suffix
+        .strip_suffix(" (attached)")
+        .map_or((suffix, false), |suffix| (suffix, true));
+
+    let mut compact = format!("{} {}{}", window_count, created.format("%Y.%m.%d %H:%M"), suffix);
+    if attached {
+        compact.push_str(" @");
+    }
+    Some(compact)
+}
+
 fn session_info_for_row(
     info: &str,
     row_width: usize,
@@ -647,12 +668,18 @@ fn session_info_for_row(
     let Some((name, details)) = info.split_once(": ") else {
         return info.to_string();
     };
+    if matches!(details, "(not responding)" | "(current)") {
+        return info.to_string();
+    }
+    let compact_details = compact_session_info_details(details);
+    let details = compact_details.as_deref().unwrap_or(details);
+    let display_info = format!("{}: {}", name, details);
     let prefix = format!("{:>w$}. {} ", visible_idx + 1, marker, w = num_width);
     let fixed_width = UnicodeWidthStr::width(prefix.as_str())
         + UnicodeWidthStr::width(": ")
         + UnicodeWidthStr::width(details);
     if fixed_width >= row_width {
-        return info.to_string();
+        return display_info;
     }
     let name = middle_ellipsize(name, row_width.saturating_sub(fixed_width));
     format!("{}: {}", name, details)
@@ -9014,18 +9041,28 @@ fn begin_picker_rename(
     std::thread::spawn(move || {
         let addr = format!("127.0.0.1:{}", port);
         let command = format!("rename-session {}\n", quote_arg(&worker_logical_name));
-        let response = crate::session::fetch_authed_response_multi(
+        let response = crate::session::fetch_authed_response_multi_outcome(
             &addr,
             &session_key,
             command.as_bytes(),
             Duration::from_millis(100),
             Duration::from_millis(300),
         );
-        let Some(response) = response else {
-            let _ = result_tx.send(Err("rename request did not receive a server response".to_string()));
-            return;
+        let response = match response {
+            crate::session::AuthedResponse::Accepted { payload } => payload,
+            crate::session::AuthedResponse::ServerError(error) => Some(error),
+            crate::session::AuthedResponse::TransportFailure => {
+                let _ = result_tx.send(Err(
+                    "rename request transport or authentication failed before a server response"
+                        .to_string(),
+                ));
+                return;
+            }
         };
-        if let Some(error) = response.trim().strip_prefix("ERROR:") {
+        if let Some(error) = response
+            .as_deref()
+            .and_then(|response| response.trim().strip_prefix("ERROR:"))
+        {
             let _ = result_tx.send(Err(error.trim().to_string()));
             return;
         }

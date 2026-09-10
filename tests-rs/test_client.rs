@@ -87,6 +87,76 @@ fn middle_ellipsis_preserves_both_identifying_ends() {
 
 #[cfg(windows)]
 #[test]
+fn session_row_compacts_live_details() {
+    let info = "my-workspace-name: 3 windows (created Wed Sep 10 17:16:03 2026) (attached)";
+
+    assert_eq!(
+        session_info_for_row(info, 120, 0, 1, "*"),
+        "my-workspace-name: 3 windows 2026.09.10 17:16 @"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_compacts_space_padded_single_digit_day() {
+    let info = "some-session: 1 windows (created Mon Sep  8 11:34:40 2026) (attached)";
+
+    assert_eq!(
+        session_info_for_row(info, 120, 0, 1, "*"),
+        "some-session: 1 windows 2026.09.08 11:34 @"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_omits_attachment_marker_when_detached() {
+    let info = "my-workspace-name: 3 windows (created Wed Sep 10 17:16:03 2026)";
+    let row = session_info_for_row(info, 120, 0, 1, " ");
+
+    assert_eq!(row, "my-workspace-name: 3 windows 2026.09.10 17:16");
+    assert!(!row.contains('@'));
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_preserves_group_after_compacting_live_details() {
+    let info = "my-workspace-name: 3 windows (created Wed Sep 10 17:16:03 2026) (group g) (attached)";
+
+    assert_eq!(
+        session_info_for_row(info, 120, 0, 1, " "),
+        "my-workspace-name: 3 windows 2026.09.10 17:16 (group g) @"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_passes_through_non_live_details() {
+    for info in ["offline-label: (not responding)", "current-name: (current)"] {
+        assert_eq!(session_info_for_row(info, 20, 0, 1, " "), info);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn session_row_compaction_preserves_more_of_a_long_name() {
+    use unicode_width::UnicodeWidthStr;
+
+    let name = "workspace-with-a-long-descriptive-and-identifying-session-name-across-hosts";
+    let old_details = "3 windows (created Wed Sep 10 17:16:03 2026) (attached)";
+    let info = format!("{name}: {old_details}");
+    let row = session_info_for_row(&info, 100, 0, 1, " ");
+    let displayed_name = row.split_once(": ").unwrap().0;
+
+    let old_name_budget = 100 - UnicodeWidthStr::width("1.   ") - UnicodeWidthStr::width(": ")
+        - UnicodeWidthStr::width(old_details);
+    assert!(
+        UnicodeWidthStr::width(displayed_name) > old_name_budget,
+        "compacted details must leave more columns for the session name"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn session_row_colours_attached_number_from_mode_style() {
     let mode_style = crate::style::parse_tmux_style("bg=magenta,fg=cyan");
     let line = session_chooser_row_line(0, 2, " ", "alpha: info", true, false, mode_style);

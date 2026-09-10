@@ -208,6 +208,45 @@ fn auth_rejected_returns_none() {
 }
 
 #[test]
+fn authed_multi_ok_eof_is_accepted_without_payload() {
+    let mut response = std::io::Cursor::new(b"OK\n");
+
+    assert_eq!(
+        read_authed_all_outcome(&mut response),
+        AuthedResponse::Accepted { payload: None }
+    );
+}
+
+#[test]
+fn authed_multi_error_is_server_error() {
+    let mut response = std::io::Cursor::new(b"OK\nERROR: x\n");
+
+    assert_eq!(
+        read_authed_all_outcome(&mut response),
+        AuthedResponse::ServerError("ERROR: x".to_string())
+    );
+}
+
+#[test]
+fn authed_multi_read_failure_is_transport_failure() {
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "forced read failure",
+            ))
+        }
+    }
+
+    assert_eq!(
+        read_authed_all_outcome(&mut FailingReader),
+        AuthedResponse::TransportFailure
+    );
+}
+
+#[test]
 fn stale_cleanup_removes_invalid_port_and_key() {
     let dir = temp_psmux_dir("stale_cleanup_invalid");
     let (port_path, key_path, sid_path) = write_registry_files(&dir, "bad", "not-a-port");

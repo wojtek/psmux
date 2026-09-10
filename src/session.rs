@@ -1868,21 +1868,50 @@ fn read_authed_line<R: std::io::BufRead>(br: &mut R) -> Option<String> {
     }
 }
 
-/// Read all remaining bytes from an authenticated stream, stripping a
-/// leading `OK\n` AUTH ack if present.
-///
-/// Returns `None` on no payload, error response, or read failure.
-/// Returns `Some(payload)` with the AUTH ack removed and trailing
-/// whitespace stripped. Total read is capped by the underlying `Take`.
-fn read_authed_all<R: std::io::Read>(rd: &mut R) -> Option<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AuthedResponse {
+    Accepted { payload: Option<String> },
+    ServerError(String),
+    TransportFailure,
+}
+
+/// Read and classify all remaining bytes from an authenticated stream.
+/// A leading `OK\n` AUTH ack proves that an empty command body is an accepted
+/// command, while EOF without that ack and read errors remain transport
+/// failures.
+fn read_authed_all_outcome<R: std::io::Read>(rd: &mut R) -> AuthedResponse {
     let mut buf = String::new();
-    std::io::Read::read_to_string(rd, &mut buf).ok()?;
-    let body = buf.strip_prefix("OK\n").or_else(|| buf.strip_prefix("OK\r\n")).unwrap_or(&buf);
-    let trimmed = body.trim();
-    if trimmed.is_empty() || trimmed.starts_with("ERROR:") {
-        None
+    if std::io::Read::read_to_string(rd, &mut buf).is_err() {
+        return AuthedResponse::TransportFailure;
+    }
+    let (body, authenticated) = if let Some(body) = buf.strip_prefix("OK\n") {
+        (body, true)
+    } else if let Some(body) = buf.strip_prefix("OK\r\n") {
+        (body, true)
     } else {
-        Some(trimmed.to_string())
+        (buf.as_str(), false)
+    };
+    let trimmed = body.trim();
+    if trimmed.starts_with("ERROR:") {
+        AuthedResponse::ServerError(trimmed.to_string())
+    } else if trimmed.is_empty() {
+        if authenticated {
+            AuthedResponse::Accepted { payload: None }
+        } else {
+            AuthedResponse::TransportFailure
+        }
+    } else {
+        AuthedResponse::Accepted { payload: Some(trimmed.to_string()) }
+    }
+}
+
+/// Preserve the established optional-payload behavior for existing callers.
+fn read_authed_all<R: std::io::Read>(rd: &mut R) -> Option<String> {
+    match read_authed_all_outcome(rd) {
+        AuthedResponse::Accepted { payload: Some(payload) } => Some(payload),
+        AuthedResponse::Accepted { payload: None }
+        | AuthedResponse::ServerError(_)
+        | AuthedResponse::TransportFailure => None,
     }
 }
 
@@ -1925,6 +1954,22 @@ pub fn fetch_authed_response_multi(
 ) -> Option<String> {
     let mut br = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
     read_authed_all(&mut br)
+}
+
+/// Like `fetch_authed_response_multi`, but preserves the distinction between
+/// an authenticated command accepted with no payload, a server error, and a
+/// transport/authentication failure.
+pub(crate) fn fetch_authed_response_multi_outcome(
+    addr: &str,
+    key: &str,
+    cmd: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> AuthedResponse {
+    let Some(mut br) = open_authed(addr, key, cmd, connect_timeout, read_timeout) else {
+        return AuthedResponse::TransportFailure;
+    };
+    read_authed_all_outcome(&mut br)
 }
 
 /// Fetch a one-line `session-info` response from a session server.
