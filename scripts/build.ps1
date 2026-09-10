@@ -14,21 +14,54 @@ $repoDir = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repoDir
 try {
-    # ── Kill old instances ────────────────────────────────────────────
-    Write-Host "[build] Killing old psmux instances..." -ForegroundColor Cyan
-    $existing = Get-Command psmux -ErrorAction SilentlyContinue
-    if ($existing) {
-        # -a: a build has to free the binary in EVERY namespace, and a bare
-        # kill-server is scoped to the default one since #649.
-        & psmux kill-server -a 2>$null
-    }
-    foreach ($name in @("psmux", "pmux", "tmux")) {
-        Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 1
-
     # ── Cargo install ─────────────────────────────────────────────────
     if (-not $SetupOnly) {
+        if ($env:CARGO_INSTALL_ROOT) {
+            $cargoInstallRoot = $env:CARGO_INSTALL_ROOT
+        } elseif ($env:CARGO_HOME) {
+            $cargoInstallRoot = $env:CARGO_HOME
+        } else {
+            $cargoInstallRoot = Join-Path $HOME ".cargo"
+        }
+
+        $cargoBinDir = Join-Path $cargoInstallRoot "bin"
+        $moveAsideDir = $null
+        foreach ($binaryName in @("psmux.exe", "pmux.exe", "tmux.exe")) {
+            $installedBinary = Join-Path $cargoBinDir $binaryName
+            if (-not (Test-Path -LiteralPath $installedBinary -PathType Leaf)) {
+                continue
+            }
+
+            $lockProbe = $null
+            $isLocked = $false
+            try {
+                $lockProbe = [System.IO.File]::Open(
+                    $installedBinary,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::None
+                )
+            } catch [System.IO.IOException] {
+                $isLocked = $true
+            } finally {
+                if ($null -ne $lockProbe) {
+                    $lockProbe.Dispose()
+                }
+            }
+
+            if ($isLocked) {
+                if ($null -eq $moveAsideDir) {
+                    $moveAsideDir = Join-Path $cargoBinDir "psmux-build-move-aside-$(Get-Date -Format 'yyyyMMdd-HHmmssfff')-$PID"
+                    New-Item -ItemType Directory -Path $moveAsideDir | Out-Null
+                }
+
+                # PSMUX_SERVER_IMAGE_NAMES defines server identity by image name, so preserve the filename instead of renaming it.
+                $movedBinary = Join-Path $moveAsideDir $binaryName
+                Move-Item -LiteralPath $installedBinary -Destination $movedBinary
+                Write-Host "[build] Moved locked binary aside without renaming: $installedBinary -> $movedBinary" -ForegroundColor Yellow
+            }
+        }
+
         Write-Host "[build] Running cargo install --path ." -ForegroundColor Cyan
         cargo install --path .
         if ($LASTEXITCODE -ne 0) {
@@ -36,14 +69,6 @@ try {
             exit 1
         }
         Write-Host "[build] cargo install succeeded" -ForegroundColor Green
-
-        # ── Pre-spawn warm server ─────────────────────────────────────────
-        # build.ps1 kills all psmux processes at the top, which destroys the
-        # background __warm__ server.  Call warmup now so the next `psmux`
-        # invocation claims the pre-warmed server instead of cold-starting.
-        Write-Host "[build] Pre-spawning warm server (psmux warmup)..." -ForegroundColor Cyan
-        & psmux warmup 2>$null
-        Write-Host "[build] Warm server pre-spawned" -ForegroundColor Green
     }
 
     # ── NSIS installer ────────────────────────────────────────────────
