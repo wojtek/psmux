@@ -11,6 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "psmux-binary-update.ps1")
 
 Push-Location $repoDir
 try {
@@ -25,41 +26,12 @@ try {
         }
 
         $cargoBinDir = Join-Path $cargoInstallRoot "bin"
-        $moveAsideDir = $null
-        foreach ($binaryName in @("psmux.exe", "pmux.exe", "tmux.exe")) {
-            $installedBinary = Join-Path $cargoBinDir $binaryName
-            if (-not (Test-Path -LiteralPath $installedBinary -PathType Leaf)) {
-                continue
-            }
-
-            $lockProbe = $null
-            $isLocked = $false
-            try {
-                $lockProbe = [System.IO.File]::Open(
-                    $installedBinary,
-                    [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::ReadWrite,
-                    [System.IO.FileShare]::None
-                )
-            } catch [System.IO.IOException] {
-                $isLocked = $true
-            } finally {
-                if ($null -ne $lockProbe) {
-                    $lockProbe.Dispose()
-                }
-            }
-
-            if ($isLocked) {
-                if ($null -eq $moveAsideDir) {
-                    $moveAsideDir = Join-Path $cargoBinDir "psmux-build-move-aside-$(Get-Date -Format 'yyyyMMdd-HHmmssfff')-$PID"
-                    New-Item -ItemType Directory -Path $moveAsideDir | Out-Null
-                }
-
-                # PSMUX_SERVER_IMAGE_NAMES defines server identity by image name, so preserve the filename instead of renaming it.
-                $movedBinary = Join-Path $moveAsideDir $binaryName
-                Move-Item -LiteralPath $installedBinary -Destination $movedBinary
-                Write-Host "[build] Moved locked binary aside without renaming: $installedBinary -> $movedBinary" -ForegroundColor Yellow
-            }
+        $movedBinaries = @(Move-PsmuxLockedBinariesAside `
+            -DestinationDirectory $cargoBinDir `
+            -BinaryNames @("psmux.exe", "pmux.exe", "tmux.exe") `
+            -DirectoryPrefix "psmux-build-move-aside")
+        foreach ($movedBinary in $movedBinaries) {
+            Write-Host "[build] Moved locked binary aside without renaming: $($movedBinary.Source) -> $($movedBinary.Destination)" -ForegroundColor Yellow
         }
 
         Write-Host "[build] Running cargo install --path ." -ForegroundColor Cyan
