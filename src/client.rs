@@ -517,6 +517,92 @@ pub(crate) fn build_osc8_overlay(runs: &[HyperlinkRun]) -> String {
 /// unaccounted for (#414, #669).
 pub(crate) const DEFAULT_PANE_BORDER_FORMAT: &str = "#{pane_index} \"#{pane_title}\"";
 
+/// Clip the frame's hyperlink runs down to the ones the finished frame
+/// actually shows, so the post-draw OSC 8 overlay can never repaint pane
+/// glyphs over something drawn on top of them (#361).
+///
+/// The runs are collected while the pane grids are rendered, but the overlay
+/// that re-emits them runs AFTER `terminal.draw()` and writes straight to the
+/// terminal at absolute screen positions with the run's own bold/underline
+/// SGR.  Nothing in that path knows about the choose-session modal, the `$`
+/// rename dialog or a server popup, so a link sitting in a cell one of them
+/// covers was painted over the overlay — and because ratatui's buffer still
+/// held the overlay's own cells, the next diff saw no change and never
+/// repaired it.
+///
+/// Comparing each glyph against the buffer that was just drawn keeps the
+/// overlay honest for every overlay that exists and every one added later,
+/// without this function having to name a single one.
+pub(crate) fn visible_hyperlink_runs(buffer: &Buffer, runs: &[HyperlinkRun]) -> Vec<HyperlinkRun> {
+    runs.iter()
+        .flat_map(|run| visible_run_fragment(buffer, run))
+        .collect()
+}
+
+/// The leading stretch of `run` the finished frame still shows, in the style
+/// the emitter is about to write; empty when no cell of it survives.
+///
+/// Two independent ways a surviving run damages an overlay, both closed here.
+/// Text: ratatui stores one whole grapheme per cell — `e` plus a combining
+/// accent is ONE cell — so the walk consumes the buffer's own symbols as
+/// prefixes of the run; comparing Rust chars one at a time rejects every
+/// accented or emoji link the frame plainly shows.  Ownership: a run whose
+/// glyphs merely coincide with an overlay's — a link of spaces over a dialog
+/// the `Clear` widget blanked — matched on text alone and then repainted the
+/// pane's background over the dialog, so a cell must also carry the style the
+/// emitter would write.  A drawn style that differs ends the stretch; losing
+/// a link's clickability is invisible next to recolouring a dialog.
+///
+/// The stretch stops at the first covered cell and does not resume after it:
+/// once the buffer holds dialog chrome instead of the run's glyphs, nothing
+/// records how wide the covered part was, so the remainder has no cells left
+/// to be matched against.  A link a modal crosses therefore keeps its visible
+/// head and loses its tail — the safe half of that trade, and strictly more
+/// link than dropping the run whole.
+fn visible_run_fragment(buffer: &Buffer, run: &HyperlinkRun) -> Vec<HyperlinkRun> {
+    if run.text.is_empty() {
+        return Vec::new();
+    }
+    let mut rest = run.text.as_str();
+    let mut column = run.x;
+    let mut text = String::new();
+    while !rest.is_empty() {
+        let cell = match buffer.cell((column, run.y)) {
+            Some(cell) => cell,
+            None => break,
+        };
+        let symbol = cell.symbol();
+        if symbol.is_empty() || !rest.starts_with(symbol) || !cell_carries_run_style(cell, run) {
+            break;
+        }
+        text.push_str(symbol);
+        rest = &rest[symbol.len()..];
+        column = column.saturating_add(unicode_width::UnicodeWidthStr::width(symbol) as u16);
+    }
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![HyperlinkRun {
+        x: run.x,
+        y: run.y,
+        text,
+        uri: run.uri.clone(),
+        style: run.style,
+    }]
+}
+
+/// Whether a drawn cell already carries the style the OSC 8 emitter writes for
+/// `run`, so re-emitting that cell changes nothing but the hyperlink.
+fn cell_carries_run_style(cell: &ratatui::buffer::Cell, run: &HyperlinkRun) -> bool {
+    use ratatui::style::Color;
+    let style = run.style;
+    cell.fg == style.fg.unwrap_or(Color::Reset)
+        && cell.bg == style.bg.unwrap_or(Color::Reset)
+        && cell.underline_color == style.underline_color.unwrap_or(Color::Reset)
+        && crate::rendering::strip_ul_style(cell.modifier)
+            == crate::rendering::strip_ul_style(style.add_modifier)
+}
+
 /// Content area of a pane after reserving the `pane-border-status` label row.
 /// Must match `render_layout_json`'s `inner`; the caret and every screen→cell
 /// mouse mapping route through this so they stay aligned with the content (#288).
@@ -740,6 +826,55 @@ pub(crate) fn popup_cursor_screen_pos(
         return None;
     }
     Some((popup_area.x + 1 + cc, popup_area.y + 1 + row))
+}
+
+/// The label the picker's `$` rename dialog puts in front of the name.
+const PICKER_RENAME_PROMPT: &str = "name: ";
+
+/// The label the pane-title dialog puts in front of the title.
+const PANE_TITLE_PROMPT: &str = "title: ";
+
+/// Screen rect of the picker's `$` rename dialog.
+///
+/// The draw pass and the post-draw cursor write both need this rect and must
+/// agree on it to the cell, or the caret lands off the dialog it belongs to
+/// (#507), so both call this instead of recomputing the geometry.
+/// `extra_line` is the second row the dialog grows by to show an error or
+/// `renaming...`.
+pub(crate) fn picker_rename_overlay_rect(content_chunk: Rect, extra_line: bool) -> Rect {
+    centered_rect(60, if extra_line { 4 } else { 3 }, content_chunk)
+}
+
+/// Screen cell of a single-line `prompt` + `entered` dialog's caret: just past
+/// the prompt and the text typed so far.
+///
+/// Returns `None` when the dialog is too small to have an interior, or when
+/// text long enough to fill it leaves no cell inside the border to park the
+/// caret on.  Callers leave the cursor hidden rather than showing it on the
+/// border or on the pane underneath, which is what made the field look like it
+/// did not have focus.
+pub(crate) fn prompt_cursor_screen_pos(overlay: Rect, prompt: &str, entered: &str) -> Option<(u16, u16)> {
+    if overlay.width < 3 || overlay.height < 3 {
+        return None;
+    }
+    // Displayed columns, not characters: a combining mark adds none and a wide
+    // glyph adds two, which is what the paragraph renderer occupies. Paste
+    // accepts an unbounded string, so saturate rather than overflow the
+    // addition below; an over-long name then simply loses the caret.
+    let prompt_w = unicode_width::UnicodeWidthStr::width(prompt).min(u16::MAX as usize) as u16;
+    let typed_w = unicode_width::UnicodeWidthStr::width(entered).min(u16::MAX as usize) as u16;
+    // One cell of border on each side; the caret sits on the row inside it.
+    let column = overlay.x.saturating_add(1).saturating_add(prompt_w).saturating_add(typed_w);
+    let last_column = overlay.x + overlay.width - 2;
+    if column > last_column {
+        return None;
+    }
+    Some((column, overlay.y + 1))
+}
+
+/// Caret of the picker's `$` rename dialog; see [`prompt_cursor_screen_pos`].
+pub(crate) fn picker_rename_cursor_screen_pos(overlay: Rect, entered: &str) -> Option<(u16, u16)> {
+    prompt_cursor_screen_pos(overlay, PICKER_RENAME_PROMPT, entered)
 }
 
 fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
@@ -3731,6 +3866,9 @@ pub fn run_remote(
     // Cache the last-sent DECSCUSR code so we only write it when it
     // actually changes (avoids resetting WT's blink timer every frame).
     let mut last_cursor_style: u8 = 255;
+    // Which surface owned the terminal caret on the last frame, so the cursor
+    // log records a handover once instead of every frame.
+    let mut last_cursor_owner: Option<&'static str> = None;
     // Trap Ctrl+Break (and stray Ctrl+C) console signals so they interrupt the
     // pane's foreground program instead of terminating this client and
     // detaching the still-running session (issue #454).  The signal is drained
@@ -4274,7 +4412,8 @@ pub fn run_remote(
                         // When a server overlay is active, intercept ALL keys and
                         // forward them to the server via overlay-specific commands.
                         if picker_rename_target.is_some() {
-                            if picker_rename_pending.is_none() {
+                            let rename_in_flight = picker_rename_pending.is_some();
+                            if !rename_in_flight {
                                 match key.code {
                                     KeyCode::Esc => {
                                         picker_rename_target = None;
@@ -4328,6 +4467,43 @@ pub fn run_remote(
                                     }
                                     _ => {}
                                 }
+                            }
+                            // The evidence that separates "the field never got
+                            // the keys" from "the field got them but shows no
+                            // caret": when these lines carry the keys the user
+                            // typed, routing is fine and the complaint is the
+                            // cursor, not the input.
+                            if input_log_enabled() {
+                                let routed = if rename_in_flight {
+                                    "dropped, a rename is still in flight".to_string()
+                                } else {
+                                    // Label the branch actually taken, not the
+                                    // key: the accept arm rejects Ctrl+chars and
+                                    // Enter can fail validation, and this log's
+                                    // whole job is telling an input failure
+                                    // apart from a caret failure.
+                                    match key.code {
+                                        KeyCode::Esc => "closed the dialog".to_string(),
+                                        KeyCode::Enter => format!(
+                                            "enter handled, in flight={}, error={}",
+                                            picker_rename_pending.is_some(),
+                                            picker_rename_error.is_some()
+                                        ),
+                                        KeyCode::Backspace => {
+                                            format!("backspace, field now {:?}", picker_rename_buf)
+                                        }
+                                        KeyCode::Char(_)
+                                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            format!("accepted, field now {:?}", picker_rename_buf)
+                                        }
+                                        other => format!("ignored {:?}", other),
+                                    }
+                                };
+                                input_log(
+                                    "picker-rename",
+                                    &format!("key={:?} mods={:?} -> {}", key.code, key.modifiers, routed),
+                                );
                             }
                         }
                         else if srv_popup_active {
@@ -5204,6 +5380,18 @@ pub fn run_remote(
                                     session_num_buffer.clear();
                                 }
                                 KeyCode::Char(c) if session_chooser && session_filter_active => {
+                                    if c == '$' {
+                                        // Worth a log line of its own: while a
+                                        // filter is active every char belongs to
+                                        // the filter, so `$` empties the list
+                                        // instead of opening the rename dialog
+                                        // and looks exactly like a dead key.
+                                        log_picker_rename_request(
+                                            "choose-session",
+                                            None,
+                                            &format!("filter mode is active, '$' went into the filter {:?}", session_filter),
+                                        );
+                                    }
                                     if session_filter.len() < 256 {
                                         session_filter.push(c);
                                         session_selected = 0;
@@ -5212,13 +5400,22 @@ pub fn run_remote(
                                     }
                                 }
                                 KeyCode::Char('$') if session_chooser => {
-                                    let selected_entry = session_filtered_indices(&session_entries, &session_filter)
+                                    let visible = session_filtered_indices(&session_entries, &session_filter);
+                                    let selected_entry = visible
                                         .get(session_selected)
                                         .and_then(|index| session_entries.get(*index));
-                                    if let Some((session_name, _)) = selected_entry {
-                                        picker_rename_target = Some(session_name.clone());
-                                        picker_rename_buf.clear();
-                                        picker_rename_error = None;
+                                    match selected_entry {
+                                        Some((session_name, _)) => {
+                                            log_picker_rename_request("choose-session", Some(session_name), "");
+                                            picker_rename_target = Some(session_name.clone());
+                                            picker_rename_buf.clear();
+                                            picker_rename_error = None;
+                                        }
+                                        None => log_picker_rename_request(
+                                            "choose-session",
+                                            None,
+                                            &format!("selection {} is outside the {} visible rows", session_selected, visible.len()),
+                                        ),
                                     }
                                 }
                                 // hjkl parity with tmux mode-tree (issue #259): for flat lists
@@ -5342,10 +5539,18 @@ pub fn run_remote(
                                 // it cannot leak through to the focused pane's PTY.
                                 KeyCode::Char(_) if session_chooser => {}
                                 KeyCode::Char('$') if tree_chooser => {
-                                    if let Some((_, _, _, _, session_name)) = tree_entries.get(tree_selected) {
-                                        picker_rename_target = Some(session_name.clone());
-                                        picker_rename_buf.clear();
-                                        picker_rename_error = None;
+                                    match tree_entries.get(tree_selected) {
+                                        Some((_, _, _, _, session_name)) => {
+                                            log_picker_rename_request("choose-tree", Some(session_name), "");
+                                            picker_rename_target = Some(session_name.clone());
+                                            picker_rename_buf.clear();
+                                            picker_rename_error = None;
+                                        }
+                                        None => log_picker_rename_request(
+                                            "choose-tree",
+                                            None,
+                                            &format!("selection {} is outside the {} visible rows", tree_selected, tree_entries.len()),
+                                        ),
                                     }
                                 }
                                 // Left/Right collapse and expand, ported from the
@@ -7406,7 +7611,13 @@ pub fn run_remote(
         // this closure returns, so once it has run this is exactly what the
         // user saw — the value a release must re-report.
         let drawn_copy_sel = active_copy_sel_end(&root);
-        terminal.draw(|f| {
+        // Cell this frame's text-entry dialog puts its caret on, if one is
+        // open, and which dialog it is. Filled in by the draw pass below, the
+        // only place that knows each dialog's rect, and read by the post-draw
+        // cursor write.
+        let mut prompt_overlay_cursor: Option<(u16, u16)> = None;
+        let mut prompt_overlay_owner: &'static str = "none";
+        let drawn_frame = terminal.draw(|f| {
             client_drawn_sel = drawn_copy_sel;
             let area = f.area();
             let constraints = if status_at_top {
@@ -8415,18 +8626,25 @@ pub fn run_remote(
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
-                let para = Paragraph::new(format!("name: {}", rename_buf));
+                let para = Paragraph::new(format!("{}{}", PICKER_RENAME_PROMPT, rename_buf));
                 f.render_widget(para, overlay.inner(oa));
+                // Same defect as the picker's `$` dialog: without a published
+                // caret the cursor suppression below leaves this field with no
+                // caret at all.
+                prompt_overlay_cursor = prompt_cursor_screen_pos(oa, PICKER_RENAME_PROMPT, &rename_buf);
+                prompt_overlay_owner = if session_renaming { "rename-session" } else { "rename-window" };
             }
             if let Some(target) = picker_rename_target.as_ref() {
                 let overlay = Block::default()
                     .borders(Borders::ALL)
                     .title(format!("rename session {}", target));
-                let prompt_height = if picker_rename_error.is_some() || picker_rename_pending.is_some() { 4 } else { 3 };
-                let oa = centered_rect(60, prompt_height, content_chunk);
+                let oa = picker_rename_overlay_rect(
+                    content_chunk,
+                    picker_rename_error.is_some() || picker_rename_pending.is_some(),
+                );
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
-                let mut lines = vec![Line::from(format!("name: {}", picker_rename_buf))];
+                let mut lines = vec![Line::from(format!("{}{}", PICKER_RENAME_PROMPT, picker_rename_buf))];
                 if picker_rename_pending.is_some() {
                     lines.push(Line::from(Span::styled(
                         "renaming...",
@@ -8439,14 +8657,23 @@ pub fn run_remote(
                     )));
                 }
                 f.render_widget(Paragraph::new(Text::from(lines)), overlay.inner(oa));
+                // The dialog owns the caret while it is up. The post-draw
+                // cursor write is what actually shows it (one atomic batch, so
+                // Windows Terminal never sees an intermediate state), so hand
+                // the cell over here instead of calling set_cursor_position and
+                // letting that write park the caret back on the pane (#507).
+                prompt_overlay_cursor = picker_rename_cursor_screen_pos(oa, &picker_rename_buf);
+                prompt_overlay_owner = "picker-rename";
             }
             if pane_renaming {
                 let overlay = Block::default().borders(Borders::ALL).title("set pane title");
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
-                let para = Paragraph::new(format!("title: {}", pane_title_buf));
+                let para = Paragraph::new(format!("{}{}", PANE_TITLE_PROMPT, pane_title_buf));
                 f.render_widget(para, overlay.inner(oa));
+                prompt_overlay_cursor = prompt_cursor_screen_pos(oa, PANE_TITLE_PROMPT, &pane_title_buf);
+                prompt_overlay_owner = "pane-title";
             }
             if command_input {
                 let title = command_prompt_label.as_deref().unwrap_or("command");
@@ -8706,6 +8933,27 @@ pub fn run_remote(
             }
 
         })?;
+        // Clip this frame's hyperlink runs against the buffer that was just
+        // drawn, while that buffer is still borrowed and before anything else
+        // touches the terminal. A run whose cells an overlay covers must not
+        // be re-emitted, or the pane's own glyphs land on top of the overlay
+        // and the next diff never repairs them (#361).
+        let drawn_hyperlinks = {
+            let runs = frame_hyperlinks_take();
+            if runs.is_empty() {
+                Vec::new()
+            } else {
+                let clipped = visible_hyperlink_runs(drawn_frame.buffer, &runs);
+                if client_log_enabled() && clipped.len() != runs.len() {
+                    client_log("osc8", &format!(
+                        "{} of {} hyperlink runs sit behind this frame's overlays and stay unpainted",
+                        runs.len() - clipped.len(),
+                        runs.len()
+                    ));
+                }
+                clipped
+            }
+        };
         if client_log_enabled() {
             client_log("draw", &format!("draw OK, render={}us overlays: popup={} confirm={} menu={} display_panes={}",
                 _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128),
@@ -8718,14 +8966,13 @@ pub fn run_remote(
         // drawn we re-emit just the hyperlinked runs wrapped in OSC 8 at
         // their screen positions, with cursor save/restore. This is a no-op
         // for the common case (no links), so it does not touch the hot path.
-        {
-            let runs = frame_hyperlinks_take();
-            if !runs.is_empty() {
-                let overlay = build_osc8_overlay(&runs);
-                let mut out = std::io::stdout().lock();
-                let _ = std::io::Write::write_all(&mut out, overlay.as_bytes());
-                let _ = std::io::Write::flush(&mut out);
-            }
+        // Only the runs the frame actually shows are emitted — see
+        // `visible_hyperlink_runs` above.
+        if !drawn_hyperlinks.is_empty() {
+            let overlay = build_osc8_overlay(&drawn_hyperlinks);
+            let mut out = std::io::stdout().lock();
+            let _ = std::io::Write::write_all(&mut out, overlay.as_bytes());
+            let _ = std::io::Write::flush(&mut out);
         }
 
         // ── Post-draw: emit buffered OSC 52 clipboard ────────────────
@@ -8868,28 +9115,58 @@ pub fn run_remote(
             // taking both the cursor and the cursor mode from the overlay).
             // Leaving it on the pane underneath is what made the popup look
             // like it had no cursor at all (#507).
-            let cursor_visible = if srv_popup_active && srv_popup_has_pty {
-                srv_popup_cursor.and_then(|c| {
-                    popup_cursor_screen_pos(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c)
-                })
-            } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
-                // Content lives inside the border-label reservation; use the render's inner rect.
-                let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
-                let cy = inner.y + cr.min(inner.height.saturating_sub(1));
-                let cx = inner.x + cc.min(inner.width.saturating_sub(1));
-                Some((cx, cy))
-            } else {
-                None
-            };
-            // Build a single VT string with: ?25h + CUP + DECSCUSR
-            // ratatui's draw() always emits ?25l (since we never call
-            // f.set_cursor_position), so we must re-emit ?25h + CUP
-            // every frame when the cursor should be visible.
+            //
+            // The same rule covers the client-side overlays, which #507 never
+            // reached: while one of them owns the screen the pane's caret must
+            // not be re-shown on top of it. An overlay that takes text
+            // publishes its own caret here — the picker's `$` rename dialog
+            // does — and the rest show none, which is what tmux's modal
+            // choosers do. Parking the pane's caret behind the rename dialog is
+            // what made the field look like it did not have focus whenever the
+            // pane underneath happened to be showing a cursor of its own.
+            let overlay_owns_screen = overlays_active || window_idx_input || srv_customize_active;
+            let (cursor_visible, cursor_owner): (Option<(u16, u16)>, &'static str) =
+                if srv_popup_active && srv_popup_has_pty {
+                    (
+                        srv_popup_cursor.and_then(|c| {
+                            popup_cursor_screen_pos(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c)
+                        }),
+                        "popup",
+                    )
+                } else if let Some(cell) = prompt_overlay_cursor {
+                    (Some(cell), prompt_overlay_owner)
+                } else if overlay_owns_screen {
+                    (None, "overlay")
+                } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
+                    // Content lives inside the border-label reservation; use the render's inner rect.
+                    let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
+                    let cy = inner.y + cr.min(inner.height.saturating_sub(1));
+                    let cx = inner.x + cc.min(inner.width.saturating_sub(1));
+                    (Some((cx, cy)), "pane")
+                } else {
+                    (None, "hidden")
+                };
+            if client_log_enabled() && Some(cursor_owner) != last_cursor_owner {
+                last_cursor_owner = Some(cursor_owner);
+                client_log("cursor", &format!("owner={} cell={:?}", cursor_owner, cursor_visible));
+            }
+            // Build a single VT string with: ?25h + CUP + DECSCUSR.
+            // ratatui shows the cursor itself only for surfaces that call
+            // f.set_cursor_position (command prompt, window-index prompt, copy
+            // mode); every other visible caret comes from this write.
+            let prompt_owns_caret = command_input || window_idx_input;
             let mut buf = String::with_capacity(32);
             if let Some((cx, cy)) = cursor_visible {
                 buf.push_str("\x1b[?25h");
                 use std::fmt::Write as FmtWrite;
                 let _ = write!(buf, "\x1b[{};{}H", cy + 1, cx + 1);
+            } else if overlay_owns_screen && !prompt_owns_caret {
+                // Hide explicitly. Returning None above only omits the
+                // show-and-position write; ratatui hides the cursor on its own
+                // only when nothing called set_cursor_position this frame, and
+                // copy mode does call it, so without this its caret stays
+                // visible on top of the picker.
+                buf.push_str("\x1b[?25l");
             }
             // DECSCUSR only when style actually changes (avoids blink
             // timer resets in WT).
@@ -9016,6 +9293,22 @@ where
 
 fn picker_session_names_equal(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+/// Record what a `$` in a chooser did, so a rename field that appears to ignore
+/// keystrokes can be told apart from one that never opened at all.
+///
+/// `target` is the session the dialog opened on; when it is `None`, `reason`
+/// says why the key was a no-op.  Off with the rest of the input log unless
+/// `PSMUX_INPUT_DEBUG=1`.
+fn log_picker_rename_request(chooser: &str, target: Option<&str>, reason: &str) {
+    if !input_log_enabled() {
+        return;
+    }
+    match target {
+        Some(name) => input_log("picker-rename", &format!("{} '$' opened the dialog on '{}'", chooser, name)),
+        None => input_log("picker-rename", &format!("{} '$' did NOT open the dialog: {}", chooser, reason)),
+    }
 }
 
 const PICKER_RENAME_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -9525,6 +9818,10 @@ mod test_pane_wants_mouse_selection;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue507_popup_cursor.rs"]
 mod test_issue507_popup_cursor;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_picker_rename_cursor.rs"]
+mod test_picker_rename_cursor;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue605_stale_port_attach.rs"]
