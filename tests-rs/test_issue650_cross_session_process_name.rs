@@ -140,10 +140,24 @@ fn anchor_still_reaps_a_pid_that_is_gone_everywhere() {
     );
 }
 
-/// A recycled PID now running something else is still reaped, snapshot or not.
+/// A PID that now names another image is no longer reaped on the name alone.
+///
+/// This entry is UNSIGNED: a bare `4244` body predates #448 and carries no
+/// creation time, so nothing here identifies a process instance. The image name
+/// is the only remaining hint and it is not trustworthy on its own, because
+/// Windows resolves a live process's name from the executable file: renaming
+/// that file made eight healthy servers report a foreign name on 2026-09-10 and
+/// every caller that believed it deleted their registry entries. The anchor now
+/// declines to answer and the network probe decides.
+///
+/// Reuse is still caught where it can be proved: a SIGNED entry whose recorded
+/// creation time does not match is dead outright (see
+/// `pid_anchor_reports_dead_when_the_recorded_signature_does_not_match` in
+/// `test_session.rs`), and an unsigned entry with a recognised name keeps the
+/// coarse created-after-the-file guard.
 #[test]
 #[cfg(windows)]
-fn anchor_still_reaps_a_pid_recycled_by_another_image() {
+fn anchor_defers_on_an_unsigned_pid_naming_another_image() {
     let dir = temp_dir();
     let port_path = dir.join("ns650__recycled.port");
     std::fs::write(&port_path, b"65002").expect("write port");
@@ -152,8 +166,8 @@ fn anchor_still_reaps_a_pid_recycled_by_another_image() {
     let other_image = |_pid: u32| -> Option<String> { Some("notepad".to_string()) };
     assert_eq!(
         pid_anchor_verdict_with(&port_path, other_image),
-        Some(false),
-        "a PID recycled by an unrelated application is not our server"
+        None,
+        "an unsigned entry with a foreign image name is inconclusive, not dead"
     );
 }
 

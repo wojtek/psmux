@@ -1365,12 +1365,21 @@ const PID_REUSE_MARGIN_TICKS: u64 = 60 * 10_000_000; // 60s in 100ns ticks
 /// invocation. The process table answers instantly and definitively.
 ///
 /// Returns:
-///   Some(true)  - recorded PID is a live psmux-image process created no later
-///                 than the `.pid` file was written -> genuinely our server.
-///   Some(false) - PID gone, recycled by a non-psmux image, or recycled by a
-///                 psmux process created long after the file -> server is dead.
-///   None        - no usable `.pid` anchor (pre-#448 registry) -> caller must
-///                 fall back to the network probe.
+///   Some(true)  - the recorded PID is held by the very process that wrote the
+///                 `.pid` file -> genuinely our server.
+///   Some(false) - PID gone, or held by a process that provably is not the one
+///                 that wrote the file -> server is dead.
+///   None        - the anchor cannot settle it -> caller must fall back to the
+///                 network probe.
+///
+/// An image name is never sufficient reason to call a server dead. Windows
+/// resolves a live process's image name from the executable FILE, so renaming
+/// or moving that file silently changes what every running server reports; on
+/// 2026-09-10 renaming the installed binary in place made eight healthy
+/// sessions look foreign, and every command that trusted the name deleted their
+/// registry entries while the servers were still answering on their ports. The
+/// `.pid` body records `pid:creation_filetime`, and that pair identifies one
+/// process instance and survives any amount of renaming, so it decides instead.
 fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
     pid_anchor_verdict_with(
         port_path,
@@ -1392,42 +1401,73 @@ where
         return None;
     }
     let pid_path = port_path.with_extension("pid");
-    // Tolerate both `pid` and `pid:creation_filetime` bodies (the latter written
-    // so kill-server can verify identity); the anchor only needs the pid.
-    let (pid, _creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
-    let name = match name_of(pid) {
-        // No such process anywhere on the machine — not openable AND not in the
-        // process table. That is a genuinely dead PID, so the #448 fast reap
-        // still fires here.
-        //
-        // It used to be enough for the PID to be merely unopenable, on the
-        // assumption that a same-user psmux server is always openable with
-        // QUERY_LIMITED_INFORMATION. It is not: a server started from an
-        // OpenSSH logon lives in Terminal Services session 0 under the elevated
-        // token sshd mints, and an unelevated desktop shell in session 1 is
-        // refused the handle with ERROR_ACCESS_DENIED, so every desktop
-        // invocation, `psmux -V` included, deleted the live server's registry
-        // files (#650). See `get_process_name_or_snapshot` for the measured
-        // access matrix.
-        None => return Some(false),
-        Some(n) => n.to_ascii_lowercase(),
-    };
-    if !PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str()) {
-        // PID recycled by an unrelated application; our server is gone.
-        return Some(false);
+    // Tolerate both `pid` and `pid:creation_filetime` bodies; the recorded
+    // creation time is the identity evidence when it is present.
+    let (pid, recorded_creation) =
+        parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    // `name_of` is `get_process_name_or_snapshot`, so `None` here means no such
+    // process anywhere on the machine: not openable AND absent from the process
+    // table. Merely unopenable is NOT enough. A server started from an OpenSSH
+    // logon lives in Terminal Services session 0 under the elevated token sshd
+    // mints, and an unelevated desktop shell in session 1 is refused the handle
+    // with ERROR_ACCESS_DENIED, so every desktop invocation, `psmux -V`
+    // included, deleted the live server's registry files (#650). See
+    // `get_process_name_or_snapshot` for the measured access matrix.
+    let live = name_of(pid).map(|name| LiveAnchorProcess {
+        name: name.to_ascii_lowercase(),
+        creation: crate::platform::process_kill::process_creation_time(pid),
+    });
+    let pid_file_mtime = std::fs::metadata(&pid_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(system_time_to_filetime_ticks);
+    pid_anchor_decision(recorded_creation, live.as_ref(), pid_file_mtime)
+}
+
+/// What the process table currently says about the PID a `.pid` file records.
+/// Separated from [`pid_anchor_decision`] so the rule can be tested without a
+/// live server behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveAnchorProcess {
+    /// Lower-cased image-name stem, as the process table reports it NOW.
+    name: String,
+    /// Creation time in FILETIME ticks, when that query succeeded.
+    creation: Option<u64>,
+}
+
+/// The anchor rule itself. See [`pid_anchor_verdict`] for what the answers mean.
+fn pid_anchor_decision(
+    recorded_creation: Option<u64>,
+    live: Option<&LiveAnchorProcess>,
+    pid_file_mtime: Option<u64>,
+) -> Option<bool> {
+    // Nothing holds the PID at all: neither openable nor present in the
+    // process-table snapshot (#650), so the server that wrote the file is gone.
+    let Some(live) = live else { return Some(false) };
+
+    // Recorded PID plus recorded creation time name one process instance, and a
+    // later reuse of the PID cannot reproduce that pair. When both halves are
+    // available they settle the question outright, whatever the executable
+    // happens to be called at this moment.
+    if let (Some(recorded), Some(actual)) = (recorded_creation, live.creation) {
+        return Some(recorded == actual);
     }
-    // PID-reuse guard (same idea as the #447 reaper guard): a psmux process
-    // created well AFTER the .pid file was last written cannot be the server
-    // that wrote it. When either timestamp is unavailable, err towards alive.
-    if let Some(created_ft) = crate::platform::process_kill::process_creation_time(pid) {
-        if let Some(mtime_ft) = std::fs::metadata(&pid_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(system_time_to_filetime_ticks)
-        {
-            if created_ft > mtime_ft.saturating_add(PID_REUSE_MARGIN_TICKS) {
-                return Some(false);
-            }
+
+    // No signature to compare: a pre-#448 `.pid` body, or the creation query
+    // failed. The image name is the only remaining hint and it is a weak one,
+    // so it may support "alive" but never "dead" on its own — an unrecognised
+    // name is inconclusive and the network probe decides.
+    if !PSMUX_SERVER_IMAGE_NAMES.contains(&live.name.as_str()) {
+        return None;
+    }
+
+    // Coarse reuse guard for that unsigned case (same idea as the #447 reaper
+    // guard): a psmux process created well AFTER the `.pid` file was last
+    // written cannot be the server that wrote it. When either timestamp is
+    // unavailable, err towards alive.
+    if let (Some(created_ft), Some(mtime_ft)) = (live.creation, pid_file_mtime) {
+        if created_ft > mtime_ft.saturating_add(PID_REUSE_MARGIN_TICKS) {
+            return Some(false);
         }
     }
     Some(true)
