@@ -35,13 +35,19 @@ function Move-PsmuxLockedBinariesAside {
         [Parameter(Mandatory)]
         [string]$DirectoryPrefix,
 
+        # Receives each move the moment it succeeds, so a move that fails later
+        # in the loop cannot strand the binaries already moved: the caller
+        # still holds their records and can put them back.
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$MovedBinaries,
+
         # Move every installed binary, not only locked ones, so a failed
         # replacement can put each original back.
         [switch]$IncludeUnlocked
     )
 
     $moveAsideDirectory = $null
-    $movedBinaries = [System.Collections.Generic.List[object]]::new()
 
     foreach ($binaryName in $BinaryNames) {
         $installedBinary = Join-Path $DestinationDirectory $binaryName
@@ -54,19 +60,17 @@ function Move-PsmuxLockedBinariesAside {
 
         if ($null -eq $moveAsideDirectory) {
             $moveAsideDirectory = Join-Path $DestinationDirectory "$DirectoryPrefix-$(Get-Date -Format 'yyyyMMdd-HHmmssfff')-$PID"
-            New-Item -ItemType Directory -Path $moveAsideDirectory | Out-Null
+            New-Item -ItemType Directory -Path $moveAsideDirectory -ErrorAction Stop | Out-Null
         }
 
         # PSMUX_SERVER_IMAGE_NAMES defines server identity by image name. Change directories, never filenames.
         $movedBinary = Join-Path $moveAsideDirectory $binaryName
-        Move-Item -LiteralPath $installedBinary -Destination $movedBinary
-        $movedBinaries.Add([pscustomobject]@{
+        Move-Item -LiteralPath $installedBinary -Destination $movedBinary -ErrorAction Stop
+        $MovedBinaries.Add([pscustomobject]@{
             Source = $installedBinary
             Destination = $movedBinary
         })
     }
-
-    return $movedBinaries.ToArray()
 }
 
 function Restore-PsmuxMovedBinaries {
@@ -83,9 +87,9 @@ function Restore-PsmuxMovedBinaries {
     foreach ($movedBinary in $MovedBinaries) {
         try {
             if (Test-Path -LiteralPath $movedBinary.Source) {
-                Remove-Item -LiteralPath $movedBinary.Source -Force
+                Remove-Item -LiteralPath $movedBinary.Source -Force -ErrorAction Stop
             }
-            Move-Item -LiteralPath $movedBinary.Destination -Destination $movedBinary.Source
+            Move-Item -LiteralPath $movedBinary.Destination -Destination $movedBinary.Source -ErrorAction Stop
         } catch {
             $failures.Add("$($movedBinary.Destination) -> $($movedBinary.Source): $_")
         }
@@ -117,26 +121,30 @@ function Invoke-PsmuxBinaryReplacement {
         [switch]$IncludeUnlocked
     )
 
+    # The moves and the replacement are one transaction: a failure in either,
+    # including a move that fails after others succeeded, puts every binary
+    # already moved back. Leaving them in the move-aside directory made psmux
+    # vanish from PATH while its servers kept running.
     # Never stops or kills a process: running binaries only change directory.
-    $movedBinaries = @(Move-PsmuxLockedBinariesAside `
-        -DestinationDirectory $DestinationDirectory `
-        -BinaryNames $BinaryNames `
-        -DirectoryPrefix $DirectoryPrefix `
-        -IncludeUnlocked:$IncludeUnlocked)
-    foreach ($movedBinary in $movedBinaries) {
-        Write-Host "$LogPrefix Moved binary aside without renaming: $($movedBinary.Source) -> $($movedBinary.Destination)" -ForegroundColor Yellow
-    }
-
-    # A failure after the move used to leave the originals in the move-aside
-    # directory, so psmux vanished from PATH while its servers kept running.
+    $movedBinaries = [System.Collections.Generic.List[object]]::new()
     try {
+        Move-PsmuxLockedBinariesAside `
+            -DestinationDirectory $DestinationDirectory `
+            -BinaryNames $BinaryNames `
+            -DirectoryPrefix $DirectoryPrefix `
+            -MovedBinaries $movedBinaries `
+            -IncludeUnlocked:$IncludeUnlocked
+        foreach ($movedBinary in $movedBinaries) {
+            Write-Host "$LogPrefix Moved binary aside without renaming: $($movedBinary.Source) -> $($movedBinary.Destination)" -ForegroundColor Yellow
+        }
+
         & $Replace
     } catch {
         $replaceError = $_
         Write-Host "$LogPrefix Replacement failed; restoring the original binaries" -ForegroundColor Yellow
-        Restore-PsmuxMovedBinaries -MovedBinaries $movedBinaries
+        Restore-PsmuxMovedBinaries -MovedBinaries $movedBinaries.ToArray()
         throw $replaceError
     }
 
-    return $movedBinaries
+    return $movedBinaries.ToArray()
 }

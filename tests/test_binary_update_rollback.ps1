@@ -108,7 +108,40 @@ try {
     Assert-That ((Get-Dummy (Join-Path $bin "psmux.exe")) -eq "old-psmux") "a failed install puts the locked psmux.exe back"
     Assert-That ((Get-Dummy (Join-Path $bin "pmux.exe")) -eq "old-pmux") "a failed install puts the unlocked pmux.exe back"
 
-    # 3. A successful replacement installs the new binaries and keeps the moved originals aside.
+    # 3. A move that fails part-way puts back the binaries already moved.
+    $bin = New-Sandbox; $sandboxes.Add($bin)
+    Set-Dummy (Join-Path $bin "psmux.exe") "old-psmux"
+    Set-Dummy (Join-Path $bin "pmux.exe") "old-pmux"
+    $running = Open-LikeRunningImage (Join-Path $bin "psmux.exe")
+    # Open without delete sharing, so this binary cannot change directory.
+    $unmovable = [System.IO.File]::Open(
+        (Join-Path $bin "pmux.exe"),
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read)
+    $script:replaced = $false
+    try {
+        $threw = $false
+        try {
+            $null = Invoke-PsmuxBinaryReplacement `
+                -DestinationDirectory $bin `
+                -BinaryNames @("psmux.exe", "pmux.exe") `
+                -DirectoryPrefix "psmux-install-move-aside" `
+                -LogPrefix "[test]" `
+                -Replace { $script:replaced = $true }
+        } catch {
+            $threw = $true
+        }
+        Assert-That $threw "the failed move still propagates"
+    } finally {
+        $unmovable.Dispose()
+        $running.Dispose()
+    }
+    Assert-That (-not $script:replaced) "nothing is replaced after a failed move"
+    Assert-That ((Get-Dummy (Join-Path $bin "psmux.exe")) -eq "old-psmux") "a failed second move puts the first binary back"
+    Assert-That ((Get-Dummy (Join-Path $bin "pmux.exe")) -eq "old-pmux") "the binary that could not move stays in place"
+
+    # 4. A successful replacement installs the new binaries and keeps the moved originals aside.
     $bin = New-Sandbox; $sandboxes.Add($bin)
     Set-Dummy (Join-Path $bin "psmux.exe") "old-psmux"
     $moved = @(Invoke-PsmuxBinaryReplacement `
