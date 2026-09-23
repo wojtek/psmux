@@ -141,7 +141,71 @@ try {
     Assert-That ((Get-Dummy (Join-Path $bin "psmux.exe")) -eq "old-psmux") "a failed second move puts the first binary back"
     Assert-That ((Get-Dummy (Join-Path $bin "pmux.exe")) -eq "old-pmux") "the binary that could not move stays in place"
 
-    # 4. A successful replacement installs the new binaries and keeps the moved originals aside.
+    # 4. An install whose version check fails puts every pre-existing alias back.
+    $bin = New-Sandbox; $sandboxes.Add($bin)
+    $src = New-Sandbox; $sandboxes.Add($src)
+    Set-Dummy (Join-Path $src "psmux.exe") "new-psmux"
+    foreach ($name in "psmux", "pmux", "tmux") { Set-Dummy (Join-Path $bin "$name.exe") "old-$name" }
+    $threw = $false
+    try {
+        Install-PsmuxLocalBinary -SourcePath (Join-Path $src "psmux.exe") -DestinationDirectory $bin `
+            -Validate { throw "injected version check failure" }
+    } catch {
+        $threw = $true
+    }
+    Assert-That $threw "the failed version check still propagates"
+    foreach ($name in "psmux", "pmux", "tmux") {
+        Assert-That ((Get-Dummy (Join-Path $bin "$name.exe")) -eq "old-$name") "a failed version check puts $name.exe back"
+    }
+
+    # 5. The originals stay preserved while the version check runs, and are pruned once it passes.
+    $bin = New-Sandbox; $sandboxes.Add($bin)
+    foreach ($name in "psmux", "pmux") { Set-Dummy (Join-Path $bin "$name.exe") "old-$name" }
+    $script:preservedDuringCheck = -1
+    Install-PsmuxLocalBinary -SourcePath (Join-Path $src "psmux.exe") -DestinationDirectory $bin -Validate {
+        $script:preservedDuringCheck = @(
+            Get-ChildItem -LiteralPath $bin -Directory -Filter "psmux-install-move-aside-*" |
+                Get-ChildItem -File
+        ).Count
+    }
+    Assert-That ($script:preservedDuringCheck -eq 2) "the originals are still preserved while the version check runs"
+    Assert-That ((Get-Dummy (Join-Path $bin "pmux.exe")) -eq "new-psmux") "a passed version check keeps the new binaries"
+    Assert-That (@(Get-ChildItem -LiteralPath $bin -Directory).Count -eq 0) "a passed version check prunes the unlocked originals"
+
+    # 6. When putting a binary back fails too, the replacement's own error stays visible.
+    $bin = New-Sandbox; $sandboxes.Add($bin)
+    Set-Dummy (Join-Path $bin "psmux.exe") "old-psmux"
+    $script:blocker = $null
+    $message = $null
+    try {
+        try {
+            $null = Invoke-PsmuxBinaryReplacement `
+                -DestinationDirectory $bin `
+                -BinaryNames @("psmux.exe") `
+                -DirectoryPrefix "psmux-install-move-aside" `
+                -LogPrefix "[test]" `
+                -IncludeUnlocked `
+                -Replace {
+                    $moved = Get-ChildItem -LiteralPath $bin -Directory -Filter "psmux-install-move-aside-*" |
+                        Get-ChildItem -File -Filter "psmux.exe" | Select-Object -First 1
+                    # Held without delete sharing, the moved original cannot go back.
+                    $script:blocker = [System.IO.File]::Open(
+                        $moved.FullName,
+                        [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read,
+                        [System.IO.FileShare]::Read)
+                    throw "injected replacement failure"
+                }
+        } catch {
+            $message = "$_"
+        }
+    } finally {
+        if ($null -ne $script:blocker) { $script:blocker.Dispose() }
+    }
+    Assert-That ($message -like "*injected replacement failure*") "the replacement's own error stays visible when the restore fails"
+    Assert-That ($message -like "*could not restore*") "the restore failure is reported with it"
+
+    # 7. A successful replacement installs the new binaries and keeps the moved originals aside.
     $bin = New-Sandbox; $sandboxes.Add($bin)
     Set-Dummy (Join-Path $bin "psmux.exe") "old-psmux"
     $moved = @(Invoke-PsmuxBinaryReplacement `

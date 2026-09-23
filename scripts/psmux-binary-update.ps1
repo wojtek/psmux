@@ -142,9 +142,114 @@ function Invoke-PsmuxBinaryReplacement {
     } catch {
         $replaceError = $_
         Write-Host "$LogPrefix Replacement failed; restoring the original binaries" -ForegroundColor Yellow
-        Restore-PsmuxMovedBinaries -MovedBinaries $movedBinaries.ToArray()
+        try {
+            Restore-PsmuxMovedBinaries -MovedBinaries $movedBinaries.ToArray()
+        } catch {
+            # Report why the replacement failed, not only why the restore did:
+            # the restore error used to replace it.
+            throw [System.InvalidOperationException]::new(
+                "psmux binary replacement failed: $($replaceError.Exception.Message); $($_.Exception.Message)",
+                $replaceError.Exception)
+        }
         throw $replaceError
     }
 
     return $movedBinaries.ToArray()
+}
+
+function Remove-PsmuxUnlockedPreservedBinaries {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DestinationDirectory,
+
+        [Parameter(Mandatory)]
+        [string]$LogPrefix
+    )
+
+    # Preserved binaries that no running server holds any more are pruned; a
+    # locked one waits for a later install.
+    $preservedDirectories = @(
+        Get-ChildItem -LiteralPath $DestinationDirectory -Directory |
+            Where-Object { $_.Name -like "psmux-install-move-aside-*" -or $_.Name -like "psmux-build-move-aside-*" } |
+            Sort-Object -Property FullName -Unique
+    )
+    $prunedFileCount = 0
+    $keptFileCount = 0
+
+    foreach ($preservedDirectory in $preservedDirectories) {
+        $preservedFiles = @(Get-ChildItem -LiteralPath $preservedDirectory.FullName -File -Recurse)
+        foreach ($preservedFile in $preservedFiles) {
+            if (Test-PsmuxBinaryLocked -LiteralPath $preservedFile.FullName) {
+                $keptFileCount++
+                Write-Host "$LogPrefix Kept locked preserved binary: $($preservedFile.FullName)" -ForegroundColor Yellow
+                continue
+            }
+
+            Remove-Item -LiteralPath $preservedFile.FullName -Force
+            $prunedFileCount++
+            Write-Host "$LogPrefix Pruned unlocked preserved binary: $($preservedFile.FullName)" -ForegroundColor Green
+        }
+
+        $nestedDirectories = @(Get-ChildItem -LiteralPath $preservedDirectory.FullName -Directory -Recurse | Sort-Object -Property FullName -Descending)
+        foreach ($nestedDirectory in $nestedDirectories) {
+            if (@(Get-ChildItem -LiteralPath $nestedDirectory.FullName -Force).Count -eq 0) {
+                Remove-Item -LiteralPath $nestedDirectory.FullName -Force
+                Write-Host "$LogPrefix Removed empty preserved directory: $($nestedDirectory.FullName)" -ForegroundColor Green
+            }
+        }
+
+        if ((Test-Path -LiteralPath $preservedDirectory.FullName -PathType Container) -and
+            @(Get-ChildItem -LiteralPath $preservedDirectory.FullName -Force).Count -eq 0) {
+            Remove-Item -LiteralPath $preservedDirectory.FullName -Force
+            Write-Host "$LogPrefix Removed empty preserved directory: $($preservedDirectory.FullName)" -ForegroundColor Green
+        }
+    }
+
+    Write-Host "$LogPrefix Preserved-binary cleanup: pruned=$prunedFileCount kept=$keptFileCount"
+}
+
+function Install-PsmuxLocalBinary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourcePath,
+
+        [Parameter(Mandatory)]
+        [string]$DestinationDirectory,
+
+        # Proves the installed binaries work; any failure must throw.
+        [Parameter(Mandatory)]
+        [scriptblock]$Validate
+    )
+
+    $installNames = [System.Collections.Generic.List[string]]::new()
+    $installNames.Add("psmux.exe")
+    foreach ($aliasName in @("pmux.exe", "tmux.exe")) {
+        if (Test-Path -LiteralPath (Join-Path $DestinationDirectory $aliasName) -PathType Leaf) {
+            $installNames.Add($aliasName)
+        }
+    }
+
+    # Every installed alias moves aside first, locked or not, so a failed copy can
+    # put each original back. The version check belongs to the same transaction:
+    # a binary that copies but does not run is rolled back while the originals
+    # still exist. Checked after the cleanup, it found them already pruned.
+    $null = Invoke-PsmuxBinaryReplacement `
+        -DestinationDirectory $DestinationDirectory `
+        -BinaryNames $installNames.ToArray() `
+        -DirectoryPrefix "psmux-install-move-aside" `
+        -LogPrefix "[install-local]" `
+        -IncludeUnlocked `
+        -Replace {
+            foreach ($installName in $installNames) {
+                $installedBinary = Join-Path $DestinationDirectory $installName
+                Copy-Item -LiteralPath $SourcePath -Destination $installedBinary -Force
+                Write-Host "[install-local] Installed: $installedBinary" -ForegroundColor Green
+            }
+            & $Validate
+        }
+
+    # Only a checked install gives up the originals.
+    Remove-PsmuxUnlockedPreservedBinaries -DestinationDirectory $DestinationDirectory -LogPrefix "[install-local]"
 }

@@ -56,9 +56,15 @@ still requires and upstream does not yet provide.
   same filename; `scripts/install-local.ps1` installs a built binary into
   `~/.local/bin`, moving every installed alias aside the same way before it
   updates each; and `scripts/psmux-binary-update.ps1` owns that move-aside rule,
-  because renaming a running image makes live servers look dead. A build or
-  copy that fails puts every moved binary back, so psmux never goes missing
-  from PATH.
+  because renaming a running image makes live servers look dead. Moving aside,
+  writing the new binaries and, for `install-local.ps1`, the `-V` check are one
+  transaction: if any step fails, every binary already moved is put back before
+  the error is reported, and preserved originals are pruned only after the check
+  passes. Moved binaries are absent from their paths while the replacement runs.
+  If putting one back fails too, both errors are reported and that original
+  stays in its move-aside directory, so its path may be empty or still hold the
+  new binary. `build.ps1` covers only the locked binaries it moves; `cargo
+  install` replaces the others itself.
 
 ## Upstream-owned and excluded behavior
 
