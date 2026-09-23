@@ -2279,7 +2279,13 @@ pub fn send_control(line: String) -> io::Result<()> {
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
-    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    send_control_with_response_to(target, line)
+}
+
+/// [`send_control_with_response`] to a session the caller names, instead of the
+/// routed `PSMUX_TARGET_SESSION`.
+pub fn send_control_with_response_to(mut target: String, line: String) -> io::Result<String> {
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
             target, env::var("PSMUX_TARGET_FULL").ok(),

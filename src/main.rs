@@ -5319,21 +5319,13 @@ fn run_main() -> io::Result<()> {
     }
     env::set_var("PSMUX_ACTIVE", "1");
 
-    // Console-backed VT input must use the target server's escape-time. Query
+    // Console-backed VT input must use the attached server's escape-time. Query
     // it before starting the reader thread; a missing or invalid value is a
     // startup error, not permission to substitute a client-side timeout.
     let use_vt_input = crate::ssh_input::needs_vt_input();
-    let vt_escape_timeout_ms = if use_vt_input && !pipe_vt {
-        let raw = send_control_with_response("show-options -gv escape-time\n".to_string())
-            .map_err(|e| io::Error::new(
-                e.kind(),
-                format!("cannot resolve server escape-time for VT input: {e}"),
-            ))?;
-        let value = raw.trim().parse::<u32>().map_err(|_| io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("server returned invalid escape-time value {:?}", raw.trim()),
-        ))?;
-        Some(value)
+    let vt_escape_timeout = if use_vt_input && !pipe_vt {
+        let session = crate::client::attached_session_name();
+        Some(crate::ssh_input::EscapeTimeout::new(query_escape_time_ms(&session)?))
     } else {
         None
     };
@@ -5388,7 +5380,7 @@ fn run_main() -> io::Result<()> {
     let input = if pipe_vt {
         InputSource::new_pipe()?
     } else {
-        InputSource::new(use_vt_input, vt_escape_timeout_ms)?
+        InputSource::new(use_vt_input, vt_escape_timeout.clone())?
     };
 
     if pipe_vt {
@@ -5467,6 +5459,14 @@ fn run_main() -> io::Result<()> {
             // (`server_client_set_session` -> `session_update_activity`). Bare CLI
             // routing ranks by that stamp (issue #603).
             crate::session::touch_session_activity(&switch_to);
+            // The VT reader's escape-time is the attached session's option,
+            // and the reader outlives this switch.
+            if let Some(ref escape_timeout) = vt_escape_timeout {
+                match query_escape_time_ms(&switch_to) {
+                    Ok(ms) => escape_timeout.set(ms),
+                    Err(e) => break Err(e),
+                }
+            }
             // Continue loop to attach to new session
             continue;
         }
@@ -5489,6 +5489,23 @@ fn run_main() -> io::Result<()> {
     let _ = execute!(out, DisableBlinking, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen);
     let _ = terminal.show_cursor();
     result
+}
+
+/// The `escape-time` of `session`, which the console VT reader applies while
+/// this client is attached to it.
+fn query_escape_time_ms(session: &str) -> io::Result<u32> {
+    let raw = crate::session::send_control_with_response_to(
+        session.to_string(),
+        "show-options -gv escape-time\n".to_string(),
+    )
+    .map_err(|e| io::Error::new(
+        e.kind(),
+        format!("cannot resolve server escape-time for VT input: {e}"),
+    ))?;
+    raw.trim().parse::<u32>().map_err(|_| io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("server returned invalid escape-time value {:?}", raw.trim()),
+    ))
 }
 
 /// Run as a control mode client (psmux -C or psmux -CC).

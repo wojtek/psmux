@@ -3179,6 +3179,20 @@ fn open_session_chooser(
     }
 }
 
+/// The session this client attaches to, read through `get` (the process
+/// environment in production). It is PSMUX_SESSION_NAME, never the routed
+/// PSMUX_TARGET_SESSION: `psmux pick` and a positional attach name the session
+/// without touching the routing variable, and a query routed that way (the VT
+/// reader's escape-time) asked a different server.
+pub(crate) fn attached_session_name_from(get: impl Fn(&str) -> Option<String>) -> String {
+    get("PSMUX_SESSION_NAME").unwrap_or_else(|| "default".to_string())
+}
+
+/// The session this client attaches to.
+pub(crate) fn attached_session_name() -> String {
+    attached_session_name_from(|key| env::var(key).ok())
+}
+
 /// One attachment of this client to a session. The Windows Terminal tab colour
 /// the attachment set on the host terminal is released when it ends, however it
 /// ends: the next attachment starts from a terminal without one, so switching
@@ -3234,7 +3248,7 @@ fn run_remote_attachment(
     let _return_trace = ReturnTrace;
     install_console_ctrl_trace();
     crate::startup_trace::mark("cli.attach");
-    let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
+    let name = attached_session_name();
     let mut path = crate::paths::port_file(&name);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
         .ok_or_else(|| no_such_session(&name))?;
@@ -10071,3 +10085,7 @@ mod test_picker_rename_paste;
 #[cfg(test)]
 #[path = "../tests-rs/test_picker_rename_namespace.rs"]
 mod test_picker_rename_namespace;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_vt_escape_time_session.rs"]
+mod test_vt_escape_time_session;

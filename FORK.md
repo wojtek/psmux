@@ -36,8 +36,9 @@ still requires and upstream does not yet provide.
 - The session option `tab-colour` applies a Windows Terminal tab color without
   rewriting the normal 0-255 text palette and resets it when cleared, when the
   client switches to a session without one, and when it detaches.
-- Console-backed SSH VT input uses the target server's `escape-time` for pending
-  Escape sequences, and translates Ctrl+J, modified Enter, and Escape into Win32
+- Console-backed SSH VT input uses the attached session's `escape-time` for
+  pending Escape sequences, following it when the client switches sessions,
+  and translates Ctrl+J, modified Enter, and Escape into Win32
   input records when a Windows pane application such as Codex requests DEC
   private mode 9001.
 - Server liveness trusts the recorded `pid:creation_filetime` pair over the
