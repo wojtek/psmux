@@ -42,7 +42,10 @@ still requires and upstream does not yet provide.
   its registry, a rename the server acknowledges with a bare `OK` is reported as
   success while real transport failures keep their own message, and the
   terminal caret sits inside the rename dialog at the cell width of the typed
-  name. Enter on the session the client is already attached to closes the
+  name. A paste into the rename dialog is taken as in the other client-side
+  overlays: an `Event::Paste` is appended to the name, and the character events
+  that arrive inside the duplicate-paste window it opens are ignored (#290).
+  Enter on the session the client is already attached to closes the
   chooser and repaints at once; upstream leaves it painted until the next key,
   which then also reaches the pane.
 - The session option `tab-colour` applies a Windows Terminal tab color without
