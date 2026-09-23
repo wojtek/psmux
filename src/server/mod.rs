@@ -1169,6 +1169,21 @@ fn reserve_session_rename_target(
     Ok(target_guard)
 }
 
+/// Whether handling `req` ends a temporary `-t` focus. After a
+/// `FocusTargetTemp` the server restores the saved focus as soon as it has
+/// handled the first request that ends it, so a targeted command runs against
+/// its target and the user's view does not jump.
+///
+/// `send-keys -R` sends its reset as a request of its own ahead of the input.
+/// A reset followed by input must leave the focus in place, or the input of
+/// `send-keys -R -t <pane> ...` would go to the pane that was active before.
+pub(crate) fn request_ends_temp_focus(req: &CtrlReq) -> bool {
+    !matches!(
+        req,
+        CtrlReq::FocusTargetTemp { .. } | CtrlReq::ResetTerminal { input_follows: true }
+    )
+}
+
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     crate::startup_trace::mark("srv.entry");
     // Write crash info to a log file when stderr is unavailable (detached server)
@@ -2066,7 +2081,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         | CtrlReq::PtyWake
                         | CtrlReq::ClientActivity(_)
                     );
-                    let is_temp_focus = matches!(&req, CtrlReq::FocusTargetTemp { .. });
+                    let is_temp_focus = !request_ends_temp_focus(&req);
                     let mut hook_event: Option<&str> = None;
                     // Track active_idx changes for debugging window-switch issues
                     let _prev_active_idx = app.active_idx;
@@ -3265,7 +3280,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::SendBytes(bytes) => {
                     send_bytes_to_active(&mut app, &bytes)?;
                 }
-                CtrlReq::ResetTerminal => {
+                CtrlReq::ResetTerminal { .. } => {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
                         if let Ok(mut terminal) = pane.term.lock() {

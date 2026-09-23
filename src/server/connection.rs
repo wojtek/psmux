@@ -155,26 +155,38 @@ fn dispatch_send_keys(args: &[&str], tx: &mpsc::Sender<CtrlReq>) -> SendKeysDisp
     }
 
     let parsed = parse_send_keys_args(args);
+    let input = send_keys_input_requests(&parsed);
     if parsed.reset {
-        let _ = tx.send(CtrlReq::ResetTerminal);
+        // The reset is a request of its own, so it has to say whether input
+        // follows: only then does it keep a temporary -t focus for that input.
+        let _ = tx.send(CtrlReq::ResetTerminal { input_follows: !input.is_empty() });
     }
+    for request in input {
+        let _ = tx.send(request);
+    }
+    SendKeysDispatchOutcome::Dispatched
+}
+
+/// The input requests one parsed send-keys command sends, in order.
+fn send_keys_input_requests(parsed: &crate::cli::ParsedSendKeysArgs<'_>) -> Vec<CtrlReq> {
+    let mut requests = Vec::new();
     if parsed.hex_mode {
         let bytes: Vec<u8> = parsed.operands.iter()
             .filter_map(|operand| u8::from_str_radix(operand, 16).ok())
             .collect();
         if !bytes.is_empty() {
             for _ in 0..parsed.repeat_count {
-                let _ = tx.send(CtrlReq::SendBytes(bytes.clone()));
+                requests.push(CtrlReq::SendBytes(bytes.clone()));
             }
         }
-        return SendKeysDispatchOutcome::Dispatched;
+        return requests;
     }
     if parsed.copy_mode {
         let command = parsed.operands.join(" ");
         for _ in 0..parsed.repeat_count {
-            let _ = tx.send(CtrlReq::SendKeysX(command.clone()));
+            requests.push(CtrlReq::SendKeysX(command.clone()));
         }
-        return SendKeysDispatchOutcome::Dispatched;
+        return requests;
     }
 
     let mut any_hex = false;
@@ -194,12 +206,12 @@ fn dispatch_send_keys(args: &[&str], tx: &mpsc::Sender<CtrlReq>) -> SendKeysDisp
     let effective_literal = parsed.literal || any_hex;
     for _ in 0..parsed.repeat_count {
         if parsed.paste_mode {
-            let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
+            requests.push(CtrlReq::SendPaste(keys.join("")));
         } else {
-            let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
+            requests.push(CtrlReq::SendKeys(keys.clone(), effective_literal));
         }
     }
-    SendKeysDispatchOutcome::Dispatched
+    requests
 }
 
 fn expand_command_alias_and_normalize(
@@ -5427,6 +5439,10 @@ mod tests_send_keys_literal_byte;
 #[cfg(test)]
 #[path = "../../tests-rs/test_send_keys_one_shot_barrier.rs"]
 mod tests_send_keys_one_shot_barrier;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_send_keys_reset_target.rs"]
+mod tests_send_keys_reset_target;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_refresh_client_flags.rs"]

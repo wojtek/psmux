@@ -168,7 +168,7 @@ fn reset_dispatches_before_following_keys() {
     let (tx, rx) = mpsc::channel();
     let outcome = dispatch_send_keys(&["-R", "Enter"], &tx);
     assert_eq!(outcome, SendKeysDispatchOutcome::Dispatched);
-    assert!(matches!(rx.recv().unwrap(), CtrlReq::ResetTerminal));
+    assert!(matches!(rx.recv().unwrap(), CtrlReq::ResetTerminal { input_follows: true }));
     assert!(matches!(
         rx.recv().unwrap(),
         CtrlReq::SendKeys(keys, false) if keys == vec!["Enter"]

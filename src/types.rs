@@ -2653,7 +2653,10 @@ pub enum CtrlReq {
     // arguments and stripped leading/trailing spaces.
     SendKeys(Vec<String>, bool),
     /// send-keys -R: reset the target pane's parsed terminal state and screen.
-    ResetTerminal,
+    /// `input_follows` says the same send-keys command sends input right after
+    /// the reset; such a reset keeps a temporary `-t` focus so the input lands
+    /// on the pane that was reset (see `request_ends_temp_focus`).
+    ResetTerminal { input_follows: bool },
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
