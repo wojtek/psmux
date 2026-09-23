@@ -2280,15 +2280,44 @@ pub fn send_control(line: String) -> io::Result<()> {
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    send_control_with_response_to(target, line)
+    send_control_request(target, ControlRouting::Routed, line)
 }
 
 /// [`send_control_with_response`] to a session the caller names, instead of the
 /// routed `PSMUX_TARGET_SESSION`.
-pub fn send_control_with_response_to(mut target: String, line: String) -> io::Result<String> {
+pub fn send_control_with_response_to(target: String, line: String) -> io::Result<String> {
+    send_control_request(target, ControlRouting::Session, line)
+}
+
+/// Whether a control request follows the command line's routing, or addresses
+/// a session the caller named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlRouting {
+    Routed,
+    Session,
+}
+
+/// The window/pane target (`TARGET` line) a control request carries, read
+/// through `get` (the process environment in production). A routed request
+/// carries the command line's `-t` (PSMUX_TARGET_FULL). A request addressed to
+/// a named session carries none: PSMUX_TARGET_FULL is set once from the
+/// startup `-t` and never cleared, so after a session switch it names a window
+/// of another session, and the addressed server rejected the request.
+pub(crate) fn control_full_target(
+    routing: ControlRouting,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    match routing {
+        ControlRouting::Routed => get("PSMUX_TARGET_FULL"),
+        ControlRouting::Session => None,
+    }
+}
+
+fn send_control_request(mut target: String, routing: ControlRouting, line: String) -> io::Result<String> {
+    let full_target = control_full_target(routing, |key| env::var(key).ok());
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
-            target, env::var("PSMUX_TARGET_FULL").ok(),
+            target, full_target,
             env::args().collect::<Vec<_>>(), line.trim());
     }
     // Never target a warm (standby) session — resolve to a real session instead
@@ -2296,7 +2325,6 @@ pub fn send_control_with_response_to(mut target: String, line: String) -> io::Re
         let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
-    let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = crate::paths::port_file(&target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
@@ -2306,11 +2334,22 @@ pub fn send_control_with_response_to(mut target: String, line: String) -> io::Re
     // error instead of a multi-second hang printed to the user.
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
+    exchange_control_request(&addr, &session_key, full_target.as_deref(), &line)
+}
+
+/// One authenticated control exchange with the server at `addr`: `AUTH`, the
+/// `TARGET` line when there is one, `line`, then the complete reply.
+pub(crate) fn exchange_control_request(
+    addr: &std::net::SocketAddr,
+    session_key: &str,
+    full_target: Option<&str>,
+    line: &str,
+) -> io::Result<String> {
+    let mut stream = std::net::TcpStream::connect_timeout(addr, Duration::from_millis(1000))?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
     let _ = write!(stream, "AUTH {}\n", session_key);
-    if let Some(ref ft) = full_target {
+    if let Some(ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
     }
     let _ = write!(stream, "{}", line);
@@ -2865,3 +2904,7 @@ mod tests_picker_namespace_filter;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue650_cross_session_process_name.rs"]
 mod tests_issue650_cross_session_process_name;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_request_target.rs"]
+mod tests_control_request_target;
