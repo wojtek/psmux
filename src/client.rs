@@ -860,6 +860,35 @@ impl OverlayFlags {
     }
 }
 
+/// Whether the Ctrl+V Release fallback may read the clipboard and send it to
+/// the server as `send-paste`. `overlays` is what is on screen now
+/// (`overlay_flags_now!`), with the window-index prompt and customize mode
+/// beside it as the caret code has them; `paste_window_open` is the
+/// duplicate-paste window.
+///
+/// The server writes a `send-paste` to the active pane whatever overlay is up
+/// (`input::send_paste_to_active` special-cases only clock mode), so with a
+/// dialog open the clipboard went into the pane hidden behind it, where a
+/// newline could run a command. That holds for every client-side dialog and
+/// for a PTY or static popup, a menu, a confirm prompt, display-panes and
+/// customize. Clock mode consumes the paste by closing the clock and writes
+/// nothing, so it keeps the fallback as before.
+pub(crate) fn clipboard_read_back_allowed(
+    overlays: OverlayFlags,
+    window_index_prompt: bool,
+    customize: bool,
+    paste_window_open: bool,
+) -> bool {
+    let dialog_hides_the_pane = overlays.client
+        || window_index_prompt
+        || overlays.popup
+        || overlays.confirm
+        || overlays.menu
+        || overlays.display_panes
+        || customize;
+    !paste_window_open && !dialog_hides_the_pane
+}
+
 /// Overlay state across one frame of the client loop. `before` is what was on
 /// screen when the pass began and decides whether to render at all; `drawn` is
 /// what the frame being rendered shows, once that frame's server-owned overlay
@@ -7247,9 +7276,13 @@ fn run_remote_attachment(
                 // Ctrl+V Release with no buffered chars.  If paste was
                 // already sent via stage2 timeout or Event::Paste, the
                 // suppress window prevents a redundant clipboard read.
-                let suppressed = paste_suppress_until
-                    .map_or(false, |t| Instant::now() < t);
-                if !suppressed {
+                let suppressed = within_paste_suppress_window(paste_suppress_until, Instant::now());
+                if clipboard_read_back_allowed(
+                    overlay_flags_now!(),
+                    window_idx_input,
+                    srv_customize_active,
+                    suppressed,
+                ) {
                     // No recent paste — read clipboard as fallback
                     if let Some(text) = read_from_system_clipboard() {
                         if paste_gesture.blocks(&text) {
@@ -7276,7 +7309,11 @@ fn run_remote_attachment(
                             paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                         }
                     }
+                } else if !suppressed && input_log_enabled() {
+                    input_log("paste", "paste CONFIRMED (no buffer): a dialog is open, the clipboard is not sent to the pane behind it");
                 }
+                // Cleared whether or not the fallback ran, so a stale
+                // confirmation cannot fire once the dialog closes.
                 paste_confirmed = false;
                 paste_gesture.finish();
             }
@@ -10158,6 +10195,10 @@ mod test_picker_rename_paste;
 #[cfg(test)]
 #[path = "../tests-rs/test_picker_rename_namespace.rs"]
 mod test_picker_rename_namespace;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_clipboard_read_back_overlays.rs"]
+mod test_clipboard_read_back_overlays;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_vt_escape_time_session.rs"]

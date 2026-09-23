@@ -55,6 +55,15 @@ still requires and upstream does not yet provide.
 - The session option `tab-colour` applies a Windows Terminal tab color without
   rewriting the normal 0-255 text palette and resets it when cleared, when the
   client switches to a session without one, and when it detaches.
+- A Ctrl+V never sends the clipboard to a pane hidden behind a psmux dialog.
+  Upstream's Windows paste fallback reads the clipboard on the Ctrl+V Release
+  when nothing was buffered for the pane and sends it with `send-paste`, which
+  the server writes to the active pane whatever overlay is up, so with a dialog
+  open the text went into the pane behind it. The fork skips that read-back
+  while a client-side dialog (the command prompt, the rename dialogs, the
+  window-index prompt, the choosers, the key viewer or a client confirm prompt)
+  or a server popup, menu, confirm prompt, display-panes or customize is open.
+  Clock mode keeps it, because a paste there only closes the clock.
 - Console-backed SSH VT input uses the attached session's `escape-time` for
   pending Escape sequences, following it when the client switches sessions,
   and translates Ctrl+J, modified Enter, and Escape into Win32
