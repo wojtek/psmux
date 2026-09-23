@@ -800,6 +800,45 @@ fn session_chooser_row_line(
     ])
 }
 
+/// The overlays on screen at one point of a client-loop pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OverlayFlags {
+    /// Any client-side overlay: command prompt, rename dialogs, choosers,
+    /// the key viewer or a client confirm prompt.
+    pub(crate) client: bool,
+    pub(crate) popup: bool,
+    pub(crate) confirm: bool,
+    pub(crate) menu: bool,
+    pub(crate) display_panes: bool,
+    pub(crate) clock: bool,
+}
+
+impl OverlayFlags {
+    pub(crate) fn any(self) -> bool {
+        self.client || self.popup || self.confirm || self.menu || self.display_panes || self.clock
+    }
+}
+
+/// Overlay state across one frame of the client loop. `before` is what was on
+/// screen when the pass began and decides whether to render at all; `drawn` is
+/// what the frame being rendered shows, once that frame's server-owned overlay
+/// flags have been applied. They differ exactly on a frame that opens or closes
+/// an overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameOverlays {
+    pub(crate) before: OverlayFlags,
+    pub(crate) drawn: OverlayFlags,
+}
+
+impl FrameOverlays {
+    /// Whether an overlay owns the screen, and with it the caret, in the frame
+    /// being drawn. Deciding it from `before` hid the caret on the frame that
+    /// closed a server overlay, and an idle client never redrew to show it.
+    pub(crate) fn overlay_owns_drawn_frame(self) -> bool {
+        self.drawn.any()
+    }
+}
+
 /// Screen position of a PTY popup's cursor, given the popup-inner cursor cell
 /// reported by the server.
 ///
@@ -3874,6 +3913,23 @@ pub fn run_remote(
     // detaching the still-running session (issue #454).  The signal is drained
     // into cmd_batch as `send-key C-Break` at the top of each iteration.
     crate::platform::install_client_console_ctrl_handler();
+    // The overlays on screen right now, read from the loop's own state. Taken
+    // when a pass begins (the render gate) and again for the frame that is
+    // drawn, whose server-owned flags that frame has just replaced.
+    macro_rules! overlay_flags_now {
+        () => {
+            OverlayFlags {
+                client: command_input || renaming || pane_renaming || tree_chooser
+                    || buffer_chooser || session_chooser || picker_rename_target.is_some()
+                    || keys_viewer || confirm_cmd.is_some(),
+                popup: srv_popup_active,
+                confirm: srv_confirm_active,
+                menu: srv_menu_active,
+                display_panes: srv_display_panes,
+                clock: clock_active,
+            }
+        };
+    }
     loop {
         // ── Poll background reconnect result (non-blocking) ──────────────────
         // If a background reconnect thread has finished, apply its result here
@@ -7252,7 +7308,8 @@ pub fn run_remote(
         // Rate-limit dump-state requests to avoid flooding the server.
         // dump_in_flight prevents >1 concurrent request; the interval check
         // ensures we don't re-request faster than ~100fps when typing.
-        let overlays_active = command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || picker_rename_target.is_some() || keys_viewer || confirm_cmd.is_some() || srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || clock_active;
+        let overlays_before = overlay_flags_now!();
+        let overlays_active = overlays_before.any();
         let should_dump = should_request_dump(force_dump, size_changed, typing_active, since_dump);
         // A failed request here is NOT the end of the client (issue #675).
         // The reader thread may have just noticed the same drop and started a
@@ -9124,7 +9181,10 @@ pub fn run_remote(
             // choosers do. Parking the pane's caret behind the rename dialog is
             // what made the field look like it did not have focus whenever the
             // pane underneath happened to be showing a cursor of its own.
-            let overlay_owns_screen = overlays_active || window_idx_input || srv_customize_active;
+            let frame_overlays = FrameOverlays { before: overlays_before, drawn: overlay_flags_now!() };
+            let overlay_owns_screen = frame_overlays.overlay_owns_drawn_frame()
+                || window_idx_input
+                || srv_customize_active;
             let (cursor_visible, cursor_owner): (Option<(u16, u16)>, &'static str) =
                 if srv_popup_active && srv_popup_has_pty {
                     (
@@ -9874,3 +9934,7 @@ mod test_issue675_stale_writer;
 #[cfg(test)]
 #[path = "../tests-rs/test_host_tab_color.rs"]
 mod test_host_tab_color;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_overlay_caret_frame.rs"]
+mod test_overlay_caret_frame;
