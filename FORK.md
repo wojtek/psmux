@@ -64,6 +64,9 @@ still requires and upstream does not yet provide.
   window-index prompt, the choosers, the key viewer or a client confirm prompt)
   or a server popup, menu, confirm prompt, display-panes or customize is open.
   Clock mode keeps it, because a paste there only closes the clock.
+- An independent terminal paste, such as SSH bracketed paste, does not leave
+  upstream's Ctrl+V duplicate guard armed, fixing upstream defect `d828af2`
+  that dropped every later paste from that client.
 - Console-backed SSH VT input uses the attached session's `escape-time` for
   pending Escape sequences, following it when the client switches sessions,
   and translates Ctrl+J, modified Enter, and Escape into Win32

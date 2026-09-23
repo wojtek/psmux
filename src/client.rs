@@ -6428,7 +6428,9 @@ fn run_remote_attachment(
                                 window_idx_input, &mut window_idx_buf,
                             )
                         };
-                        let duplicate = !consumed && paste_gesture.blocks(&data);
+                        let send_paste =
+                            !consumed && take_terminal_paste(&mut paste_gesture, &data);
+                        let duplicate = !consumed && !send_paste;
                         if duplicate {
                             // Windows crossterm can emit Event::Paste *and* the
                             // per-character key events for one Ctrl+V.  When the
@@ -6439,10 +6441,10 @@ fn run_remote_attachment(
                                     "Event::Paste: dropping duplicate of {} char(s) already sent as characters",
                                     data.len()));
                             }
-                        } else if !consumed {
+                        }
+                        if send_paste {
                             let encoded = base64_encode(&data);
                             cmd_batch.push(format!("send-paste {}\n", encoded));
-                            paste_gesture.record(&data);
                         }
                         // On Windows, crossterm with EnableBracketedPaste may
                         // emit Event::Paste AND individual Event::Key events
@@ -9868,6 +9870,8 @@ struct PasteGesture {
     delivered: Option<(String, Instant)>,
     /// True once any of this gesture's characters have been forwarded.
     injected: bool,
+    /// True between a local Ctrl+V press and its release.
+    active: bool,
 }
 
 impl PasteGesture {
@@ -9875,11 +9879,18 @@ impl PasteGesture {
     fn start(&mut self) {
         self.delivered = None;
         self.injected = false;
+        self.active = true;
     }
 
     /// The gesture is over, however it ended.
     fn finish(&mut self) {
-        self.start();
+        self.delivered = None;
+        self.injected = false;
+        self.active = false;
+    }
+
+    fn active(&self) -> bool {
+        self.active
     }
 
     /// Remember `text` as forwarded on behalf of this gesture.
@@ -9903,6 +9914,18 @@ impl PasteGesture {
     fn blocks(&self, text: &str) -> bool {
         self.injected || duplicates_recent_paste(text, self.recent())
     }
+}
+
+/// Decide whether to forward a terminal paste and clear standalone paste state.
+fn take_terminal_paste(gesture: &mut PasteGesture, data: &str) -> bool {
+    let duplicate = gesture.blocks(data);
+    if !duplicate {
+        gesture.record(data);
+    }
+    if !gesture.active() {
+        gesture.finish();
+    }
+    !duplicate
 }
 
 /// How long after a burst was forwarded a clipboard read-back of the same text
@@ -9973,6 +9996,10 @@ fn route_paste_to_overlay(
 #[cfg(test)]
 #[path = "../tests-rs/test_client.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_ssh_paste_gesture.rs"]
+mod test_ssh_paste_gesture;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_zoom_bleed.rs"]
