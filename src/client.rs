@@ -4565,37 +4565,58 @@ fn run_remote_attachment(
                                     }
                                     KeyCode::Enter => {
                                         let old_base = picker_rename_target.clone().unwrap_or_default();
-                                        let (logical_name, new_base) = picker_rename_plan(&old_base, &picker_rename_buf);
-                                        if let Err(reason) = validate_picker_session_name(&logical_name, &new_base) {
-                                            picker_rename_error = Some(reason.to_string());
-                                        } else {
-                                            let names: Vec<&str> = if session_chooser {
-                                                session_entries.iter().map(|entry| entry.0.as_str()).collect()
-                                            } else {
-                                                tree_all.iter().map(|entry| entry.4.as_str()).collect()
-                                            };
-                                            if picker_session_name_conflicts(names, &old_base, &new_base) {
-                                                picker_rename_error = Some(format!("session '{}' already exists", logical_name));
-                                            } else {
-                                                let port = std::fs::read_to_string(crate::paths::port_file(&old_base))
-                                                    .ok()
-                                                    .and_then(|value| value.trim().parse::<u16>().ok());
-                                                let target_key = read_session_key(&old_base).ok();
-                                                if let (Some(port), Some(target_key)) = (port, target_key) {
-                                                    picker_rename_error = None;
-                                                    picker_rename_pending = Some(begin_picker_rename(
-                                                        old_base,
-                                                        logical_name,
-                                                        new_base,
-                                                        port,
-                                                        target_key,
-                                                    ));
-                                                } else {
-                                                    picker_rename_error = Some(format!(
-                                                        "session '{}' is no longer available",
-                                                        old_base,
-                                                    ));
+                                        let port = std::fs::read_to_string(crate::paths::port_file(&old_base))
+                                            .ok()
+                                            .and_then(|value| value.trim().parse::<u16>().ok());
+                                        let target_key = read_session_key(&old_base).ok();
+                                        // The selected server's own session name
+                                        // decides its namespace; neither the
+                                        // client's -L nor a guess from the
+                                        // registry name can.
+                                        let server_name = match (port, target_key.as_deref()) {
+                                            (Some(port), Some(key)) => crate::session::fetch_session_info(
+                                                &format!("127.0.0.1:{}", port),
+                                                key,
+                                                PICKER_RENAME_PROBE_CONNECT,
+                                                PICKER_RENAME_PROBE_READ,
+                                            )
+                                            .and_then(|info| picker_server_session_name(&info).map(str::to_string)),
+                                            _ => None,
+                                        };
+                                        match (port, target_key, server_name) {
+                                            (Some(port), Some(target_key), Some(server_name)) => {
+                                                match picker_rename_plan(&old_base, &server_name, &picker_rename_buf) {
+                                                    Err(reason) => picker_rename_error = Some(reason),
+                                                    Ok((logical_name, new_base)) => {
+                                                        if let Err(reason) = validate_picker_session_name(&logical_name, &new_base) {
+                                                            picker_rename_error = Some(reason.to_string());
+                                                        } else {
+                                                            let names: Vec<&str> = if session_chooser {
+                                                                session_entries.iter().map(|entry| entry.0.as_str()).collect()
+                                                            } else {
+                                                                tree_all.iter().map(|entry| entry.4.as_str()).collect()
+                                                            };
+                                                            if picker_session_name_conflicts(names, &old_base, &new_base) {
+                                                                picker_rename_error = Some(format!("session '{}' already exists", logical_name));
+                                                            } else {
+                                                                picker_rename_error = None;
+                                                                picker_rename_pending = Some(begin_picker_rename(
+                                                                    old_base,
+                                                                    logical_name,
+                                                                    new_base,
+                                                                    port,
+                                                                    target_key,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
                                                 }
+                                            }
+                                            _ => {
+                                                picker_rename_error = Some(format!(
+                                                    "session '{}' is no longer available",
+                                                    old_base,
+                                                ));
                                             }
                                         }
                                     }
@@ -9590,17 +9611,52 @@ fn begin_picker_rename(
     PickerRenamePending { old_base, logical_name, new_base, result_rx }
 }
 
+/// How long the rename dialog waits for the selected server to report its own
+/// session name: the connect and read limits the chooser uses when it opens.
+const PICKER_RENAME_PROBE_CONNECT: Duration = Duration::from_millis(50);
+const PICKER_RENAME_PROBE_READ: Duration = Duration::from_millis(250);
+
+/// The session name a server reports for itself at the start of its
+/// `session-info` line (`<name>: <n> windows ...`).
+pub(crate) fn picker_server_session_name(session_info: &str) -> Option<&str> {
+    session_info
+        .split_once(':')
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+}
+
 /// The names a picker rename of `old_base` to `entered` works with: the logical
 /// name the server is asked to take, and the registry name it will then be
-/// found under. Both follow the namespace of the server being renamed. The
-/// client's own `-L` is not that namespace when it attached to a namespaced
-/// session by its full registry name; planning with it waited for a name the
-/// server never takes and reported the successful rename as a failure.
-pub(crate) fn picker_rename_plan(old_base: &str, entered: &str) -> (String, String) {
-    let ns = crate::session::session_namespace(old_base);
+/// found under. Both follow the namespace of the server being renamed.
+///
+/// A server registers as `<namespace>__<name>` (a bare `<name>` in the default
+/// namespace), and `-L` takes the namespace unchanged, so it may contain `__`
+/// itself. Given `server_name`, the session name the selected server reports
+/// for itself, the namespace is exactly what precedes `__<server_name>`. The
+/// client's own `-L` is not that namespace when it attached by full registry
+/// name, and splitting the registry name at its first `__` broke namespaces
+/// containing `__`; both waited for a name the server never takes and reported
+/// a successful rename as a failure.
+pub(crate) fn picker_rename_plan(
+    old_base: &str,
+    server_name: &str,
+    entered: &str,
+) -> Result<(String, String), String> {
+    let ns = if old_base == server_name {
+        None
+    } else {
+        let ns = old_base
+            .strip_suffix(server_name)
+            .and_then(|rest| rest.strip_suffix("__"))
+            .filter(|ns| !ns.is_empty())
+            .ok_or_else(|| {
+                format!("session '{}' reports its name as '{}'", old_base, server_name)
+            })?;
+        Some(ns)
+    };
     let logical_name = picker_logical_rename_name(ns, entered);
     let registry_name = picker_registry_name_for_logical(ns, &logical_name);
-    (logical_name, registry_name)
+    Ok((logical_name, registry_name))
 }
 
 fn picker_logical_rename_name(socket_name: Option<&str>, entered_name: &str) -> String {

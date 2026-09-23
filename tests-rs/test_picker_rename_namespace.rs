@@ -1,44 +1,78 @@
 // A picker rename is planned in the namespace of the server being renamed.
 //
-// The session chooser lists the sessions of the namespace the client is
-// attached in, which comes from the attached session's registry name: a client
-// can attach to `team__alpha` by that full name without having been started
-// with `-L team`. The `$` rename built the name to wait for, and the name to
-// check for collisions, from the client's own startup `-L` instead. Renaming
-// `team__alpha` to `beta` from such a client asked the server to become
-// "beta", which it did as `team__beta`, while the client waited for a registry
-// entry called "beta", reported the successful rename as a failure after the
-// confirmation timeout, and never ran its rename-success update. The collision
-// check missed an existing `team__beta` the same way.
+// A server registers as `<namespace>__<name>`, or as a bare `<name>` in the
+// default namespace, and the namespace is the `-L` value unchanged, which may
+// itself contain `__`. The rename used to plan with the client's startup `-L`,
+// which is not the selected server's namespace when the client attached to a
+// namespaced session by its full registry name. Splitting the registry name at
+// its first `__` instead broke namespaces that contain `__`: `team__qa__alpha`
+// renamed to `beta` was expected as `team__beta` while the server became
+// `team__qa__beta`. In both cases the client waited for a registry entry the
+// server never writes and reported a successful rename as a failure.
 //
-// These tests pin picker_rename_plan; they start no server (see AGENTS.md).
+// The plan now takes the session name the selected server reports for itself
+// (its `session-info`); the namespace is exactly what precedes `__<name>`.
+//
+// These tests pin the pure plan; they start no server (see AGENTS.md).
 
 use super::*;
 
-fn plan(old_base: &str, entered: &str) -> (String, String) {
-    picker_rename_plan(old_base, entered)
+fn plan(old_base: &str, server_name: &str, entered: &str) -> Result<(String, String), String> {
+    picker_rename_plan(old_base, server_name, entered)
+}
+
+fn names(logical: &str, registry: &str) -> Result<(String, String), String> {
+    Ok((logical.to_string(), registry.to_string()))
 }
 
 #[test]
 fn a_namespaced_server_is_expected_under_its_own_namespace() {
-    assert_eq!(plan("team__alpha", "beta"), ("beta".to_string(), "team__beta".to_string()));
+    // Reached by full registry name from a client started without -L.
+    assert_eq!(plan("team__alpha", "alpha", "beta"), names("beta", "team__beta"));
+}
+
+#[test]
+fn a_namespace_that_contains_a_double_underscore_is_kept_whole() {
+    // Created with `-L team__qa`; whatever -L the renaming client has.
+    assert_eq!(plan("team__qa__alpha", "alpha", "beta"), names("beta", "team__qa__beta"));
 }
 
 #[test]
 fn a_typed_namespace_prefix_is_not_doubled() {
-    assert_eq!(plan("team__alpha", "team__beta"), ("beta".to_string(), "team__beta".to_string()));
+    assert_eq!(plan("team__alpha", "alpha", "team__beta"), names("beta", "team__beta"));
+    assert_eq!(plan("team__qa__alpha", "alpha", "team__qa__beta"), names("beta", "team__qa__beta"));
 }
 
 #[test]
-fn the_collision_check_sees_the_namespaced_name() {
-    let (_, new_base) = plan("team__alpha", "beta");
-    assert!(
-        picker_session_name_conflicts(["team__alpha", "team__beta"], "team__alpha", &new_base),
-        "team__beta already exists in the list the chooser shows"
-    );
+fn a_session_name_that_contains_a_double_underscore_keeps_its_namespace() {
+    assert_eq!(plan("team__a__b", "a__b", "c"), names("c", "team__c"));
 }
 
 #[test]
 fn a_default_namespace_server_keeps_a_bare_name() {
-    assert_eq!(plan("alpha", "beta"), ("beta".to_string(), "beta".to_string()));
+    assert_eq!(plan("alpha", "alpha", "beta"), names("beta", "beta"));
+}
+
+#[test]
+fn a_server_whose_name_is_not_its_registry_entry_is_not_renamed() {
+    assert!(plan("team__alpha", "other", "beta").is_err());
+}
+
+#[test]
+fn the_collision_check_sees_the_namespaced_name() {
+    let (_, new_base) = plan("team__qa__alpha", "alpha", "beta").expect("plan");
+    assert!(
+        picker_session_name_conflicts(["team__qa__alpha", "team__qa__beta"], "team__qa__alpha", &new_base),
+        "team__qa__beta already exists in the list the chooser shows"
+    );
+}
+
+#[test]
+fn the_server_name_is_the_start_of_its_session_info() {
+    assert_eq!(
+        picker_server_session_name("alpha: 2 windows (created Tue Sep 23 10:00:00 2026) (attached)"),
+        Some("alpha")
+    );
+    assert_eq!(picker_server_session_name("no separator"), None);
+    assert_eq!(picker_server_session_name(": 1 windows"), None);
 }
