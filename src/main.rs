@@ -5423,7 +5423,7 @@ fn run_main() -> io::Result<()> {
     // Loop to handle session switching without spawning new processes
     let mut open_picker = start_in_session_chooser;
     let result = loop {
-        let result = run_remote(&mut terminal, &input, l_socket_name.as_deref(), open_picker);
+        let result = run_remote(&mut terminal, &input, open_picker);
         open_picker = false;
         if crate::debug_log::reconnect_log_enabled() {
             crate::debug_log::reconnect_log(&format!(

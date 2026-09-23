@@ -3200,14 +3200,12 @@ pub(crate) fn attached_session_name() -> String {
 pub fn run_remote(
     terminal: &mut Terminal<crate::platform::PsmuxBackend>,
     input: &crate::ssh_input::InputSource,
-    socket_name: Option<&str>,
     start_in_session_chooser: bool,
 ) -> io::Result<()> {
     let mut last_emitted_host_tab_color: Option<String> = None;
     let result = run_remote_attachment(
         terminal,
         input,
-        socket_name,
         start_in_session_chooser,
         &mut last_emitted_host_tab_color,
     );
@@ -3222,7 +3220,6 @@ pub fn run_remote(
 fn run_remote_attachment(
     terminal: &mut Terminal<crate::platform::PsmuxBackend>,
     input: &crate::ssh_input::InputSource,
-    socket_name: Option<&str>,
     start_in_session_chooser: bool,
     // Last Windows Terminal frame/tab colour emitted to the host terminal.
     last_emitted_host_tab_color: &mut Option<String>,
