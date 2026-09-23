@@ -24,8 +24,9 @@ still requires and upstream does not yet provide.
   first frame. The chooser uses the available width, preserves both ends of
   long session names, ends each row with a compact `N windows YYYY.MM.DD HH:MM`
   tail plus `@` only when a client is attached so the name keeps the freed
-  columns, and accents attached rows. `$` renames the highlighted session with
-  collision validation: the server reserves the target name before it changes
+  columns, and accents attached rows. `$` renames the highlighted session within
+  that session's own `-L` namespace, whatever namespace the client was started
+  with, with collision validation: the server reserves the target name before it changes
   its registry, a rename the server acknowledges with a bare `OK` is reported as
   success while real transport failures keep their own message, and the
   terminal caret sits inside the rename dialog at the cell width of the typed

@@ -4503,8 +4503,7 @@ pub fn run_remote(
                                     }
                                     KeyCode::Enter => {
                                         let old_base = picker_rename_target.clone().unwrap_or_default();
-                                        let logical_name = picker_logical_rename_name(socket_name, &picker_rename_buf);
-                                        let new_base = picker_registry_name_for_logical(socket_name, &logical_name);
+                                        let (logical_name, new_base) = picker_rename_plan(&old_base, &picker_rename_buf);
                                         if let Err(reason) = validate_picker_session_name(&logical_name, &new_base) {
                                             picker_rename_error = Some(reason.to_string());
                                         } else {
@@ -9534,6 +9533,19 @@ fn begin_picker_rename(
     PickerRenamePending { old_base, logical_name, new_base, result_rx }
 }
 
+/// The names a picker rename of `old_base` to `entered` works with: the logical
+/// name the server is asked to take, and the registry name it will then be
+/// found under. Both follow the namespace of the server being renamed. The
+/// client's own `-L` is not that namespace when it attached to a namespaced
+/// session by its full registry name; planning with it waited for a name the
+/// server never takes and reported the successful rename as a failure.
+pub(crate) fn picker_rename_plan(old_base: &str, entered: &str) -> (String, String) {
+    let ns = crate::session::session_namespace(old_base);
+    let logical_name = picker_logical_rename_name(ns, entered);
+    let registry_name = picker_registry_name_for_logical(ns, &logical_name);
+    (logical_name, registry_name)
+}
+
 fn picker_logical_rename_name(socket_name: Option<&str>, entered_name: &str) -> String {
     if let Some(socket_name) = socket_name {
         let prefix = format!("{}__", socket_name);
@@ -10009,3 +10021,7 @@ mod test_session_chooser_enter;
 #[cfg(test)]
 #[path = "../tests-rs/test_picker_rename_paste.rs"]
 mod test_picker_rename_paste;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_picker_rename_namespace.rs"]
+mod test_picker_rename_namespace;
