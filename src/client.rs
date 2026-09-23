@@ -800,6 +800,22 @@ fn session_chooser_row_line(
     ])
 }
 
+/// True while the duplicate-paste window opened by an `Event::Paste` is still
+/// running. On Windows crossterm delivers one Ctrl+V as `Event::Paste` AND as
+/// per-character key events; an overlay that took the paste must ignore those
+/// characters until the window closes (issue #290).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn within_paste_suppress_window(until: Option<Instant>, now: Instant) -> bool {
+    until.map_or(false, |t| now < t)
+}
+
+/// Whether a key event types its character into the picker's `$` rename field.
+/// Inside the duplicate-paste window the Event::Paste has already put the text
+/// there; typing the key events too inserted a Ctrl+V twice.
+pub(crate) fn picker_rename_accepts_char(modifiers: KeyModifiers, paste_burst_active: bool) -> bool {
+    !modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active
+}
+
 /// The overlays on screen at one point of a client-loop pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OverlayFlags {
@@ -4469,6 +4485,11 @@ pub fn run_remote(
                         // forward them to the server via overlay-specific commands.
                         if picker_rename_target.is_some() {
                             let rename_in_flight = picker_rename_pending.is_some();
+                            #[cfg(windows)]
+                            let paste_burst_active =
+                                within_paste_suppress_window(paste_suppress_until, Instant::now());
+                            #[cfg(not(windows))]
+                            let paste_burst_active = false;
                             if !rename_in_flight {
                                 match key.code {
                                     KeyCode::Esc => {
@@ -4517,7 +4538,7 @@ pub fn run_remote(
                                             }
                                         }
                                     }
-                                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    KeyCode::Char(c) if picker_rename_accepts_char(key.modifiers, paste_burst_active) => {
                                         picker_rename_buf.push(c);
                                         picker_rename_error = None;
                                     }
@@ -4549,7 +4570,7 @@ pub fn run_remote(
                                             format!("backspace, field now {:?}", picker_rename_buf)
                                         }
                                         KeyCode::Char(_)
-                                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                            if picker_rename_accepts_char(key.modifiers, paste_burst_active) =>
                                         {
                                             format!("accepted, field now {:?}", picker_rename_buf)
                                         }
@@ -5390,7 +5411,7 @@ pub fn run_remote(
                             // into the overlay buffers below.
                             #[cfg(windows)]
                             let paste_burst_active =
-                                paste_suppress_until.map_or(false, |t| Instant::now() < t);
+                                within_paste_suppress_window(paste_suppress_until, Instant::now());
                             #[cfg(not(windows))]
                             let paste_burst_active = false;
                             // tmux `mode_tree_key`: a jump key is not a prompt and
@@ -9984,3 +10005,7 @@ mod test_overlay_caret_frame;
 #[cfg(test)]
 #[path = "../tests-rs/test_session_chooser_enter.rs"]
 mod test_session_chooser_enter;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_picker_rename_paste.rs"]
+mod test_picker_rename_paste;
