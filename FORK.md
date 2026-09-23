@@ -54,9 +54,11 @@ still requires and upstream does not yet provide.
   `scripts/build.ps1` drops upstream's `kill-server -a` and process kills and
   moves only a locked installed binary into a timestamped subdirectory under the
   same filename; `scripts/install-local.ps1` installs a built binary into
-  `~/.local/bin` the same way and updates every installed alias; and
-  `scripts/psmux-binary-update.ps1` owns that move-aside rule, because renaming
-  a running image makes live servers look dead.
+  `~/.local/bin`, moving every installed alias aside the same way before it
+  updates each; and `scripts/psmux-binary-update.ps1` owns that move-aside rule,
+  because renaming a running image makes live servers look dead. A build or
+  copy that fails puts every moved binary back, so psmux never goes missing
+  from PATH.
 
 ## Upstream-owned and excluded behavior
 

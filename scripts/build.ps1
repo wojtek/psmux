@@ -26,20 +26,19 @@ try {
         }
 
         $cargoBinDir = Join-Path $cargoInstallRoot "bin"
-        $movedBinaries = @(Move-PsmuxLockedBinariesAside `
+        # A failed build puts every moved binary back, so psmux stays on PATH.
+        $null = Invoke-PsmuxBinaryReplacement `
             -DestinationDirectory $cargoBinDir `
             -BinaryNames @("psmux.exe", "pmux.exe", "tmux.exe") `
-            -DirectoryPrefix "psmux-build-move-aside")
-        foreach ($movedBinary in $movedBinaries) {
-            Write-Host "[build] Moved locked binary aside without renaming: $($movedBinary.Source) -> $($movedBinary.Destination)" -ForegroundColor Yellow
-        }
-
-        Write-Host "[build] Running cargo install --path ." -ForegroundColor Cyan
-        cargo install --path .
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "cargo install failed (exit $LASTEXITCODE)"
-            exit 1
-        }
+            -DirectoryPrefix "psmux-build-move-aside" `
+            -LogPrefix "[build]" `
+            -Replace {
+                Write-Host "[build] Running cargo install --path ." -ForegroundColor Cyan
+                cargo install --path .
+                if ($LASTEXITCODE -ne 0) {
+                    throw "cargo install failed (exit $LASTEXITCODE)"
+                }
+            }
         Write-Host "[build] cargo install succeeded" -ForegroundColor Green
     }
 

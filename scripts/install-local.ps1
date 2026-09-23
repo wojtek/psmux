@@ -27,20 +27,22 @@ foreach ($aliasName in @("pmux.exe", "tmux.exe")) {
     }
 }
 
-$movedBinaries = @(Move-PsmuxLockedBinariesAside `
+# Every installed alias moves aside first, locked or not, so a failed copy can
+# put each original back instead of leaving psmux missing from PATH. The
+# unlocked ones are pruned by the cleanup below once the install succeeds.
+$null = Invoke-PsmuxBinaryReplacement `
     -DestinationDirectory $destinationDirectory `
     -BinaryNames $binaryNames.ToArray() `
-    -DirectoryPrefix "psmux-install-move-aside")
-
-foreach ($movedBinary in $movedBinaries) {
-    Write-Host "[install-local] Moved locked binary aside without renaming: $($movedBinary.Source) -> $($movedBinary.Destination)" -ForegroundColor Yellow
-}
-
-foreach ($binaryName in $binaryNames) {
-    $installedBinary = Join-Path $destinationDirectory $binaryName
-    Copy-Item -LiteralPath $sourcePath -Destination $installedBinary -Force
-    Write-Host "[install-local] Installed: $installedBinary" -ForegroundColor Green
-}
+    -DirectoryPrefix "psmux-install-move-aside" `
+    -LogPrefix "[install-local]" `
+    -IncludeUnlocked `
+    -Replace {
+        foreach ($binaryName in $binaryNames) {
+            $installedBinary = Join-Path $destinationDirectory $binaryName
+            Copy-Item -LiteralPath $sourcePath -Destination $installedBinary -Force
+            Write-Host "[install-local] Installed: $installedBinary" -ForegroundColor Green
+        }
+    }
 
 $preservedDirectories = @(
     Get-ChildItem -LiteralPath $destinationDirectory -Directory |

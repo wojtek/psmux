@@ -33,7 +33,11 @@ function Move-PsmuxLockedBinariesAside {
         [string[]]$BinaryNames,
 
         [Parameter(Mandatory)]
-        [string]$DirectoryPrefix
+        [string]$DirectoryPrefix,
+
+        # Move every installed binary, not only locked ones, so a failed
+        # replacement can put each original back.
+        [switch]$IncludeUnlocked
     )
 
     $moveAsideDirectory = $null
@@ -44,7 +48,7 @@ function Move-PsmuxLockedBinariesAside {
         if (-not (Test-Path -LiteralPath $installedBinary -PathType Leaf)) {
             continue
         }
-        if (-not (Test-PsmuxBinaryLocked -LiteralPath $installedBinary)) {
+        if (-not $IncludeUnlocked -and -not (Test-PsmuxBinaryLocked -LiteralPath $installedBinary)) {
             continue
         }
 
@@ -63,4 +67,76 @@ function Move-PsmuxLockedBinariesAside {
     }
 
     return $movedBinaries.ToArray()
+}
+
+function Restore-PsmuxMovedBinaries {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$MovedBinaries
+    )
+
+    # Put every moved original back where it was. A file now at the original
+    # path is a partial or unwanted replacement and makes way for it.
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($movedBinary in $MovedBinaries) {
+        try {
+            if (Test-Path -LiteralPath $movedBinary.Source) {
+                Remove-Item -LiteralPath $movedBinary.Source -Force
+            }
+            Move-Item -LiteralPath $movedBinary.Destination -Destination $movedBinary.Source
+        } catch {
+            $failures.Add("$($movedBinary.Destination) -> $($movedBinary.Source): $_")
+        }
+    }
+    if ($failures.Count -gt 0) {
+        throw "could not restore moved psmux binaries: $($failures -join '; ')"
+    }
+}
+
+function Invoke-PsmuxBinaryReplacement {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DestinationDirectory,
+
+        [Parameter(Mandatory)]
+        [string[]]$BinaryNames,
+
+        [Parameter(Mandatory)]
+        [string]$DirectoryPrefix,
+
+        [Parameter(Mandatory)]
+        [string]$LogPrefix,
+
+        # Writes the new binaries into $DestinationDirectory; any failure must throw.
+        [Parameter(Mandatory)]
+        [scriptblock]$Replace,
+
+        [switch]$IncludeUnlocked
+    )
+
+    # Never stops or kills a process: running binaries only change directory.
+    $movedBinaries = @(Move-PsmuxLockedBinariesAside `
+        -DestinationDirectory $DestinationDirectory `
+        -BinaryNames $BinaryNames `
+        -DirectoryPrefix $DirectoryPrefix `
+        -IncludeUnlocked:$IncludeUnlocked)
+    foreach ($movedBinary in $movedBinaries) {
+        Write-Host "$LogPrefix Moved binary aside without renaming: $($movedBinary.Source) -> $($movedBinary.Destination)" -ForegroundColor Yellow
+    }
+
+    # A failure after the move used to leave the originals in the move-aside
+    # directory, so psmux vanished from PATH while its servers kept running.
+    try {
+        & $Replace
+    } catch {
+        $replaceError = $_
+        Write-Host "$LogPrefix Replacement failed; restoring the original binaries" -ForegroundColor Yellow
+        Restore-PsmuxMovedBinaries -MovedBinaries $movedBinaries
+        throw $replaceError
+    }
+
+    return $movedBinaries
 }
