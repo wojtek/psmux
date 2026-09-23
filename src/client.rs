@@ -841,6 +841,45 @@ pub(crate) fn picker_rename_accepts_char(modifiers: KeyModifiers, paste_burst_ac
     !modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active
 }
 
+/// The characters the picker's `$` rename field took in its current key burst,
+/// with the time the last one arrived. Characters closer together than
+/// [`PASTE_DUPLICATE_WINDOW`] belong to one burst.
+pub(crate) type PickerRenameBurst = Option<(String, Instant)>;
+
+/// Take a character key into the picker's `$` rename field.
+pub(crate) fn picker_rename_take_char(field: &mut String, burst: &mut PickerRenameBurst, c: char, now: Instant) {
+    field.push(c);
+    match burst {
+        Some((run, at)) if now.saturating_duration_since(*at) < PASTE_DUPLICATE_WINDOW => {
+            run.push(c);
+            *at = now;
+        }
+        _ => *burst = Some((c.to_string(), now)),
+    }
+}
+
+/// Take an `Event::Paste` into the picker's `$` rename field. Returns whether
+/// the text went in.
+///
+/// Windows can deliver one Ctrl+V as character events AND a late
+/// `Event::Paste` of the same text (upstream d828af2 handles that order for
+/// the pane). A paste that repeats the end of the burst the field just typed,
+/// within [`PASTE_DUPLICATE_WINDOW`], is that same Ctrl+V and is dropped;
+/// appending it doubled the name. The other order, the paste first, is
+/// covered by the duplicate-paste window the `Event::Paste` arm opens.
+pub(crate) fn picker_rename_take_paste(field: &mut String, burst: &mut PickerRenameBurst, data: &str, now: Instant) -> bool {
+    let repeats_burst = burst.take().is_some_and(|(run, at)| {
+        !data.is_empty()
+            && now.saturating_duration_since(at) < PASTE_DUPLICATE_WINDOW
+            && run.ends_with(data)
+    });
+    if repeats_burst {
+        return false;
+    }
+    field.push_str(data);
+    true
+}
+
 /// The overlays on screen at one point of a client-loop pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OverlayFlags {
@@ -3391,6 +3430,7 @@ fn run_remote_attachment(
     // attached-session rename prompt.
     let mut picker_rename_target: Option<String> = None;
     let mut picker_rename_buf = String::new();
+    let mut picker_rename_burst: PickerRenameBurst = None;
     let mut picker_rename_error: Option<String> = None;
     let mut picker_rename_pending: Option<PickerRenamePending> = None;
     // Digit-jump buffer for the customize-mode picker. Customize lives on
@@ -4174,6 +4214,7 @@ fn run_remote_attachment(
                 preview_state_cache.clear();
                 picker_rename_target = None;
                 picker_rename_buf.clear();
+                picker_rename_burst = None;
                 picker_rename_error = None;
             } else if let Err(error) = result {
                 picker_rename_error = Some(error);
@@ -4557,6 +4598,7 @@ fn run_remote_attachment(
                                     KeyCode::Esc => {
                                         picker_rename_target = None;
                                         picker_rename_buf.clear();
+                                        picker_rename_burst = None;
                                         picker_rename_error = None;
                                     }
                                     KeyCode::Backspace => {
@@ -4621,7 +4663,7 @@ fn run_remote_attachment(
                                         }
                                     }
                                     KeyCode::Char(c) if picker_rename_accepts_char(key.modifiers, paste_burst_active) => {
-                                        picker_rename_buf.push(c);
+                                        picker_rename_take_char(&mut picker_rename_buf, &mut picker_rename_burst, c, Instant::now());
                                         picker_rename_error = None;
                                     }
                                     _ => {}
@@ -5568,6 +5610,7 @@ fn run_remote_attachment(
                                             log_picker_rename_request("choose-session", Some(session_name), "");
                                             picker_rename_target = Some(session_name.clone());
                                             picker_rename_buf.clear();
+                                            picker_rename_burst = None;
                                             picker_rename_error = None;
                                         }
                                         None => log_picker_rename_request(
@@ -5699,6 +5742,7 @@ fn run_remote_attachment(
                                             log_picker_rename_request("choose-tree", Some(session_name), "");
                                             picker_rename_target = Some(session_name.clone());
                                             picker_rename_buf.clear();
+                                            picker_rename_burst = None;
                                             picker_rename_error = None;
                                         }
                                         None => log_picker_rename_request(
@@ -6406,8 +6450,13 @@ fn run_remote_attachment(
                         // prompt / rename prompts into the underlying pane.
                         let consumed = if picker_rename_target.is_some() {
                             if picker_rename_pending.is_none() {
-                                picker_rename_buf.push_str(&data);
-                                picker_rename_error = None;
+                                if picker_rename_take_paste(&mut picker_rename_buf, &mut picker_rename_burst, &data, Instant::now()) {
+                                    picker_rename_error = None;
+                                } else if input_log_enabled() {
+                                    input_log("picker-rename", &format!(
+                                        "Event::Paste: dropping duplicate of {} char(s) the field already took as keys",
+                                        data.len()));
+                                }
                             }
                             true
                         } else {
