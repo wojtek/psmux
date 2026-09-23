@@ -4259,9 +4259,11 @@ match cmd {
     }
     _ => {}
 }
-    // Process pending chained commands before reading from socket
+    // Process pending chained commands before reading from socket. The top of
+    // the loop takes the next one; taking it here as well dropped every other
+    // sub-command of a chain with two or more queued.
     if !pending_chain.is_empty() {
-        line = pending_chain.remove(0);
+        line.clear();
         continue;
     }
     // Try to read next command for batching (with timeout)

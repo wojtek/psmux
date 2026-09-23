@@ -10,6 +10,10 @@ still requires and upstream does not yet provide.
   or reinterpreted as targets. Its help routes are side-effect-free, and an
   unknown long option before the operand boundary fails with a literal-input
   hint. `send-keys -R` resets the target pane's parsed terminal state and screen.
+- A command line chained with `;` runs every sub-command once, in order.
+  Upstream's connection loop takes the next queued sub-command at both the
+  bottom and the top of the loop, so with two or more queued it drops every
+  other one; the fork takes each one only at the top.
 - Backspace is encoded as DEL (`0x7f`) consistently with the Windows console and
   SSH input paths. Modified Backspace behavior remains upstream-owned.
 - `kill-server -h`, `kill-server --help`, and `help kill-server` are

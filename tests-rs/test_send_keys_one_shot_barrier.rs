@@ -89,6 +89,20 @@ fn one_shot_send_keys_runs_a_chained_tail() {
     assert_eq!(seen, vec!["keys:hello".to_string(), "session-info".to_string()]);
 }
 
+// Every sub-command of a chain runs, once and in order. The connection loop
+// took the next queued sub-command both at its bottom and again at its top, so
+// with two or more queued, every other one was dropped: here "Y" never reached
+// the pane although the barrier after it still answered.
+#[test]
+fn one_shot_chain_runs_every_sub_command_once() {
+    let (out, seen) = run_one_shot("send-keys -l X ; send-keys -l Y ; session-info\n");
+    assert!(out.contains(BARRIER_REPLY), "the barrier must still answer; got {:?}", out);
+    assert_eq!(
+        seen,
+        vec!["keys:X".to_string(), "keys:Y".to_string(), "session-info".to_string()]
+    );
+}
+
 #[test]
 fn one_shot_send_keys_help_still_answers_without_input() {
     // Guard for the fork's help contract: help is printed, nothing reaches a pane.
