@@ -1808,20 +1808,28 @@ match cmd {
     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
     "send-keys" | "send" => {
+        // Dispatched keys fall through to the loop tail like every other
+        // fire-and-forget command, so a one-shot connection goes on to run a
+        // chained tail and answer send_control's `session-info` execution
+        // barrier. Ending the connection here returned the CLI while the keys
+        // were still queued. Help and a rejected option answer and stop.
         match dispatch_send_keys(&args, &tx) {
             SendKeysDispatchOutcome::Dispatched => {}
             SendKeysDispatchOutcome::Help => {
                 let _ = write!(write_stream, "{}", send_keys_help_text());
                 let _ = write_stream.flush();
+                if !persistent { break; }
+                line.clear();
+                continue;
             }
             SendKeysDispatchOutcome::InvalidLongOption(error) => {
                 let _ = writeln!(write_stream, "psmux: {}", error);
                 let _ = write_stream.flush();
+                if !persistent { break; }
+                line.clear();
+                continue;
             }
         }
-        if !persistent { break; }
-        line.clear();
-        continue;
     }
     "select-pane" | "selectp" => {
         // Detect relative pane targets: -t :.+  or  -t :.-
@@ -5415,6 +5423,10 @@ mod tests_issue476_bindkey_quoting;
 #[cfg(test)]
 #[path = "../../tests-rs/test_send_keys_literal_byte.rs"]
 mod tests_send_keys_literal_byte;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_send_keys_one_shot_barrier.rs"]
+mod tests_send_keys_one_shot_barrier;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_refresh_client_flags.rs"]
