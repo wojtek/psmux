@@ -4205,40 +4205,43 @@ fn run_remote_attachment(
         });
         if let Some(result) = picker_rename_result {
             let pending = picker_rename_pending.take().expect("completed rename is present");
-            if result.is_ok() {
-                for (session_name, info) in &mut session_entries {
-                    if picker_session_names_equal(session_name, &pending.old_base) {
-                        *session_name = pending.new_base.clone();
-                        if let Some(colon) = info.find(':') {
-                            *info = format!("{}{}", pending.logical_name, &info[colon..]);
-                        }
-                    }
-                }
-                for row in tree_all.iter_mut().chain(tree_entries.iter_mut()) {
-                    if picker_session_names_equal(&row.4, &pending.old_base) {
-                        row.4 = pending.new_base.clone();
-                        if row.1 == usize::MAX {
-                            if let Some(colon) = row.3.find(':') {
-                                row.3 = format!("{}{}", pending.logical_name, &row.3[colon..]);
+            match result {
+                Ok(renamed) => {
+                    for (session_name, info) in &mut session_entries {
+                        if picker_session_names_equal(session_name, &pending.old_base) {
+                            *session_name = renamed.new_base.clone();
+                            if let Some(colon) = info.find(':') {
+                                *info = format!("{}{}", renamed.logical_name, &info[colon..]);
                             }
                         }
                     }
+                    for row in tree_all.iter_mut().chain(tree_entries.iter_mut()) {
+                        if picker_session_names_equal(&row.4, &pending.old_base) {
+                            row.4 = renamed.new_base.clone();
+                            if row.1 == usize::MAX {
+                                if let Some(colon) = row.3.find(':') {
+                                    row.3 = format!("{}{}", renamed.logical_name, &row.3[colon..]);
+                                }
+                            }
+                        }
+                    }
+                    if picker_session_names_equal(&current_session, &pending.old_base) {
+                        path = crate::paths::port_file(&renamed.new_base);
+                        current_session = renamed.new_base.clone();
+                        activity_name = Some(renamed.new_base.clone());
+                        env::set_var("PSMUX_SESSION_NAME", &renamed.new_base);
+                        let _ = std::fs::write(&last_path, &renamed.new_base);
+                    }
+                    preview_cache.clear();
+                    preview_state_cache.clear();
+                    picker_rename_target = None;
+                    picker_rename_buf.clear();
+                    picker_rename_gesture.finish();
+                    picker_rename_error = None;
                 }
-                if picker_session_names_equal(&current_session, &pending.old_base) {
-                    path = crate::paths::port_file(&pending.new_base);
-                    current_session = pending.new_base.clone();
-                    activity_name = Some(pending.new_base.clone());
-                    env::set_var("PSMUX_SESSION_NAME", &pending.new_base);
-                    let _ = std::fs::write(&last_path, &pending.new_base);
+                Err(error) => {
+                    picker_rename_error = Some(error);
                 }
-                preview_cache.clear();
-                preview_state_cache.clear();
-                picker_rename_target = None;
-                picker_rename_buf.clear();
-                picker_rename_gesture.finish();
-                picker_rename_error = None;
-            } else if let Err(error) = result {
-                picker_rename_error = Some(error);
             }
             force_dump = true;
         }
@@ -4641,48 +4644,25 @@ fn run_remote_attachment(
                                             .ok()
                                             .and_then(|value| value.trim().parse::<u16>().ok());
                                         let target_key = read_session_key(&old_base).ok();
-                                        // The selected server's own session name
-                                        // decides its namespace; neither the
-                                        // client's -L nor a guess from the
-                                        // registry name can.
-                                        let server_name = match (port, target_key.as_deref()) {
-                                            (Some(port), Some(key)) => crate::session::fetch_session_info(
-                                                &format!("127.0.0.1:{}", port),
-                                                key,
-                                                PICKER_RENAME_PROBE_CONNECT,
-                                                PICKER_RENAME_PROBE_READ,
-                                            )
-                                            .and_then(|info| picker_server_session_name(&info).map(str::to_string)),
-                                            _ => None,
-                                        };
-                                        match (port, target_key, server_name) {
-                                            (Some(port), Some(target_key), Some(server_name)) => {
-                                                match picker_rename_plan(&old_base, &server_name, &picker_rename_buf) {
-                                                    Err(reason) => picker_rename_error = Some(reason),
-                                                    Ok((logical_name, new_base)) => {
-                                                        if let Err(reason) = validate_picker_session_name(&logical_name, &new_base) {
-                                                            picker_rename_error = Some(reason.to_string());
-                                                        } else {
-                                                            let names: Vec<&str> = if session_chooser {
-                                                                session_entries.iter().map(|entry| entry.0.as_str()).collect()
-                                                            } else {
-                                                                tree_all.iter().map(|entry| entry.4.as_str()).collect()
-                                                            };
-                                                            if picker_session_name_conflicts(names, &old_base, &new_base) {
-                                                                picker_rename_error = Some(format!("session '{}' already exists", logical_name));
-                                                            } else {
-                                                                picker_rename_error = None;
-                                                                picker_rename_pending = Some(begin_picker_rename(
-                                                                    old_base,
-                                                                    logical_name,
-                                                                    new_base,
-                                                                    port,
-                                                                    target_key,
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                        match (port, target_key) {
+                                            (Some(port), Some(target_key)) => {
+                                                // The server is asked for its own
+                                                // name, and the rename planned and
+                                                // checked, on the rename worker: Enter
+                                                // does not wait on the network.
+                                                let listed_names: Vec<String> = if session_chooser {
+                                                    session_entries.iter().map(|entry| entry.0.clone()).collect()
+                                                } else {
+                                                    tree_all.iter().map(|entry| entry.4.clone()).collect()
+                                                };
+                                                picker_rename_error = None;
+                                                picker_rename_pending = Some(begin_picker_rename(
+                                                    old_base,
+                                                    picker_rename_buf.clone(),
+                                                    listed_names,
+                                                    port,
+                                                    target_key,
+                                                ));
                                             }
                                             _ => {
                                                 picker_rename_error = Some(format!(
@@ -9592,105 +9572,124 @@ fn log_picker_rename_request(chooser: &str, target: Option<&str>, reason: &str) 
 
 const PICKER_RENAME_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
-struct PickerRenamePending {
-    old_base: String,
+/// A confirmed picker rename: the logical name the server took and the registry
+/// name it is now found under.
+struct PickerRenamed {
     logical_name: String,
     new_base: String,
-    result_rx: std::sync::mpsc::Receiver<Result<(), String>>,
 }
 
+struct PickerRenamePending {
+    old_base: String,
+    result_rx: std::sync::mpsc::Receiver<Result<PickerRenamed, String>>,
+}
+
+/// Start renaming `old_base` to `entered` on a worker. Asking the server for its
+/// own name, planning, validating, the rename and its confirmation all run
+/// there, so Enter never waits on the network; each failure, a validation or
+/// collision error included, comes back through `result_rx`. `listed_names`
+/// are the sessions the chooser shows, for the collision check.
 fn begin_picker_rename(
     old_base: String,
-    logical_name: String,
-    new_base: String,
+    entered: String,
+    listed_names: Vec<String>,
     port: u16,
     session_key: String,
 ) -> PickerRenamePending {
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let worker_old_base = old_base.clone();
-    let worker_logical_name = logical_name.clone();
-    let worker_new_base = new_base.clone();
     std::thread::spawn(move || {
-        let addr = format!("127.0.0.1:{}", port);
-        let command = format!("rename-session {}\n", quote_arg(&worker_logical_name));
-        let response = crate::session::fetch_authed_response_multi_outcome(
-            &addr,
+        let _ = result_tx.send(run_picker_rename(
+            &worker_old_base,
+            &entered,
+            &listed_names,
+            port,
             &session_key,
-            command.as_bytes(),
-            Duration::from_millis(100),
-            Duration::from_millis(300),
-        );
-        let response = match response {
-            crate::session::AuthedResponse::Accepted { payload } => payload,
-            crate::session::AuthedResponse::ServerError(error) => Some(error),
-            crate::session::AuthedResponse::TransportFailure => {
-                let _ = result_tx.send(Err(
-                    "rename request transport or authentication failed before a server response"
-                        .to_string(),
-                ));
-                return;
-            }
-        };
-        if let Some(error) = response
-            .as_deref()
-            .and_then(|response| response.trim().strip_prefix("ERROR:"))
-        {
-            let _ = result_tx.send(Err(error.trim().to_string()));
-            return;
-        }
-
-        let old_path = crate::paths::port_file(&worker_old_base);
-        let new_path = crate::paths::port_file(&worker_new_base);
-        let same_registry_path = picker_session_names_equal(&worker_old_base, &worker_new_base);
-        let expected_port = port.to_string();
-        let logical_info_prefix = format!("{}:", worker_logical_name);
-        let deadline = Instant::now() + PICKER_RENAME_CONFIRM_TIMEOUT;
-        let mut rename_observed = false;
-        while Instant::now() < deadline {
-            let new_port_matches = std::fs::read_to_string(&new_path)
-                .ok()
-                .is_some_and(|value| value.trim() == expected_port);
-            let new_key_matches = read_session_key(&worker_new_base)
-                .ok()
-                .is_some_and(|value| value == session_key);
-            let old_is_gone = same_registry_path || !std::path::Path::new(&old_path).exists();
-            if new_port_matches && new_key_matches && old_is_gone {
-                if !same_registry_path {
-                    rename_observed = true;
-                    break;
-                }
-                let info = crate::session::fetch_authed_response_multi(
-                    &addr,
-                    &session_key,
-                    b"session-info\n",
-                    Duration::from_millis(50),
-                    Duration::from_millis(100),
-                );
-                if info
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with(&logical_info_prefix))
-                {
-                    rename_observed = true;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let result = if rename_observed {
-            Ok(())
-        } else {
-            Err(format!(
-                "rename outcome was not confirmed within {} seconds",
-                PICKER_RENAME_CONFIRM_TIMEOUT.as_secs(),
-            ))
-        };
-        let _ = result_tx.send(result);
+        ));
     });
-
-    PickerRenamePending { old_base, logical_name, new_base, result_rx }
+    PickerRenamePending { old_base, result_rx }
 }
 
-/// How long the rename dialog waits for the selected server to report its own
+fn run_picker_rename(
+    old_base: &str,
+    entered: &str,
+    listed_names: &[String],
+    port: u16,
+    session_key: &str,
+) -> Result<PickerRenamed, String> {
+    let addr = format!("127.0.0.1:{}", port);
+    let (logical_name, new_base) = picker_rename_plan_from_server(&addr, session_key, old_base, entered)?;
+    validate_picker_session_name(&logical_name, &new_base).map_err(str::to_string)?;
+    if picker_session_name_conflicts(listed_names.iter().map(String::as_str), old_base, &new_base) {
+        return Err(format!("session '{}' already exists", logical_name));
+    }
+
+    let command = format!("rename-session {}\n", quote_arg(&logical_name));
+    let response = crate::session::fetch_authed_response_multi_outcome(
+        &addr,
+        session_key,
+        command.as_bytes(),
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    );
+    let response = match response {
+        crate::session::AuthedResponse::Accepted { payload } => payload,
+        crate::session::AuthedResponse::ServerError(error) => Some(error),
+        crate::session::AuthedResponse::TransportFailure => {
+            return Err(
+                "rename request transport or authentication failed before a server response"
+                    .to_string(),
+            );
+        }
+    };
+    if let Some(error) = response
+        .as_deref()
+        .and_then(|response| response.trim().strip_prefix("ERROR:"))
+    {
+        return Err(error.trim().to_string());
+    }
+
+    let old_path = crate::paths::port_file(old_base);
+    let new_path = crate::paths::port_file(&new_base);
+    let same_registry_path = picker_session_names_equal(old_base, &new_base);
+    let expected_port = port.to_string();
+    let logical_info_prefix = format!("{}:", logical_name);
+    let deadline = Instant::now() + PICKER_RENAME_CONFIRM_TIMEOUT;
+    while Instant::now() < deadline {
+        let new_port_matches = std::fs::read_to_string(&new_path)
+            .ok()
+            .is_some_and(|value| value.trim() == expected_port);
+        let new_key_matches = read_session_key(&new_base)
+            .ok()
+            .is_some_and(|value| value == session_key);
+        let old_is_gone = same_registry_path || !std::path::Path::new(&old_path).exists();
+        if new_port_matches && new_key_matches && old_is_gone {
+            if !same_registry_path {
+                return Ok(PickerRenamed { logical_name, new_base });
+            }
+            let info = crate::session::fetch_authed_response_multi(
+                &addr,
+                session_key,
+                b"session-info\n",
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            );
+            if info
+                .as_deref()
+                .is_some_and(|value| value.starts_with(&logical_info_prefix))
+            {
+                return Ok(PickerRenamed { logical_name, new_base });
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "rename outcome was not confirmed within {} seconds",
+        PICKER_RENAME_CONFIRM_TIMEOUT.as_secs(),
+    ))
+}
+
+/// How long the rename worker waits for the selected server to report its own
 /// session name: the connect and read limits the chooser uses when it opens.
 const PICKER_RENAME_PROBE_CONNECT: Duration = Duration::from_millis(50);
 const PICKER_RENAME_PROBE_READ: Duration = Duration::from_millis(250);
@@ -9702,6 +9701,27 @@ pub(crate) fn picker_server_session_name(session_info: &str) -> Option<&str> {
         .split_once(':')
         .map(|(name, _)| name)
         .filter(|name| !name.is_empty())
+}
+
+/// Ask the selected server at `addr` for its own session name, and plan the
+/// rename of `old_base` to `entered` from it.
+pub(crate) fn picker_rename_plan_from_server(
+    addr: &str,
+    session_key: &str,
+    old_base: &str,
+    entered: &str,
+) -> Result<(String, String), String> {
+    let unavailable = || format!("session '{}' is no longer available", old_base);
+    // Exactly as the server wrote it: a name can begin with a space.
+    let info = crate::session::fetch_session_info_exact(
+        addr,
+        session_key,
+        PICKER_RENAME_PROBE_CONNECT,
+        PICKER_RENAME_PROBE_READ,
+    )
+    .ok_or_else(unavailable)?;
+    let server_name = picker_server_session_name(&info).ok_or_else(unavailable)?;
+    picker_rename_plan(old_base, server_name, entered)
 }
 
 /// The names a picker rename of `old_base` to `entered` works with: the logical

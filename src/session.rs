@@ -1885,6 +1885,13 @@ fn open_authed(
 /// Returns `None` on timeout, EOF, empty payload, or `ERROR:` reply.
 /// Returns `Some(line)` on a valid payload (newline trimmed).
 fn read_authed_line<R: std::io::BufRead>(br: &mut R) -> Option<String> {
+    read_authed_line_exact(br).map(|line| line.trim().to_string())
+}
+
+/// [`read_authed_line`] that returns the payload exactly as the server wrote
+/// it, less only its line ending. A session name can begin with a space, and
+/// trimming the whole reply removed it.
+fn read_authed_line_exact<R: std::io::BufRead>(br: &mut R) -> Option<String> {
     // First read: could be either the AUTH ack ("OK") or the payload
     // (if the ack was already pipelined into the same packet).
     let mut line = String::new();
@@ -1904,7 +1911,8 @@ fn read_authed_line<R: std::io::BufRead>(br: &mut R) -> Option<String> {
     if trimmed.is_empty() || trimmed == "OK" || trimmed.starts_with("ERROR:") {
         None
     } else {
-        Some(trimmed.to_string())
+        let payload = line.strip_suffix('\n').unwrap_or(&line);
+        Some(payload.strip_suffix('\r').unwrap_or(payload).to_string())
     }
 }
 
@@ -2023,6 +2031,18 @@ pub fn fetch_session_info(
     read_timeout: Duration,
 ) -> Option<String> {
     fetch_authed_response(addr, key, b"session-info\n", connect_timeout, read_timeout)
+}
+
+/// [`fetch_session_info`] with the reply exactly as the server wrote it, less
+/// its line ending, so a session name that begins with a space keeps it.
+pub(crate) fn fetch_session_info_exact(
+    addr: &str,
+    key: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Option<String> {
+    let mut br = open_authed(addr, key, b"session-info\n", connect_timeout, read_timeout)?;
+    read_authed_line_exact(&mut br)
 }
 
 /// Fan out `fetch_session_info` across many sessions in parallel.

@@ -67,6 +67,62 @@ fn the_collision_check_sees_the_namespaced_name() {
     );
 }
 
+// The server's own name reaches the plan through its session-info reply. A
+// session may be called ` alpha` (the picker allows a leading space), and a
+// reader that trimmed the whole reply turned it into `alpha`, which no longer
+// matched the registry entry, so the rename was refused.
+
+const KEY: &str = "picker-rename-identity-test-key";
+
+/// Plan a rename through a loopback responder that answers the session-info
+/// query with `info_line` the way a psmux server writes it.
+fn plan_through_query(info_line: &str, old_base: &str, entered: &str) -> Result<(String, String), String> {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    let reply = format!("OK\n{}\n", info_line);
+    let responder = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut request = BufReader::new(stream.try_clone().expect("clone"));
+        let (mut auth, mut command) = (String::new(), String::new());
+        request.read_line(&mut auth).expect("auth line");
+        request.read_line(&mut command).expect("command line");
+        assert_eq!(command, "session-info\n");
+        let mut stream = stream;
+        stream.write_all(reply.as_bytes()).expect("reply");
+    });
+    let plan = picker_rename_plan_from_server(&addr, KEY, old_base, entered);
+    responder.join().expect("responder thread");
+    plan
+}
+
+#[test]
+fn a_leading_space_in_the_server_name_survives_the_query() {
+    assert_eq!(
+        plan_through_query(" alpha: 1 windows (created Tue Sep 23 10:00:00 2026)", " alpha", "beta"),
+        names("beta", "beta")
+    );
+}
+
+#[test]
+fn a_namespaced_leading_space_name_survives_the_query() {
+    assert_eq!(
+        plan_through_query(" alpha: 1 windows (created Tue Sep 23 10:00:00 2026)", "team__ alpha", "beta"),
+        names("beta", "team__beta")
+    );
+}
+
+#[test]
+fn the_query_plans_a_compound_namespace() {
+    assert_eq!(
+        plan_through_query("alpha: 2 windows (created Tue Sep 23 10:00:00 2026) (attached)", "team__qa__alpha", "beta"),
+        names("beta", "team__qa__beta")
+    );
+}
+
 #[test]
 fn the_server_name_is_the_start_of_its_session_info() {
     assert_eq!(

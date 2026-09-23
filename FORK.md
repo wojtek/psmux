@@ -29,11 +29,13 @@ still requires and upstream does not yet provide.
   long session names, ends each row with a compact `N windows YYYY.MM.DD HH:MM`
   tail plus `@` only when a client is attached so the name keeps the freed
   columns, and accents attached rows. `$` renames the highlighted session within
-  its own `-L` namespace: before renaming, the client asks that server for its
-  session name and takes the namespace as whatever precedes `__<name>` in the
-  registry name, so a namespace containing `__` and a client started without
-  `-L` both work, and a server whose name does not match its registry entry is
-  not renamed. The rename validates collisions: the server reserves the target name before it changes
+  its own `-L` namespace. The rename runs on a background worker, so Enter never
+  waits on the network: the worker asks that server for its session name,
+  exactly as the server reports it (a leading space included), and takes the
+  namespace as whatever precedes `__<name>` in the registry name, so a namespace
+  containing `__` and a client started without `-L` both work, and a server
+  whose name does not match its registry entry is not renamed. Invalid names and
+  collisions are reported from the worker, and the server reserves the target name before it changes
   its registry, a rename the server acknowledges with a bare `OK` is reported as
   success while real transport failures keep their own message, and the
   terminal caret sits inside the rename dialog at the cell width of the typed
