@@ -841,42 +841,63 @@ pub(crate) fn picker_rename_accepts_char(modifiers: KeyModifiers, paste_burst_ac
     !modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active
 }
 
-/// The characters the picker's `$` rename field took in its current key burst,
-/// with the time the last one arrived. Characters closer together than
-/// [`PASTE_DUPLICATE_WINDOW`] belong to one burst.
-pub(crate) type PickerRenameBurst = Option<(String, Instant)>;
+/// The picker `$` rename field's own record of one Ctrl+V gesture, with the
+/// lifecycle upstream d828af2 gives the pane's `PasteGesture`: the Ctrl+V
+/// Press opens it and the Release closes it. Windows can deliver one Ctrl+V as
+/// the clipboard's character events AND an `Event::Paste`, in either order;
+/// only what arrives while a gesture is open is that gesture's delivery.
+///
+/// It has its own open flag instead of reusing `PasteGesture`, which also
+/// records ordinary typing bursts: a field that let typing count as a delivery
+/// dropped intentional pastes (typing `beta` then pasting `beta` kept one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PickerRenameGesture {
+    /// A Ctrl+V Press opened a gesture its Release has not closed.
+    open: bool,
+    /// The open gesture has already put its text into the field.
+    delivered: bool,
+}
 
-/// Take a character key into the picker's `$` rename field.
-pub(crate) fn picker_rename_take_char(field: &mut String, burst: &mut PickerRenameBurst, c: char, now: Instant) {
-    field.push(c);
-    match burst {
-        Some((run, at)) if now.saturating_duration_since(*at) < PASTE_DUPLICATE_WINDOW => {
-            run.push(c);
-            *at = now;
-        }
-        _ => *burst = Some((c.to_string(), now)),
+impl PickerRenameGesture {
+    /// A Ctrl+V Press while the dialog is open: a new gesture, nothing delivered yet.
+    pub(crate) fn start(&mut self) {
+        *self = PickerRenameGesture { open: true, delivered: false };
+    }
+
+    /// The gesture is over: its Release, an edit, or the dialog opening or closing.
+    pub(crate) fn finish(&mut self) {
+        *self = PickerRenameGesture::default();
     }
 }
 
+/// Take a character key into the picker's `$` rename field.
+pub(crate) fn picker_rename_take_char(field: &mut String, gesture: &mut PickerRenameGesture, c: char) {
+    field.push(c);
+    if gesture.open {
+        gesture.delivered = true;
+    }
+}
+
+/// Backspace in the picker's `$` rename field. An edit ends any gesture, so a
+/// later paste is never judged against text that is no longer there.
+pub(crate) fn picker_rename_backspace(field: &mut String, gesture: &mut PickerRenameGesture) {
+    field.pop();
+    gesture.finish();
+}
+
 /// Take an `Event::Paste` into the picker's `$` rename field. Returns whether
-/// the text went in.
-///
-/// Windows can deliver one Ctrl+V as character events AND a late
-/// `Event::Paste` of the same text (upstream d828af2 handles that order for
-/// the pane). A paste that repeats the end of the burst the field just typed,
-/// within [`PASTE_DUPLICATE_WINDOW`], is that same Ctrl+V and is dropped;
-/// appending it doubled the name. The other order, the paste first, is
-/// covered by the duplicate-paste window the `Event::Paste` arm opens.
-pub(crate) fn picker_rename_take_paste(field: &mut String, burst: &mut PickerRenameBurst, data: &str, now: Instant) -> bool {
-    let repeats_burst = burst.take().is_some_and(|(run, at)| {
-        !data.is_empty()
-            && now.saturating_duration_since(at) < PASTE_DUPLICATE_WINDOW
-            && run.ends_with(data)
-    });
-    if repeats_burst {
+/// the text went in. A paste is dropped only when its own gesture already
+/// delivered the text as characters; outside a gesture, after ordinary typing
+/// or an edit, a paste is always taken. The other order, the paste first, is
+/// covered by the duplicate-paste window the `Event::Paste` arm opens (#290).
+pub(crate) fn picker_rename_take_paste(field: &mut String, gesture: &mut PickerRenameGesture, data: &str) -> bool {
+    if gesture.open && gesture.delivered {
         return false;
     }
     field.push_str(data);
+    if gesture.open {
+        gesture.delivered = true;
+    }
     true
 }
 
@@ -3430,7 +3451,7 @@ fn run_remote_attachment(
     // attached-session rename prompt.
     let mut picker_rename_target: Option<String> = None;
     let mut picker_rename_buf = String::new();
-    let mut picker_rename_burst: PickerRenameBurst = None;
+    let mut picker_rename_gesture = PickerRenameGesture::default();
     let mut picker_rename_error: Option<String> = None;
     let mut picker_rename_pending: Option<PickerRenamePending> = None;
     // Digit-jump buffer for the customize-mode picker. Customize lives on
@@ -4214,7 +4235,7 @@ fn run_remote_attachment(
                 preview_state_cache.clear();
                 picker_rename_target = None;
                 picker_rename_buf.clear();
-                picker_rename_burst = None;
+                picker_rename_gesture.finish();
                 picker_rename_error = None;
             } else if let Err(error) = result {
                 picker_rename_error = Some(error);
@@ -4482,6 +4503,8 @@ fn run_remote_attachment(
                             input_log("paste", &format!("Ctrl+V Release detected, paste_pend len={}", paste_pend.len()));
                         }
                         paste_confirmed = true;
+                        // The Release ends the rename field's gesture too.
+                        picker_rename_gesture.finish();
                     }
                     // ── WezTerm: Shift+Enter arrives as Release-only ──
                     // WezTerm generates only KeyEventKind::Release for Shift+Enter
@@ -4598,12 +4621,19 @@ fn run_remote_attachment(
                                     KeyCode::Esc => {
                                         picker_rename_target = None;
                                         picker_rename_buf.clear();
-                                        picker_rename_burst = None;
+                                        picker_rename_gesture.finish();
                                         picker_rename_error = None;
                                     }
                                     KeyCode::Backspace => {
-                                        picker_rename_buf.pop();
+                                        picker_rename_backspace(&mut picker_rename_buf, &mut picker_rename_gesture);
                                         picker_rename_error = None;
+                                    }
+                                    // A Ctrl+V Press opens the field's paste
+                                    // gesture, as the pane's does (d828af2); the
+                                    // host injects the clipboard behind it.
+                                    #[cfg(windows)]
+                                    KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && paste_detection_enabled => {
+                                        picker_rename_gesture.start();
                                     }
                                     KeyCode::Enter => {
                                         let old_base = picker_rename_target.clone().unwrap_or_default();
@@ -4663,7 +4693,7 @@ fn run_remote_attachment(
                                         }
                                     }
                                     KeyCode::Char(c) if picker_rename_accepts_char(key.modifiers, paste_burst_active) => {
-                                        picker_rename_take_char(&mut picker_rename_buf, &mut picker_rename_burst, c, Instant::now());
+                                        picker_rename_take_char(&mut picker_rename_buf, &mut picker_rename_gesture, c);
                                         picker_rename_error = None;
                                     }
                                     _ => {}
@@ -5610,7 +5640,7 @@ fn run_remote_attachment(
                                             log_picker_rename_request("choose-session", Some(session_name), "");
                                             picker_rename_target = Some(session_name.clone());
                                             picker_rename_buf.clear();
-                                            picker_rename_burst = None;
+                                            picker_rename_gesture.finish();
                                             picker_rename_error = None;
                                         }
                                         None => log_picker_rename_request(
@@ -5742,7 +5772,7 @@ fn run_remote_attachment(
                                             log_picker_rename_request("choose-tree", Some(session_name), "");
                                             picker_rename_target = Some(session_name.clone());
                                             picker_rename_buf.clear();
-                                            picker_rename_burst = None;
+                                            picker_rename_gesture.finish();
                                             picker_rename_error = None;
                                         }
                                         None => log_picker_rename_request(
@@ -6450,7 +6480,7 @@ fn run_remote_attachment(
                         // prompt / rename prompts into the underlying pane.
                         let consumed = if picker_rename_target.is_some() {
                             if picker_rename_pending.is_none() {
-                                if picker_rename_take_paste(&mut picker_rename_buf, &mut picker_rename_burst, &data, Instant::now()) {
+                                if picker_rename_take_paste(&mut picker_rename_buf, &mut picker_rename_gesture, &data) {
                                     picker_rename_error = None;
                                 } else if input_log_enabled() {
                                     input_log("picker-rename", &format!(

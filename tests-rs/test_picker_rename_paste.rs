@@ -1,12 +1,20 @@
-// A Ctrl+V into the picker's `$` rename dialog must insert the clipboard once.
+// A Ctrl+V into the picker's `$` rename dialog must insert the clipboard once,
+// and an intentional paste must always go in.
 //
 // On Windows crossterm delivers one Ctrl+V as an Event::Paste AND as the
-// per-character key events of the same text. The Event::Paste arm puts the
-// text into the rename field and opens the 200 ms duplicate-paste window that
-// every other overlay's character arm honours (issue #290); the rename
-// dialog's arm did not, so the key events typed the text a second time.
+// per-character key events of the same text, in either order. Paste first: the
+// Event::Paste arm puts the text into the rename field and opens the 200 ms
+// duplicate-paste window that every other overlay's character arm honours
+// (issue #290), so the key events that follow are not typed again. Characters
+// first (the ordering upstream d828af2 handles for the pane): the field keeps
+// its own record of the Ctrl+V gesture, opened by the Press and closed by the
+// Release, and a late Event::Paste of a gesture that already delivered its
+// characters is dropped. Ordinary typing and edits open no gesture, so they
+// never suppress a paste; a text/time rule did (typing `beta` then pasting
+// `beta` kept one, and typing `a`, Backspace, pasting `a` left the field empty).
 //
-// These tests pin the two pure decisions; they start no server (see AGENTS.md).
+// These tests drive the field's own functions with the events in the order the
+// dialog receives them; they start no server (see AGENTS.md).
 
 use super::*;
 use std::time::{Duration, Instant};
@@ -30,20 +38,15 @@ fn a_control_chord_is_never_typed() {
     assert!(!picker_rename_accepts_char(KeyModifiers::CONTROL, false));
 }
 
-// The field's text after one Ctrl+V, whichever order Windows delivers it in.
-// When the characters come first and a late Event::Paste repeats them (the
-// ordering upstream d828af2 handles for the pane), the paste used to be
-// appended again, doubling the name.
-
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
 /// Deliver `text` as key events 1 ms apart from `start`, through the same key
 /// predicate and paste window the rename field uses. Returns the time after it.
-fn key_burst(
+fn keys(
     field: &mut String,
-    burst: &mut PickerRenameBurst,
+    gesture: &mut PickerRenameGesture,
     text: &str,
     start: Instant,
     paste_window_until: Option<Instant>,
@@ -51,7 +54,7 @@ fn key_burst(
     let mut now = start;
     for c in text.chars() {
         if picker_rename_accepts_char(KeyModifiers::NONE, within_paste_suppress_window(paste_window_until, now)) {
-            picker_rename_take_char(field, burst, c, now);
+            picker_rename_take_char(field, gesture, c);
         }
         now += ms(1);
     }
@@ -61,9 +64,11 @@ fn key_burst(
 #[test]
 fn characters_then_a_late_event_paste_leave_the_name_once() {
     let t0 = Instant::now();
-    let (mut field, mut burst) = (String::new(), None);
-    let after = key_burst(&mut field, &mut burst, "beta", t0, None);
-    let taken = picker_rename_take_paste(&mut field, &mut burst, "beta", after + ms(20));
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    gesture.start(); // Ctrl+V Press
+    keys(&mut field, &mut gesture, "beta", t0, None);
+    let taken = picker_rename_take_paste(&mut field, &mut gesture, "beta");
+    gesture.finish(); // Ctrl+V Release
     assert_eq!(field, "beta");
     assert!(!taken);
 }
@@ -71,39 +76,72 @@ fn characters_then_a_late_event_paste_leave_the_name_once() {
 #[test]
 fn an_event_paste_then_its_characters_leave_the_name_once() {
     let t0 = Instant::now();
-    let (mut field, mut burst) = (String::new(), None);
-    assert!(picker_rename_take_paste(&mut field, &mut burst, "beta", t0));
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    gesture.start();
+    assert!(picker_rename_take_paste(&mut field, &mut gesture, "beta"));
     // The Event::Paste arm opens the 200 ms duplicate-paste window (#290).
-    key_burst(&mut field, &mut burst, "beta", t0 + ms(5), Some(t0 + ms(200)));
+    keys(&mut field, &mut gesture, "beta", t0 + ms(5), Some(t0 + ms(200)));
+    gesture.finish();
     assert_eq!(field, "beta");
 }
 
 #[test]
-fn a_late_paste_of_a_burst_typed_after_other_text_is_dropped() {
+fn a_gesture_after_other_typing_keeps_the_typing() {
     let t0 = Instant::now();
-    let (mut field, mut burst) = (String::new(), None);
-    key_burst(&mut field, &mut burst, "x", t0, None);
-    let after = key_burst(&mut field, &mut burst, "beta", t0 + ms(400), None);
-    let taken = picker_rename_take_paste(&mut field, &mut burst, "beta", after + ms(20));
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    keys(&mut field, &mut gesture, "x", t0, None);
+    gesture.start();
+    keys(&mut field, &mut gesture, "beta", t0 + ms(20), None);
+    let taken = picker_rename_take_paste(&mut field, &mut gesture, "beta");
+    gesture.finish();
     assert_eq!(field, "xbeta");
     assert!(!taken);
 }
 
 #[test]
-fn a_paste_of_different_text_is_taken() {
+fn typing_a_name_then_pasting_it_keeps_both() {
     let t0 = Instant::now();
-    let (mut field, mut burst) = (String::new(), None);
-    let after = key_burst(&mut field, &mut burst, "ab", t0, None);
-    assert!(picker_rename_take_paste(&mut field, &mut burst, "cd", after + ms(20)));
-    assert_eq!(field, "abcd");
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    keys(&mut field, &mut gesture, "beta", t0, None);
+    // A paste with no Ctrl+V behind it (a terminal's bracketed paste).
+    let taken = picker_rename_take_paste(&mut field, &mut gesture, "beta");
+    assert_eq!(field, "betabeta");
+    assert!(taken);
 }
 
 #[test]
-fn a_repeat_paste_well_after_the_typing_is_taken() {
+fn a_paste_after_backspace_is_taken() {
     let t0 = Instant::now();
-    let (mut field, mut burst) = (String::new(), None);
-    let after = key_burst(&mut field, &mut burst, "beta", t0, None);
-    assert!(picker_rename_take_paste(&mut field, &mut burst, "beta", after + ms(1000)));
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    keys(&mut field, &mut gesture, "a", t0, None);
+    picker_rename_backspace(&mut field, &mut gesture);
+    let taken = picker_rename_take_paste(&mut field, &mut gesture, "a");
+    assert_eq!(field, "a");
+    assert!(taken);
+}
+
+#[test]
+fn backspace_inside_a_gesture_ends_it() {
+    let t0 = Instant::now();
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    gesture.start();
+    keys(&mut field, &mut gesture, "ab", t0, None);
+    picker_rename_backspace(&mut field, &mut gesture);
+    let taken = picker_rename_take_paste(&mut field, &mut gesture, "cd");
+    assert_eq!(field, "acd");
+    assert!(taken);
+}
+
+#[test]
+fn a_second_ctrl_v_pastes_again() {
+    let t0 = Instant::now();
+    let (mut field, mut gesture) = (String::new(), PickerRenameGesture::default());
+    gesture.start();
+    keys(&mut field, &mut gesture, "beta", t0, None);
+    gesture.finish();
+    gesture.start();
+    assert!(picker_rename_take_paste(&mut field, &mut gesture, "beta"));
+    gesture.finish();
     assert_eq!(field, "betabeta");
 }
 
