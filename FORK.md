@@ -10,10 +10,13 @@ still requires and upstream does not yet provide.
   or reinterpreted as targets. Its help routes are side-effect-free, and an
   unknown long option before the operand boundary fails with a literal-input
   hint. `send-keys -R` resets the target pane's parsed terminal state and screen.
-- A command line chained with `;` runs every sub-command once, in order.
-  Upstream's connection loop takes the next queued sub-command at both the
-  bottom and the top of the loop, so with two or more queued it drops every
-  other one; the fork takes each one only at the top.
+- Each queued `;` sub-command is taken from the connection's queue once.
+  Upstream's connection loop takes the next one at both the bottom and the top
+  of the loop, so with two or more queued it drops every other one; the fork
+  takes each only at the top. That is the whole difference: a command that
+  ends a one-shot connection (such as `session-info`) still ends the rest of
+  the chain, and an `if-shell` command run while sub-commands are queued can
+  still be replaced by the next one, as upstream.
 - Backspace is encoded as DEL (`0x7f`) consistently with the Windows console and
   SSH input paths. Modified Backspace behavior remains upstream-owned.
 - `kill-server -h`, `kill-server --help`, and `help kill-server` are
