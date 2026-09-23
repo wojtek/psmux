@@ -250,6 +250,10 @@ fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
     let cmd = toks[0].as_str();
     if cmd != "send" && cmd != "send-keys" { return None; }
     let args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
+    // Only a command the send-keys classifier would execute may become bytes.
+    // Help and a rejected long option have to reach it intact, or a literal
+    // `send -lt %1 --help` would type "--help" into the pane.
+    if classify_send_keys_cli(&args) != SendKeysCliAction::Execute { return None; }
 
     let parsed = parse_send_keys_args(&args);
     if parsed.copy_mode || parsed.paste_mode || parsed.has_repeat || parsed.reset { return None; }
@@ -5443,6 +5447,10 @@ mod tests_send_keys_one_shot_barrier;
 #[cfg(test)]
 #[path = "../../tests-rs/test_send_keys_reset_target.rs"]
 mod tests_send_keys_reset_target;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_send_keys_coalesce_help.rs"]
+mod tests_send_keys_coalesce_help;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_refresh_client_flags.rs"]
