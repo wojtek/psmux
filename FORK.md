@@ -74,7 +74,9 @@ still requires and upstream does not yet provide.
   own, so renaming or moving a running binary cannot make live servers look dead
   and lose their registry entries. Upstream's #650 process-table lookup stays
   underneath; its test for an unsigned `.pid` entry naming another image expects
-  an inconclusive verdict instead of dead.
+  an inconclusive verdict instead of dead. Upstream's stale-port-tax test for a
+  recycled PID likewise records it with a signed entry whose creation time does
+  not match the live process, which is still reaped without a network probe.
 - The post-draw OSC 8 hyperlink overlay is clipped against the frame that was
   just drawn, so a link under the session chooser, the `$` rename dialog or a
   popup is never repainted over it (#361).

@@ -77,16 +77,21 @@ fn dead_pid_anchor_reaps_registry_without_any_network_probe() {
 
 #[cfg(windows)]
 #[test]
-fn pid_recycled_by_unrelated_image_is_reaped_without_probe() {
-    // The current test process is alive but its image is not `psmux.exe`
-    // (cargo test binaries are named psmux-<hash>), which models a PID that
-    // was recycled by an unrelated application after the server died.
+fn recycled_pid_is_reaped_without_probe_when_its_signature_does_not_match() {
+    // Fork identity rule (FORK.md; `pid_anchor_verdict`): the recorded pid:creation pair decides, never the image name.
+    // The current test process is alive, as an unrelated application holding
+    // a dead server's recycled PID would be. The `.pid` body records that PID
+    // with a creation time this process does not have, so the server that
+    // wrote it is provably gone.
     let dir = temp_psmux_dir("pid_anchor_recycled");
     let (port_path, _, _) = write_registry(&dir, "recycled", "54330");
-    fs::write(dir.join("recycled.pid"), std::process::id().to_string()).unwrap();
+    let pid = std::process::id();
+    let live_creation = crate::platform::process_kill::process_creation_time(pid)
+        .expect("the running test process has a creation time");
+    fs::write(dir.join("recycled.pid"), format_pid_file_contents(pid, live_creation - 1)).unwrap();
 
     cleanup_stale_port_files_in_with(&dir, |_, _| {
-        panic!("network probe must not run when the PID belongs to another image");
+        panic!("network probe must not run when the recorded signature does not match");
     });
 
     assert!(!port_path.exists(), "recycled-PID registry must be reaped");
