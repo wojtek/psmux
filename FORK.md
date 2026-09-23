@@ -34,7 +34,8 @@ still requires and upstream does not yet provide.
   chooser and repaints at once; upstream leaves it painted until the next key,
   which then also reaches the pane.
 - The session option `tab-colour` applies a Windows Terminal tab color without
-  rewriting the normal 0-255 text palette and resets it when cleared.
+  rewriting the normal 0-255 text palette and resets it when cleared, when the
+  client switches to a session without one, and when it detaches.
 - Console-backed SSH VT input uses the target server's `escape-time` for pending
   Escape sequences, and translates Ctrl+J, modified Enter, and Escape into Win32
   input records when a Windows pane application such as Codex requests DEC

@@ -118,6 +118,31 @@ fn emit_host_tab_color<W: Write>(
     *last_emitted = current;
 }
 
+/// Clear the tab colour an attachment set on the host terminal when the
+/// attachment ends. The next attachment starts with nothing emitted, so a
+/// colour left behind survived a switch to a session without one, and detach.
+fn release_host_tab_color<W: Write>(
+    out: &mut W,
+    last_emitted: &mut Option<String>,
+    host_colors: &crate::types::HostColors,
+) {
+    if last_emitted.take().is_some_and(|value| !value.trim().is_empty()) {
+        if let Some(sequence) = host_tab_color_sequence(None, host_colors) {
+            let _ = out.write_all(sequence.as_bytes());
+            let _ = out.flush();
+        }
+    }
+}
+
+/// The host palette the tab colour is resolved against.
+fn host_colors_now() -> crate::types::HostColors {
+    crate::types::HOST_COLORS_SPEC
+        .get()
+        .and_then(|spec| spec.as_deref())
+        .map(crate::types::HostColors::from_spec)
+        .unwrap_or_else(crate::types::HostColors::campbell)
+}
+
 /// A floating pane (tmux new-pane) as shipped from the server: position, size,
 /// border style, focus, title, and the pane's rendered rows.
 #[derive(serde::Deserialize, Clone, Default)]
@@ -3154,11 +3179,39 @@ fn open_session_chooser(
     }
 }
 
+/// One attachment of this client to a session. The Windows Terminal tab colour
+/// the attachment set on the host terminal is released when it ends, however it
+/// ends: the next attachment starts from a terminal without one, so switching
+/// to a session with no `tab-colour`, or detaching, does not leave it behind.
 pub fn run_remote(
     terminal: &mut Terminal<crate::platform::PsmuxBackend>,
     input: &crate::ssh_input::InputSource,
     socket_name: Option<&str>,
     start_in_session_chooser: bool,
+) -> io::Result<()> {
+    let mut last_emitted_host_tab_color: Option<String> = None;
+    let result = run_remote_attachment(
+        terminal,
+        input,
+        socket_name,
+        start_in_session_chooser,
+        &mut last_emitted_host_tab_color,
+    );
+    release_host_tab_color(
+        &mut std::io::stdout().lock(),
+        &mut last_emitted_host_tab_color,
+        &host_colors_now(),
+    );
+    result
+}
+
+fn run_remote_attachment(
+    terminal: &mut Terminal<crate::platform::PsmuxBackend>,
+    input: &crate::ssh_input::InputSource,
+    socket_name: Option<&str>,
+    start_in_session_chooser: bool,
+    // Last Windows Terminal frame/tab colour emitted to the host terminal.
+    last_emitted_host_tab_color: &mut Option<String>,
 ) -> io::Result<()> {
     // A client process exists only while a terminal is attached, so hold the
     // 1ms timer period for its whole life. Without it every sub-tick wait in
@@ -3904,8 +3957,6 @@ pub fn run_remote(
     // Last OSC 0 (host terminal title) value emitted to the host terminal.
     // Tracked across iterations so we only re-emit when the title changes.
     let mut last_emitted_host_title: Option<String> = None;
-    // Last Windows Terminal frame/tab colour emitted to the host terminal.
-    let mut last_emitted_host_tab_color: Option<String> = None;
     // Issue #269: last OSC 9;4 (host terminal progress) value emitted.
     // Same debounce pattern as host_title.
     let mut last_emitted_host_progress: Option<String> = None;
@@ -9082,18 +9133,13 @@ pub fn run_remote(
         }
 
         // ── Post-draw: forward Windows Terminal tab colour ────────────
-        if host_tab_color_this_frame != last_emitted_host_tab_color {
-            let host_colors = crate::types::HOST_COLORS_SPEC
-                .get()
-                .and_then(|spec| spec.as_deref())
-                .map(crate::types::HostColors::from_spec)
-                .unwrap_or_else(crate::types::HostColors::campbell);
+        if host_tab_color_this_frame != *last_emitted_host_tab_color {
             let mut out = std::io::stdout().lock();
             emit_host_tab_color(
                 &mut out,
                 host_tab_color_this_frame,
-                &mut last_emitted_host_tab_color,
-                &host_colors,
+                last_emitted_host_tab_color,
+                &host_colors_now(),
             );
         }
 
