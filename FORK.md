@@ -29,7 +29,9 @@ still requires and upstream does not yet provide.
   its registry, a rename the server acknowledges with a bare `OK` is reported as
   success while real transport failures keep their own message, and the
   terminal caret sits inside the rename dialog at the cell width of the typed
-  name.
+  name. Enter on the session the client is already attached to closes the
+  chooser and repaints at once; upstream leaves it painted until the next key,
+  which then also reaches the pane.
 - The session option `tab-colour` applies a Windows Terminal tab color without
   rewriting the normal 0-255 text palette and resets it when cleared.
 - Console-backed SSH VT input uses the target server's `escape-time` for pending

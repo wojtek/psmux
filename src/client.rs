@@ -5500,30 +5500,26 @@ pub fn run_remote(
                                     session_selected = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
                                 }
                                 KeyCode::Enter if session_chooser => {
-                                    let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
-                                    // If the user has typed a number, that wins over the arrow cursor.
-                                    // Buffer is 1-based: "1" → first entry, "12" → twelfth. Out-of-range
-                                    // or unparseable → do nothing (keep buffer so user can Backspace).
-                                    let target_idx: Option<usize> = if session_num_buffer.is_empty() {
-                                        Some(session_selected)
-                                    } else {
-                                        match session_num_buffer.parse::<usize>() {
-                                            Ok(n) if n >= 1 && n <= filtered_indices.len() => Some(n - 1),
-                                            _ => None,
-                                        }
-                                    };
-                                    if let Some(idx) = target_idx.and_then(|i| filtered_indices.get(i).copied()) {
-                                        if let Some((sname, _)) = session_entries.get(idx) {
-                                            if sname != &current_session {
-                                                cmd_batch.push("client-detach\n".into());
-                                                env::set_var("PSMUX_SWITCH_TO", sname);
-                                                quit = true;
-                                            }
-                                            session_chooser = false;
-                                            session_num_buffer.clear();
-                                            session_filter_active = false;
-                                            session_filter.clear();
-                                        }
+                                    let enter = session_chooser_enter(
+                                        &session_entries,
+                                        &session_filter,
+                                        session_selected,
+                                        &session_num_buffer,
+                                        &current_session,
+                                    );
+                                    if let Some(sname) = enter.switch_to {
+                                        cmd_batch.push("client-detach\n".into());
+                                        env::set_var("PSMUX_SWITCH_TO", &sname);
+                                        quit = true;
+                                    }
+                                    if enter.close {
+                                        session_chooser = false;
+                                        session_num_buffer.clear();
+                                        session_filter_active = false;
+                                        session_filter.clear();
+                                    }
+                                    if enter.redraw {
+                                        selection_changed = true;
                                     }
                                 }
                                 KeyCode::Backspace if session_chooser => {
@@ -9335,6 +9331,52 @@ fn session_filter_escape_selection(
     )
 }
 
+/// What Enter in the session chooser does, as the effects the client loop
+/// applies.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionChooserEnter {
+    /// Detach and switch the client to this session.
+    pub(crate) switch_to: Option<String>,
+    /// Close the chooser and drop its number buffer and filter.
+    pub(crate) close: bool,
+    /// Repaint now from the last frame, as Escape does.
+    pub(crate) redraw: bool,
+}
+
+/// Enter in the session chooser. A typed number wins over the arrow cursor
+/// (1-based); an out-of-range number does nothing, so the user can correct it.
+pub(crate) fn session_chooser_enter(
+    entries: &[(String, String)],
+    filter: &str,
+    selected: usize,
+    num_buffer: &str,
+    current_session: &str,
+) -> SessionChooserEnter {
+    let filtered_indices = session_filtered_indices(entries, filter);
+    let target_idx: Option<usize> = if num_buffer.is_empty() {
+        Some(selected)
+    } else {
+        match num_buffer.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= filtered_indices.len() => Some(n - 1),
+            _ => None,
+        }
+    };
+    let Some((name, _)) = target_idx
+        .and_then(|i| filtered_indices.get(i).copied())
+        .and_then(|idx| entries.get(idx))
+    else {
+        return SessionChooserEnter::default();
+    };
+    if name != current_session {
+        SessionChooserEnter { switch_to: Some(name.clone()), close: true, redraw: false }
+    } else {
+        // Closing in place changes nothing on the server, so no frame will
+        // come to take the chooser off the screen. Without the repaint it
+        // stayed painted until the next key, which also reached the pane.
+        SessionChooserEnter { switch_to: None, close: true, redraw: true }
+    }
+}
+
 fn picker_session_name_conflicts<'a, I>(
     existing_names: I,
     current_name: &str,
@@ -9938,3 +9980,7 @@ mod test_host_tab_color;
 #[cfg(test)]
 #[path = "../tests-rs/test_overlay_caret_frame.rs"]
 mod test_overlay_caret_frame;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_session_chooser_enter.rs"]
+mod test_session_chooser_enter;
