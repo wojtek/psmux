@@ -1,10 +1,9 @@
-$ErrorActionPreference = "Continue"
-
 param(
     [string]$PsmuxExe = $env:PSMUX_EXE,
     [string]$Pattern = "test_*.ps1",
     [switch]$FailFast
 )
+$ErrorActionPreference = "Continue"
 
 function Resolve-PsmuxExe {
     param([string]$PreferredPath)

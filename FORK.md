@@ -27,6 +27,10 @@ still requires and upstream does not yet provide.
 - The PowerShell Claude shim composes psmux teammate-mode behavior with an
   existing profile-defined `claude` function instead of replacing the owner's
   default flags.
+- The integration runner `tests/run_all_integration.ps1` declares its `param`
+  block first, so CI's full integration job actually binds `-Pattern` and runs
+  the suite. Upstream puts a statement before `param(`, matches no tests and
+  reports success.
 - `psmux pick` attaches from a normal shell and opens `choose-session` on its
   first frame. The chooser uses the available width, preserves both ends of
   long session names, ends each row with a compact `N windows YYYY.MM.DD HH:MM`
