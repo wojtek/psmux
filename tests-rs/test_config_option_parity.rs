@@ -114,6 +114,7 @@ fn non_default_value(name: &str) -> Option<&'static str> {
         "pane-border-hover-style" => "fg=cyan",
         "message-limit" => "77",
         "history-file-limit" => "88",
+        "tab-colour" => "#336699",
         other => panic!(
             "option '{}' has no sweep value: add one to non_default_value so the \
              config/runtime parity sweep covers it",
