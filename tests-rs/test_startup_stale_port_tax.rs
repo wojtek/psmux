@@ -41,25 +41,17 @@ fn write_registry(dir: &std::path::Path, session: &str, port: &str) -> (PathBuf,
     (port_path, key_path, sid_path)
 }
 
-/// Spawn a short-lived real process and return the signed `.pid` body
-/// (`pid:creation`) a hard-killed session server leaves behind, after that
-/// process has exited. The creation time is read while `child` still holds the
-/// process handle, so it belongs to this process. Once the handle is dropped
-/// Windows may give the PID to another program; under the fork's identity rule
-/// (FORK.md) only the recorded pid:creation pair proves a server dead, so a
-/// bare PID taken over by another image would be inconclusive and probed.
+/// The signed `.pid` body (`pid:creation`) of a server that is certainly gone.
+/// Windows assigns PIDs far below this value, so no process, running, exiting
+/// or recycled, can hold it. An exited child's real PID is not deterministic on
+/// a busy CI runner: the process table can still list it, or a protected
+/// process can take it over, while it cannot be opened. Under the fork's
+/// identity rule (FORK.md) that is inconclusive and runs the network probe
+/// these tests forbid.
 #[cfg(windows)]
 fn dead_pid_anchor() -> String {
-    let mut child = std::process::Command::new("cmd")
-        .args(["/c", "exit"])
-        .spawn()
-        .expect("spawn cmd");
-    let pid = child.id();
-    let _ = child.wait();
-    let creation = crate::platform::process_kill::process_creation_time(pid)
-        .expect("an exited child keeps its creation time while its handle is open");
-    drop(child);
-    format_pid_file_contents(pid, creation)
+    const NEVER_ASSIGNED_PID: u32 = 0xFFFF_FFFC;
+    format_pid_file_contents(NEVER_ASSIGNED_PID, 1)
 }
 
 #[cfg(windows)]
