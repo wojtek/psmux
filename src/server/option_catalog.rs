@@ -202,7 +202,7 @@ const UNVALIDATED_CHOICE: OptionType = Choice(Unvalidated);
 
 pub static OPTION_CATALOG: &[OptionDef] = &[
     // ── Server options ──
-    OptionDef { name: "escape-time", scope: Server, option_type: Number(U64), default: "500", description: "Time in ms to wait for escape sequence" },
+    OptionDef { name: "escape-time", scope: Server, option_type: Number(U64), default: "500", description: "Time in ms to wait for an escape sequence; larger values tolerate SSH jitter but delay a standalone Escape key" },
     OptionDef { name: "focus-events", scope: Server, option_type: Boolean, default: "off", description: "Send focus events to applications" },
     OptionDef { name: "bold-is-bright", scope: Server, option_type: Boolean, default: "on", description: "Rewrite crossterm's 256-indexed basic colors to standard SGR so the terminal applies bold-is-bright (issue #425); off keeps explicit 256-indexed low colors byte-accurate" },
     OptionDef { name: "history-limit", scope: Server, option_type: Number(Usize), default: "2000", description: "Maximum scrollback lines per pane" },

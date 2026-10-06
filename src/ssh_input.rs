@@ -531,7 +531,7 @@ pub fn keepalive_reasserts_mouse_input() -> bool {
 ///
 /// # Usage
 /// ```ignore
-/// let input = InputSource::new(is_ssh)?;
+/// let input = InputSource::new(is_ssh, escape_timeout)?;
 /// loop {
 ///     if let Some(evt) = input.read_timeout(Duration::from_millis(50))? {
 ///         match evt { /* … */ }
@@ -1020,6 +1020,28 @@ pub mod frame_wake {
     pub fn signal() {}
 }
 
+/// The escape-time, in milliseconds, the console VT reader waits before it
+/// treats a lone ESC as the Escape key: the attached session's `escape-time`.
+/// Clones share one value, so the client can hand the running reader a new
+/// session's option when it switches; the reader used to keep a copy of the
+/// first session's value for the life of the client.
+#[derive(Clone, Debug)]
+pub struct EscapeTimeout(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl EscapeTimeout {
+    pub fn new(ms: u32) -> Self {
+        EscapeTimeout(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(ms)))
+    }
+
+    pub fn set(&self, ms: u32) {
+        self.0.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub enum InputSource {
     /// Local terminal — delegates to `crossterm::event`.
     Crossterm {
@@ -1048,14 +1070,20 @@ impl InputSource {
     /// When `ssh == true` **and** running on Windows, spawns the SSH VT reader
     /// thread with raw console input.  Otherwise wraps `crossterm::event`
     /// with zero overhead.
-    pub fn new(ssh: bool) -> io::Result<Self> {
+    pub fn new(ssh: bool, escape_timeout: Option<EscapeTimeout>) -> io::Result<Self> {
         if !ssh {
             return Ok(InputSource::crossterm());
         }
 
         #[cfg(windows)]
         {
-            match start_ssh_reader() {
+            let escape_timeout = escape_timeout.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSH VT input requires the server's escape-time option",
+                )
+            })?;
+            match start_ssh_reader(escape_timeout) {
                 Ok(rx) => Ok(InputSource::Ssh { rx }),
                 Err(e) => {
                     // Log to file instead of stderr (raw mode garbles eprintln).
@@ -1069,6 +1097,7 @@ impl InputSource {
         {
             // On Unix, crossterm already reads raw VT bytes and handles mouse.
             let _ = ssh;
+            let _ = escape_timeout;
             Ok(InputSource::crossterm())
         }
     }
@@ -2477,7 +2506,7 @@ fn ssh_verbose() -> bool {
 // ─── Windows: SSH reader thread + Win32 FFI ──────────────────────────────────
 
 #[cfg(windows)]
-fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
+fn start_ssh_reader(escape_timeout: EscapeTimeout) -> io::Result<std::sync::mpsc::Receiver<Event>> {
     use std::ffi::c_void;
     use std::sync::mpsc;
 
@@ -2714,9 +2743,6 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
             let mut records: Vec<INPUT_RECORD> = Vec::with_capacity(64);
             records.resize_with(64, || unsafe { std::mem::zeroed() });
 
-            // Escape-timeout: 50 ms matches tmux's default.
-            const ESC_TIMEOUT_MS: u32 = 50;
-
             let mut alive = true;
             let verbose = ssh_verbose();
             let mut total_records: u64 = 0;
@@ -2732,7 +2758,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // Dynamic timeout: short when the parser has a pending Esc
                 // or is inside a paste (need to detect stale paste quickly).
                 let wait_ms = if parser.has_pending_escape() {
-                    ESC_TIMEOUT_MS
+                    escape_timeout.get()
                 } else if parser.is_in_paste() || parser.state == PS::PasteDrain {
                     200 // check paste timeout / drain expiry frequently
                 } else {
@@ -2896,7 +2922,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // After processing all records from this batch, flush any
                 // pending escape if no more input is immediately available.
                 if parser.has_pending_escape() {
-                    let peek_wait = unsafe { WaitForSingleObject(handle, ESC_TIMEOUT_MS) };
+                    let peek_wait = unsafe { WaitForSingleObject(handle, escape_timeout.get()) };
                     if peek_wait == WAIT_TIMEOUT {
                         parser.flush_escape(&mut |evt| {
                             if tx.send(evt).is_err() { alive = false; }
