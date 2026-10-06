@@ -3798,6 +3798,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 combined_buf.push_str("\"}");
                             }
                         }
+                        // tab-colour: forward the configured colour so the client
+                        // can update its host terminal after drawing the frame.
+                        if !app.tab_colour.is_empty() && combined_buf.ends_with('}') {
+                            combined_buf.pop();
+                            combined_buf.push_str(",\"host_tab_color\":\"");
+                            combined_buf.push_str(&json_escape_string(&app.tab_colour));
+                            combined_buf.push_str("\"}");
+                        }
                         // Issue #269: forward OSC 9;4 progress from the active
                         // pane so the client emits the same sequence to the
                         // host terminal (Windows Terminal taskbar/tab progress).
@@ -5827,6 +5835,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if !app.set_titles_string.is_empty() {
                         output.push_str(&format!("set-titles-string \"{}\"\n", app.set_titles_string));
                     }
+                    output.push_str(&format!("tab-colour \"{}\"\n", app.tab_colour));
                     output.push_str(&format!(
                         "prediction-dimming {}\n",
                         if app.prediction_dimming { "on" } else { "off" }
@@ -8289,6 +8298,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         combined_buf.push_str(&json_escape_string(title));
                         combined_buf.push_str("\"}");
                     }
+                }
+                // tab-colour: forward the configured colour to the client.
+                if !app.tab_colour.is_empty() && combined_buf.ends_with('}') {
+                    combined_buf.pop();
+                    combined_buf.push_str(",\"host_tab_color\":\"");
+                    combined_buf.push_str(&json_escape_string(&app.tab_colour));
+                    combined_buf.push_str("\"}");
                 }
                 // Issue #269: forward OSC 9;4 progress from the active pane.
                 if combined_buf.ends_with('}') {

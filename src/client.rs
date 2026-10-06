@@ -15,7 +15,7 @@ use crate::rendering::{
     BorderGeometry, centered_rect, dim_color, dim_predictions_enabled,
     fix_border_intersections,
 };
-use crate::style::{map_color, parse_tmux_style_components};
+use crate::style::{map_color, parse_tmux_color, parse_tmux_style_components};
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::clipboard::{copy_to_system_clipboard, read_from_system_clipboard};
 use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled,
@@ -23,6 +23,125 @@ use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enab
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
 use crate::pane_border::PaneBorderIndicators;
+
+const WINDOWS_TERMINAL_FRAME_FG_INDEX: u16 = 263;
+const WINDOWS_TERMINAL_FRAME_BG_INDEX: u16 = 264;
+const WINDOWS_TERMINAL_TAB_COLOR_INDEX: u16 = 264;
+
+fn indexed_tab_color_rgb(index: u8, host_colors: &crate::types::HostColors) -> (u8, u8, u8) {
+    if index < 16 {
+        return host_colors.palette[index as usize]
+            .or_else(|| crate::types::HostColors::campbell().palette[index as usize])
+            .expect("Campbell defines all 16 ANSI palette entries");
+    }
+    if index < 232 {
+        const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+        let offset = index - 16;
+        return (
+            CUBE[(offset / 36) as usize],
+            CUBE[((offset % 36) / 6) as usize],
+            CUBE[(offset % 6) as usize],
+        );
+    }
+    let gray = 8 + (index - 232) * 10;
+    (gray, gray, gray)
+}
+
+fn tab_color_rgb(value: &str, host_colors: &crate::types::HostColors) -> Option<(u8, u8, u8)> {
+    let color = parse_tmux_color(value)?;
+    let index = match color {
+        Color::Rgb(r, g, b) => return Some((r, g, b)),
+        Color::Indexed(index) => return Some(indexed_tab_color_rgb(index, host_colors)),
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Reset => return None,
+    };
+    Some(indexed_tab_color_rgb(index, host_colors))
+}
+
+fn host_tab_color_sequence(value: Option<&str>, host_colors: &crate::types::HostColors) -> Option<String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Some(format!(
+            "\x1b]104;{}\x1b\\\x1b[2;{};{},|",
+            WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+            WINDOWS_TERMINAL_FRAME_FG_INDEX,
+            WINDOWS_TERMINAL_FRAME_BG_INDEX,
+        ));
+    };
+    if matches!(parse_tmux_color(value), Some(Color::Reset)) {
+        return Some(format!(
+            "\x1b]104;{}\x1b\\\x1b[2;{};{},|",
+            WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+            WINDOWS_TERMINAL_FRAME_FG_INDEX,
+            WINDOWS_TERMINAL_FRAME_BG_INDEX,
+        ));
+    }
+    let (r, g, b) = tab_color_rgb(value, host_colors)?;
+    Some(format!(
+        "\x1b]4;{};rgb:{:02x}/{:02x}/{:02x}\x1b\\\x1b[2;{};{},|",
+        WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+        r,
+        g,
+        b,
+        WINDOWS_TERMINAL_FRAME_FG_INDEX,
+        WINDOWS_TERMINAL_TAB_COLOR_INDEX,
+    ))
+}
+
+fn emit_host_tab_color<W: Write>(
+    out: &mut W,
+    current: Option<String>,
+    last_emitted: &mut Option<String>,
+    host_colors: &crate::types::HostColors,
+) {
+    if current == *last_emitted {
+        return;
+    }
+    if let Some(sequence) = host_tab_color_sequence(current.as_deref(), host_colors) {
+        let _ = out.write_all(sequence.as_bytes());
+        let _ = out.flush();
+    }
+    *last_emitted = current;
+}
+
+/// Clear the tab colour an attachment set on the host terminal when the
+/// attachment ends. The next attachment starts with nothing emitted, so a
+/// colour left behind survived a switch to a session without one, and detach.
+fn release_host_tab_color<W: Write>(
+    out: &mut W,
+    last_emitted: &mut Option<String>,
+    host_colors: &crate::types::HostColors,
+) {
+    if last_emitted.take().is_some_and(|value| !value.trim().is_empty()) {
+        if let Some(sequence) = host_tab_color_sequence(None, host_colors) {
+            let _ = out.write_all(sequence.as_bytes());
+            let _ = out.flush();
+        }
+    }
+}
+
+/// The host palette the tab colour is resolved against.
+fn host_colors_now() -> crate::types::HostColors {
+    crate::types::HOST_COLORS_SPEC
+        .get()
+        .and_then(|spec| spec.as_deref())
+        .map(crate::types::HostColors::from_spec)
+        .unwrap_or_else(crate::types::HostColors::campbell)
+}
 
 /// A floating pane (tmux new-pane) as shipped from the server: position, size,
 /// border style, focus, title, and the pane's rendered rows.
@@ -3236,10 +3355,36 @@ pub(crate) fn attached_session_name() -> String {
     attached_session_name_from(|key| env::var(key).ok())
 }
 
+/// One attachment of this client to a session. The Windows Terminal tab colour
+/// the attachment set on the host terminal is released when it ends, however it
+/// ends: the next attachment starts from a terminal without one, so switching
+/// to a session with no `tab-colour`, or detaching, does not leave it behind.
 pub fn run_remote(
     terminal: &mut Terminal<crate::platform::PsmuxBackend>,
     input: &crate::ssh_input::InputSource,
     start_in_session_chooser: bool,
+) -> io::Result<()> {
+    let mut last_emitted_host_tab_color: Option<String> = None;
+    let result = run_remote_attachment(
+        terminal,
+        input,
+        start_in_session_chooser,
+        &mut last_emitted_host_tab_color,
+    );
+    release_host_tab_color(
+        &mut std::io::stdout().lock(),
+        &mut last_emitted_host_tab_color,
+        &host_colors_now(),
+    );
+    result
+}
+
+fn run_remote_attachment(
+    terminal: &mut Terminal<crate::platform::PsmuxBackend>,
+    input: &crate::ssh_input::InputSource,
+    start_in_session_chooser: bool,
+    // Last Windows Terminal frame/tab colour emitted to the host terminal.
+    last_emitted_host_tab_color: &mut Option<String>,
 ) -> io::Result<()> {
     // A client process exists only while a terminal is attached, so hold the
     // 1ms timer period for its whole life. Without it every sub-tick wait in
@@ -3845,6 +3990,10 @@ pub fn run_remote(
         /// iTerm2, etc.) follow the active pane / window title.
         #[serde(default)]
         host_title: Option<String>,
+        /// Session tab colour forwarded by the server. The client emits the
+        /// Windows Terminal frame-colour sequences after drawing.
+        #[serde(default)]
+        host_tab_color: Option<String>,
         /// Issue #269: OSC 9;4 progress indicator from the active pane,
         /// formatted as "<state>;<value>".  Client emits OSC 9;4 to its host
         /// terminal so apps inside a pane (Copilot CLI, build tools) keep
@@ -7790,6 +7939,7 @@ pub fn run_remote(
         // new OSC 0 sequence if it has changed.  Stored as a local so
         // it survives `state` being moved into its other fields below.
         let host_title_this_frame: Option<String> = state.host_title.clone();
+        let host_tab_color_this_frame: Option<String> = state.host_tab_color.clone();
         // Issue #269: capture host_progress for post-draw OSC 9;4 emit.
         let host_progress_this_frame: Option<String> = state.host_progress.clone();
 
@@ -9558,6 +9708,17 @@ pub fn run_remote(
                 let _ = out.flush();
             }
             last_emitted_host_title = host_title_this_frame;
+        }
+
+        // ── Post-draw: forward Windows Terminal tab colour ────────────
+        if host_tab_color_this_frame != *last_emitted_host_tab_color {
+            let mut out = std::io::stdout().lock();
+            emit_host_tab_color(
+                &mut out,
+                host_tab_color_this_frame,
+                last_emitted_host_tab_color,
+                &host_colors_now(),
+            );
         }
 
         // ── Post-draw: forward OSC 9;4 progress (issue #269) ─────────

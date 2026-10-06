@@ -260,6 +260,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "renumber-windows", scope: Session, option_type: Boolean, default: "off", description: "Renumber windows on close" },
     OptionDef { name: "set-titles", scope: Session, option_type: Boolean, default: "off", description: "Set terminal title" },
     OptionDef { name: "set-titles-string", scope: Session, option_type: OptionType::String, default: "#S:#I:#W", description: "Terminal title format string" },
+    OptionDef { name: "tab-colour", scope: Session, option_type: OptionType::String, default: "", description: "Windows Terminal tab colour" },
     OptionDef { name: "word-separators", scope: Session, option_type: OptionType::String, default: " -_@", description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: Session, option_type: UNVALIDATED_CHOICE, default: "off", description: "Allow passthrough escape sequences" },
     OptionDef { name: "allow-rename", scope: Session, option_type: Boolean, default: "on", description: "Allow programs to rename windows" },

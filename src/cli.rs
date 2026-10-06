@@ -921,6 +921,7 @@ SET OPTIONS (use with: set -g <option> <value>):
     aggressive-resize   Bool Resize to smallest client (default: off)
     set-titles          Bool Update terminal title (default: off)
     set-titles-string   Str  Terminal title format
+    tab-colour          Str  Windows Terminal tab colour (empty clears it)
     default-shell       Str  Shell to launch (default: pwsh)
     default-command     Str  Alias for default-shell
     word-separators     Str  Copy-mode word delimiters (default: " -_@")
