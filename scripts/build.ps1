@@ -11,39 +11,35 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoDir = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "psmux-binary-update.ps1")
 
 Push-Location $repoDir
 try {
-    # ── Kill old instances ────────────────────────────────────────────
-    Write-Host "[build] Killing old psmux instances..." -ForegroundColor Cyan
-    $existing = Get-Command psmux -ErrorAction SilentlyContinue
-    if ($existing) {
-        # -a: a build has to free the binary in EVERY namespace, and a bare
-        # kill-server is scoped to the default one since #649.
-        & psmux kill-server -a 2>$null
-    }
-    foreach ($name in @("psmux", "pmux", "tmux")) {
-        Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 1
-
     # ── Cargo install ─────────────────────────────────────────────────
     if (-not $SetupOnly) {
-        Write-Host "[build] Running cargo install --path ." -ForegroundColor Cyan
-        cargo install --path .
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "cargo install failed (exit $LASTEXITCODE)"
-            exit 1
+        if ($env:CARGO_INSTALL_ROOT) {
+            $cargoInstallRoot = $env:CARGO_INSTALL_ROOT
+        } elseif ($env:CARGO_HOME) {
+            $cargoInstallRoot = $env:CARGO_HOME
+        } else {
+            $cargoInstallRoot = Join-Path $HOME ".cargo"
         }
-        Write-Host "[build] cargo install succeeded" -ForegroundColor Green
 
-        # ── Pre-spawn warm server ─────────────────────────────────────────
-        # build.ps1 kills all psmux processes at the top, which destroys the
-        # background __warm__ server.  Call warmup now so the next `psmux`
-        # invocation claims the pre-warmed server instead of cold-starting.
-        Write-Host "[build] Pre-spawning warm server (psmux warmup)..." -ForegroundColor Cyan
-        & psmux warmup 2>$null
-        Write-Host "[build] Warm server pre-spawned" -ForegroundColor Green
+        $cargoBinDir = Join-Path $cargoInstallRoot "bin"
+        # A failed build puts every moved binary back, so psmux stays on PATH.
+        $null = Invoke-PsmuxBinaryReplacement `
+            -DestinationDirectory $cargoBinDir `
+            -BinaryNames @("psmux.exe", "pmux.exe", "tmux.exe") `
+            -DirectoryPrefix "psmux-build-move-aside" `
+            -LogPrefix "[build]" `
+            -Replace {
+                Write-Host "[build] Running cargo install --path ." -ForegroundColor Cyan
+                cargo install --path .
+                if ($LASTEXITCODE -ne 0) {
+                    throw "cargo install failed (exit $LASTEXITCODE)"
+                }
+            }
+        Write-Host "[build] cargo install succeeded" -ForegroundColor Green
     }
 
     # ── NSIS installer ────────────────────────────────────────────────
