@@ -41,18 +41,25 @@ fn write_registry(dir: &std::path::Path, session: &str, port: &str) -> (PathBuf,
     (port_path, key_path, sid_path)
 }
 
-/// Spawn a short-lived real process and return its PID after it has exited.
-/// This produces a PID that is genuinely dead (not fabricated), matching what
-/// a hard-killed session server leaves behind in its .pid file.
+/// Spawn a short-lived real process and return the signed `.pid` body
+/// (`pid:creation`) a hard-killed session server leaves behind, after that
+/// process has exited. The creation time is read while `child` still holds the
+/// process handle, so it belongs to this process. Once the handle is dropped
+/// Windows may give the PID to another program; under the fork's identity rule
+/// (FORK.md) only the recorded pid:creation pair proves a server dead, so a
+/// bare PID taken over by another image would be inconclusive and probed.
 #[cfg(windows)]
-fn dead_pid() -> u32 {
+fn dead_pid_anchor() -> String {
     let mut child = std::process::Command::new("cmd")
         .args(["/c", "exit"])
         .spawn()
         .expect("spawn cmd");
     let pid = child.id();
     let _ = child.wait();
-    pid
+    let creation = crate::platform::process_kill::process_creation_time(pid)
+        .expect("an exited child keeps its creation time while its handle is open");
+    drop(child);
+    format_pid_file_contents(pid, creation)
 }
 
 #[cfg(windows)]
@@ -61,7 +68,7 @@ fn dead_pid_anchor_reaps_registry_without_any_network_probe() {
     let dir = temp_psmux_dir("pid_anchor_dead");
     let (port_path, key_path, sid_path) = write_registry(&dir, "crashed", "54329");
     let pid_path = dir.join("crashed.pid");
-    fs::write(&pid_path, dead_pid().to_string()).unwrap();
+    fs::write(&pid_path, dead_pid_anchor()).unwrap();
 
     // The probe must never run: a dead .pid anchor is definitive on its own.
     cleanup_stale_port_files_in_with(&dir, |_, _| {
@@ -142,10 +149,10 @@ fn cleanup_with_many_dead_pid_registries_is_fast() {
     // With the PID anchor, even 6 dead registries must clean up in well under
     // the cost of a single 100ms probe attempt.
     let dir = temp_psmux_dir("pid_anchor_speed");
-    let dead = dead_pid();
+    let dead = dead_pid_anchor();
     for i in 0..6 {
         write_registry(&dir, &format!("dead{i}"), &format!("5430{i}"));
-        fs::write(dir.join(format!("dead{i}.pid")), dead.to_string()).unwrap();
+        fs::write(dir.join(format!("dead{i}.pid")), &dead).unwrap();
     }
 
     let start = Instant::now();
