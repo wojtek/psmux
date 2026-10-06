@@ -2186,12 +2186,6 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
     // Prevent MSYS2/Git-Bash from path-mangling the TMUX value (which starts
     // with /tmp/ and would be rewritten to a Windows path otherwise).
     builder.env("MSYS2_ENV_CONV_EXCL", "TMUX");
-    // Enable Claude Code agent teams feature.  The standalone binary gates
-    // the entire teammate tool-set (spawnTeam, spawnTeammate, …) behind
-    //   T8(): LA(process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) || --agent-teams
-    // Without this env var the team tools are never registered and Claude
-    // always falls back to the in-process "Agent" tool.
-    builder.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
 
     // ── Claude Code workarounds (removable once upstream fixes land) ──
     //
@@ -2289,12 +2283,17 @@ const ENV_SHIM_PS: &str = concat!(
     // .claude/settings(.local).json found by walking up from the CWD at call
     // time.  Disable entirely with: set -g claude-code-fix-tty off
     //
-    // The real claude command is resolved at call time via Get-Command instead
-    // of hardcoding claude.exe, because npm/nvm4w installs ship only claude.cmd
-    // and claude.ps1 with no exe (psmux#475).  The CommandType filter
-    // (Application = .exe/.cmd, ExternalScript = .ps1) excludes this wrapper
-    // function itself, so there is no self-recursion.
+    // A profile-defined claude function may add the user's own default flags.
+    // Capture its ScriptBlock once before installing the psmux wrapper so those
+    // defaults compose with teammate mode. The marker prevents repeated shim
+    // initialization from capturing this wrapper and recursing. Without a user
+    // function, resolve the real command at call time because npm/nvm4w installs
+    // may expose claude.cmd / claude.ps1 but no claude.exe.
     "if($env:PSMUX_CLAUDE_TEAMMATE_MODE){ ",
+    "if(-not (Get-Variable _psmux_claude_user_function_captured -Scope Global -EA 0)){ ",
+    "$Global:_psmux_claude_user_function_captured=$true; ",
+    "& { $candidate=Get-Command claude -CommandType Function -EA 0 | Select-Object -First 1; ",
+    "if($candidate){$Global:_psmux_claude_user_function=$candidate.ScriptBlock} } }; ",
     // _psmux_tmcfg: $true when teammateMode is already configured in a settings
     // file Claude Code consults.  Checked at call time (not shim load time) so
     // cd'ing into a project with its own .claude/settings.json is honoured.
@@ -2311,8 +2310,9 @@ const ENV_SHIM_PS: &str = concat!(
     "foreach($f in $fs){ try{ if((Test-Path -LiteralPath $f) -and ((Get-Content -LiteralPath $f -Raw) -match '\"teammateMode\"\\s*:')){ return $true } }catch{} }; ",
     "$false }; ",
     "function Global:claude { ",
-    "$c=Get-Command claude -CommandType Application,ExternalScript -EA 0 | Select-Object -First 1; ",
-    "if(-not $c){ $c='claude.exe' }; ",
+    "$c=$Global:_psmux_claude_user_function; ",
+    "if(-not $c){$c=Get-Command claude -CommandType Application,ExternalScript -EA 0 | Select-Object -First 1}; ",
+    "if(-not $c){$c='claude.exe'}; ",
     "if(($args -contains '--teammate-mode') -or (_psmux_tmcfg)){ & $c @args } ",
     "else{ & $c --teammate-mode $env:PSMUX_CLAUDE_TEAMMATE_MODE @args } } }",
 );
