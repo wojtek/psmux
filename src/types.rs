@@ -3208,6 +3208,9 @@ pub enum CtrlReq {
     // re-split on whitespace — that collapsed runs of spaces inside quoted
     // arguments and stripped leading/trailing spaces.
     SendKeys(Vec<String>, bool),
+    /// send-keys -R: reset the parsed terminal state and screen.
+    /// Like every request from a targeted command, this carries its own target.
+    ResetTerminal,
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
@@ -3252,7 +3255,7 @@ pub enum CtrlReq {
     },
     KillSession,
     HasSession(mpsc::Sender<bool>),
-    RenameSession(String),
+    RenameSession(String, mpsc::Sender<Result<(), String>>),
     /// Claim a warm server: rename session + send response so CLI knows it's done.
     /// Fields: session name, optional client CWD, optional client priority,
     /// optional path to the client's environment block, optional initial

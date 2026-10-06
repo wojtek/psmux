@@ -62,7 +62,11 @@ use crossterm::{execute};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 
 use crate::platform::enable_virtual_terminal_processing;
-use crate::cli::{print_help, print_version, print_commands};
+use crate::cli::{
+    build_send_keys_control_command, classify_send_keys_cli, parse_send_keys_args,
+    print_commands, print_help, print_kill_server_help, print_send_keys_help,
+    print_version, SendKeysCliAction,
+};
 use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control,
     send_control_with_response, resolve_default_session_name};
 use crate::rendering::apply_cursor_style;
@@ -787,6 +791,103 @@ fn process_target_position(args: &[String], command_index: usize) -> Option<usiz
         .map(|position| command_index + 1 + position)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PickCliAction {
+    Unrelated,
+    ForwardToAttachedClient,
+    StartInPicker,
+}
+
+fn classify_pick_command(cmd: &str, attached_client_context: bool) -> PickCliAction {
+    if cmd != "pick" {
+        return PickCliAction::Unrelated;
+    }
+    if attached_client_context {
+        PickCliAction::ForwardToAttachedClient
+    } else {
+        PickCliAction::StartInPicker
+    }
+}
+
+struct AttachResolution {
+    name: String,
+    shown: String,
+    explicit_target: bool,
+}
+
+fn resolve_attach_target(
+    args: &[String],
+    command_args: &[&String],
+    socket_name: Option<&str>,
+) -> AttachResolution {
+    let sub_args: Vec<&String> = command_args.iter().skip(1).copied().collect();
+    let explicit_target = args.iter().any(|a| a == "-t")
+        || sub_args.iter().any(|a| !a.starts_with('-'));
+    let name = args
+        .iter()
+        .position(|a| a == "-t")
+        .and_then(|i| args.get(i + 1))
+        .map(|target| {
+            let session = crate::cli::parse_target(target)
+                .session
+                .unwrap_or_else(|| target.clone());
+            if let Some(socket) = socket_name {
+                format!("{}__{}", socket, session)
+            } else {
+                session
+            }
+        })
+        .or_else(|| {
+            let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
+            sub_args.iter().enumerate().find_map(|(i, a)| {
+                if !a.starts_with('-') && Some(i) != t_val_idx {
+                    Some(if let Some(socket) = socket_name {
+                        format!("{}__{}", socket, a)
+                    } else {
+                        (*a).clone()
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(resolve_default_session_name)
+        .or_else(|| crate::session::resolve_last_session_name_ns(socket_name))
+        .unwrap_or_else(|| {
+            if let Some(socket) = socket_name {
+                format!("{}__0", socket)
+            } else {
+                "0".to_string()
+            }
+        });
+    let shown = socket_name
+        .and_then(|socket| name.strip_prefix(&format!("{}__", socket)))
+        .unwrap_or(&name)
+        .to_string();
+    AttachResolution { name, shown, explicit_target }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KillServerCliAction<'a> {
+    Unrelated,
+    Execute,
+    Help,
+    Invalid(&'a str),
+}
+
+fn classify_kill_server_command<'a>(cmd: &str, cmd_args: &'a [&String]) -> KillServerCliAction<'a> {
+    if cmd != "kill-server" {
+        return KillServerCliAction::Unrelated;
+    }
+    match cmd_args.get(1) {
+        Some(arg) if cmd_args.len() == 2 && matches!(arg.as_str(), "-h" | "--help") => {
+            KillServerCliAction::Help
+        }
+        Some(arg) => KillServerCliAction::Invalid(arg.as_str()),
+        None => KillServerCliAction::Execute,
+    }
+}
+
 #[cfg(test)]
 mod process_command_arg_tests {
     use super::*;
@@ -823,6 +924,42 @@ mod process_command_arg_tests {
         let args = strings(&["psmux", "-t", "outer", "new-window"]);
         let command = process_command_index(&args).unwrap();
         assert_eq!(process_target_position(&args, command), Some(1));
+    }
+
+    #[test]
+    fn kill_server_help_and_typos_never_classify_as_execute() {
+        let help = strings(&["kill-server", "-h"]);
+        assert_eq!(classify_kill_server_command("kill-server", &help.iter().collect::<Vec<_>>()), KillServerCliAction::Help);
+
+        let long_help = strings(&["kill-server", "--help"]);
+        assert_eq!(classify_kill_server_command("kill-server", &long_help.iter().collect::<Vec<_>>()), KillServerCliAction::Help);
+
+        let typo = strings(&["kill-server", "--hepl"]);
+        assert_eq!(classify_kill_server_command("kill-server", &typo.iter().collect::<Vec<_>>()), KillServerCliAction::Invalid("--hepl"));
+
+        let mixed = strings(&["kill-server", "--hepl", "--help"]);
+        assert_eq!(classify_kill_server_command("kill-server", &mixed.iter().collect::<Vec<_>>()), KillServerCliAction::Invalid("--hepl"));
+
+        let help_with_extra = strings(&["kill-server", "--help", "extra"]);
+        assert_eq!(classify_kill_server_command("kill-server", &help_with_extra.iter().collect::<Vec<_>>()), KillServerCliAction::Invalid("--help"));
+
+        let execute = strings(&["kill-server"]);
+        assert_eq!(classify_kill_server_command("kill-server", &execute.iter().collect::<Vec<_>>()), KillServerCliAction::Execute);
+    }
+
+    #[test]
+    fn pick_cli_starts_picker_from_cold_shell() {
+        assert_eq!(classify_pick_command("pick", false), PickCliAction::StartInPicker);
+    }
+
+    #[test]
+    fn pick_cli_preserves_attached_client_forwarding() {
+        assert_eq!(classify_pick_command("pick", true), PickCliAction::ForwardToAttachedClient);
+    }
+
+    #[test]
+    fn choose_session_is_not_the_cold_picker_command() {
+        assert_eq!(classify_pick_command("choose-session", false), PickCliAction::Unrelated);
     }
 }
 
@@ -1019,19 +1156,6 @@ fn run_main() -> io::Result<()> {
     // render multi-byte Unicode characters instead of mojibake.
     enable_virtual_terminal_processing();
 
-    // Clean up any stale port files at startup
-    cleanup_stale_port_files();
-    // Then drop registry files whose `.port` entry is already gone (issue
-    // #530). The sweep above is the only thing that can reach them, and it
-    // finds entries BY their `.port` file — so a satellite that outlives its
-    // port is invisible to it and accumulates forever.
-    crate::session::prune_orphaned_registry_files();
-    // Then reap any LIVE but orphaned server processes (issue #448): duplicates
-    // or crashed-client headless servers that cleanup_stale_port_files cannot
-    // see because they have no registry file. Bounds the process count so
-    // orphans can't accumulate to the point of exhausting Windows desktop-heap.
-    reap_orphaned_servers();
-
     // Parse -L flag early (tmux-compatible: names the server socket for namespace isolation)
     // In psmux, -L <name> creates a namespace prefix for session port/key files.
     // Sessions under -L "foo" are stored as "foo__sessionname.port".
@@ -1112,9 +1236,83 @@ fn run_main() -> io::Result<()> {
     // the pane environment (e.g. a warm-pool shell frozen at `__warm__`) can never
     // hijack the current session. See issue #485.
     let command_index = process_command_index(&args);
-    let target_position = command_index.and_then(|index| process_target_position(&args, index));
+    let raw_cmd_args: Vec<&String> = command_index
+        .map(|index| args[index..].iter().collect())
+        .unwrap_or_default();
+    let raw_cmd = raw_cmd_args.first().map(|arg| arg.as_str()).unwrap_or("");
+
+    // Resolve side-effect-free help and destructive-command argument errors
+    // before target routing performs registry or session reads.
+    if raw_cmd == "help" {
+        match raw_cmd_args.get(1).map(|arg| arg.as_str()) {
+            Some("send-keys" | "send" | "send-key") => print_send_keys_help(),
+            Some("kill-server") => print_kill_server_help(),
+            _ => print_help(),
+        }
+        return Ok(());
+    }
+    if matches!(raw_cmd, "send-keys" | "send" | "send-key") {
+        let send_args: Vec<&str> = raw_cmd_args.iter().skip(1).map(|arg| arg.as_str()).collect();
+        match classify_send_keys_cli(&send_args) {
+            SendKeysCliAction::Help => {
+                print_send_keys_help();
+                return Ok(());
+            }
+            SendKeysCliAction::InvalidLongOption(arg) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown send-keys option '{}'; to send it literally, use: psmux send -- {}",
+                        arg, arg
+                    ),
+                ));
+            }
+            SendKeysCliAction::Execute => {}
+        }
+    }
+    match classify_kill_server_command(raw_cmd, &raw_cmd_args) {
+        KillServerCliAction::Help => {
+            print_kill_server_help();
+            return Ok(());
+        }
+        KillServerCliAction::Invalid(arg) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown kill-server argument '{}'\nhint: run 'psmux kill-server --help'",
+                    arg
+                ),
+            ));
+        }
+        KillServerCliAction::Unrelated | KillServerCliAction::Execute => {}
+    }
+
+    // Help and destructive-command argument errors above are intentionally
+    // side-effect free. Ordinary commands retain upstream's registry cleanup.
+    cleanup_stale_port_files();
+    crate::session::prune_orphaned_registry_files();
+    reap_orphaned_servers();
+
+    let parsed_cli_send_keys = command_index
+        .filter(|index| matches!(args[*index].as_str(), "send-keys" | "send" | "send-key"))
+        .map(|index| {
+            let tail: Vec<&str> = args[index + 1..].iter().map(String::as_str).collect();
+            parse_send_keys_args(&tail)
+        });
+    let global_target_position = command_index.and_then(|index| {
+        args[1..index]
+            .iter()
+            .position(|arg| arg == "-t")
+            .map(|position| position + 1)
+    });
+    let target_position = if parsed_cli_send_keys.is_some() {
+        global_target_position
+    } else {
+        command_index.and_then(|index| process_target_position(&args, index))
+    };
     let strip_target_position = command_index
         .filter(|index| !matches!(args[*index].as_str(), "detach-client" | "detach"))
+        .filter(|_| parsed_cli_send_keys.is_none())
         .and(target_position);
     let is_set_option_command = command_index
         .and_then(|index| args.get(index))
@@ -1136,10 +1334,14 @@ fn run_main() -> io::Result<()> {
     } else {
         None
     };
-    let explicit_target = if is_set_option_command {
-        set_option_target.as_ref().or(precommand_target.as_ref())
+    let explicit_target: Option<&str> = if is_set_option_command {
+        set_option_target.as_deref().or(precommand_target.as_deref())
+    } else if let Some(parsed) = parsed_cli_send_keys.as_ref() {
+        global_target_position
+            .and_then(|position| args.get(position + 1).map(String::as_str))
+            .or(parsed.target)
     } else {
-        target_position.and_then(|position| args.get(position + 1))
+        target_position.and_then(|position| args.get(position + 1).map(String::as_str))
     };
     let mut explicit_session_target = false;
     if let Some(target) = explicit_target {
@@ -1283,8 +1485,9 @@ fn run_main() -> io::Result<()> {
     }
 
     // Handle help and version flags first
+    let mut start_in_session_chooser = false;
     match cmd {
-        "-h" | "--help" | "help" => {
+        "-h" | "--help" => {
             print_help();
             return Ok(());
         }
@@ -1624,60 +1827,8 @@ fn run_main() -> io::Result<()> {
                 return Ok(());
             }
             "a" | "at" | "attach" | "attach-session" => {
-                // Search cmd_args (skips binary name + global flags). Skip
-                // cmd_args[0] which is the subcommand itself ("a"/"attach"/etc),
-                // otherwise argv[0] (the exe path or subcommand name) gets
-                // picked up as the target session name.
-                let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
-                // Explicit -t target takes precedence over every fallback (issue #408).
-                // The global argument scan above STRIPS -t (and its value) out of
-                // cmd_args, so re-reading it from sub_args here always missed and the
-                // resolution fell through to resolve_last_session_name_ns — meaning
-                // `attach-session -t NAME` reattached to whatever session was used
-                // last instead of NAME. Read -t from the full, unstripped argv so the
-                // requested target always wins. Works for both subcommand-position
-                // (`attach-session -t s2`) and global-position (`-t s2 attach-session`).
-                let explicit_target = args.iter().any(|a| a == "-t")
-                    || sub_args.iter().any(|a| !a.starts_with('-'));
-                let name = args
-                    .iter()
-                    .position(|a| a == "-t")
-                    .and_then(|i| args.get(i + 1))
-                    .map(|target| {
-                        let session = crate::cli::parse_target(target)
-                            .session
-                            .unwrap_or_else(|| target.clone());
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, session)
-                        } else {
-                            session
-                        }
-                    })
-                    .or_else(|| {
-                        // Accept positional argument as target session name
-                        // (e.g. "psmux attach work" without -t flag)
-                        let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
-                        sub_args.iter().enumerate().find_map(|(i, a)| {
-                            if !a.starts_with('-') && Some(i) != t_val_idx {
-                                Some(if let Some(ref l) = l_socket_name {
-                                    format!("{}__{}", l, a)
-                                } else {
-                                    (*a).clone()
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .or_else(resolve_default_session_name)
-                    .or_else(|| crate::session::resolve_last_session_name_ns(l_socket_name.as_deref()))
-                    .unwrap_or_else(|| {
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__0", l)
-                        } else {
-                            "0".to_string()
-                        }
-                    });
+                let resolution = resolve_attach_target(&args, &cmd_args, l_socket_name.as_deref());
+                let name = resolution.name;
                 // #362: tmux runs `new-session` from the config at server start,
                 // so `attach-session` works even with no server running. psmux has
                 // no persistent server, so when no session exists yet and the
@@ -1711,11 +1862,7 @@ fn run_main() -> io::Result<()> {
                 // complete means no server, whatever error the OS chose to
                 // report. The lenient reading let a stale registry entry pass
                 // the gate and the raw winsock error surfaced from the client.
-                let shown = l_socket_name
-                    .as_deref()
-                    .and_then(|l| name.strip_prefix(&format!("{}__", l)))
-                    .unwrap_or(&name)
-                    .to_string();
+                let shown = resolution.shown;
                 if !probe_session_alive_strict(&name) {
                     // Nothing is listening on the registered port. Reap the
                     // entry so the next `ls`/`attach` does not re-litigate it,
@@ -1729,7 +1876,7 @@ fn run_main() -> io::Result<()> {
                     // never typed by the user (it came from last_session or the
                     // `0` default), so echoing it back would blame a session
                     // they never asked for.
-                    if !explicit_target
+                    if !resolution.explicit_target
                         && crate::session::list_session_names_ns(l_socket_name.as_deref()).is_empty()
                     {
                         eprintln!("psmux: no sessions");
@@ -1744,7 +1891,7 @@ fn run_main() -> io::Result<()> {
                 // `attach -r` / `attach -f read-only` (issue #724). The flag was
                 // parsed and dropped, so a read only client could type and no
                 // tool could tell it apart from a writable one.
-                if crate::cli::attach_wants_readonly(sub_args.iter().map(|s| s.as_str())) {
+                if crate::cli::attach_wants_readonly(cmd_args.iter().skip(1).map(|s| s.as_str())) {
                     env::set_var("PSMUX_CLIENT_READONLY", "1");
                 } else {
                     env::remove_var("PSMUX_CLIENT_READONLY");
@@ -2732,58 +2879,20 @@ fn run_main() -> io::Result<()> {
             }
             // send-keys - Send keys to a pane (critical for scripting)
             "send-keys" | "send" | "send-key" => {
-                let mut literal = false;
-                let mut has_x = false;
-                let mut has_hex = false;
-                let mut repeat: Option<String> = None;
-                let mut keys: Vec<String> = Vec::new();
-                // Getopt-style parsing: -t consumes next arg, -l/-R/-X/-H are flags
-                let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-l" => { literal = true; }
-                        "-R" => { keys.push("__RESET__".to_string()); }
-                        "-X" => { has_x = true; }
-                        "-H" => { has_hex = true; }
-                        "-t" => { i += 1; } // consume target value (already handled globally)
-                        // Repeat count. It used to be consumed and dropped
-                        // here, so `send-keys -N 40 -X scroll-up` and
-                        // `send-keys -N 3 x` ran once; the server already
-                        // honours -N, it just never received it.
-                        "-N" => { i += 1; repeat = cmd_args.get(i).map(|s| s.to_string()); }
-                        _ => { keys.push(cmd_args[i].to_string()); }
-                    }
-                    i += 1;
-                }
-                let mut cmd = "send-keys".to_string();
-                if literal { cmd.push_str(" -l"); }
-                if has_x { cmd.push_str(" -X"); }
-                if has_hex { cmd.push_str(" -H"); }
-                if let Some(n) = repeat.as_deref() {
-                    cmd.push_str(&format!(" -N {}", crate::util::quote_arg_if_needed(n)));
-                }
-                // Quote arguments that need it. quote_arg_if_needed escapes
-                // backslashes as well as quotes inside the wrapping quotes,
-                // matching what parse_command_line decodes there (#547) —
-                // the old encoder escaped only `"`, so a quoted key ending
-                // in `\` consumed the closing quote and swallowed the rest.
-                // Unquoted values keep literal backslashes byte-exact
-                // (Windows path separators).
-                for k in keys {
-                    cmd.push_str(&format!(" {}", crate::util::quote_arg_if_needed(&k)));
-                }
+                let send_args: Vec<&str> = cmd_args.iter().skip(1).map(|arg| arg.as_str()).collect();
+                let parsed = parse_send_keys_args(&send_args);
+                let mut cmd = build_send_keys_control_command(&send_args);
                 cmd.push('\n');
-                if has_x {
-                    // tmux: `send-keys -X` on a pane in no mode is
-                    // "not in a mode" at exit 1 (cmd-send-keys.c).
+                if parsed.copy_mode && !parsed.hex_mode {
+                    // Preserve upstream's copy-mode error and exit status.
                     let resp = send_control_with_response(cmd)?;
                     if resp.trim_start().starts_with("ERROR") {
                         eprintln!("{}", resp.trim_start().trim_start_matches("ERROR:").trim());
                         std::process::exit(1);
                     }
-                    return Ok(());
+                } else {
+                    send_control(cmd)?;
                 }
-                send_control(cmd)?;
                 return Ok(());
             }
             // Base64 is the protocol boundary: unlike send-keys -l, it cannot
@@ -3448,7 +3557,16 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 if let Some(name) = new_name {
-                    send_control(format!("rename-session {}\n", crate::util::quote_arg(&name)))?;
+                    let response = send_control_with_response(format!(
+                        "rename-session {}\n",
+                        crate::util::quote_arg(&name),
+                    ))?;
+                    if let Some(error) = response.trim().strip_prefix("ERROR:") {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            error.trim().to_string(),
+                        ));
+                    }
                 }
                 return Ok(());
             }
@@ -5045,6 +5163,35 @@ fn run_main() -> io::Result<()> {
                 send_control(format!("{}\n", cmd))?;
                 return Ok(());
             }
+            // Cold-shell entry point for the client-side session chooser.
+            // Inside psmux, the already attached client owns the overlay.
+            "pick" => {
+                match classify_pick_command(cmd, crate::util::psmux_drawn_terminal()) {
+                    PickCliAction::ForwardToAttachedClient => {
+                        send_control("choose-session\n".to_string())?;
+                        return Ok(());
+                    }
+                    PickCliAction::StartInPicker => {
+                        let resolution = resolve_attach_target(&args, &cmd_args, l_socket_name.as_deref());
+                        if !probe_session_alive_strict(&resolution.name) {
+                            if crate::session::registry_pid_anchor_alive(&resolution.name) != Some(true) {
+                                crate::session::remove_session_registry(&resolution.name);
+                            }
+                            if crate::session::list_session_names_ns(l_socket_name.as_deref()).is_empty() {
+                                eprintln!("psmux: no sessions");
+                            } else {
+                                eprintln!("psmux: can't find session: {}", resolution.shown);
+                            }
+                            std::process::exit(1);
+                        }
+                        env::set_var("PSMUX_SESSION_NAME", resolution.name);
+                        env::set_var("PSMUX_SESSION_DISPLAY_NAME", resolution.shown);
+                        env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                        start_in_session_chooser = true;
+                    }
+                    PickCliAction::Unrelated => unreachable!(),
+                }
+            }
             // command-prompt - Open interactive command prompt
             "command-prompt" => {
                 let mut cmd = "command-prompt".to_string();
@@ -5750,8 +5897,10 @@ fn run_main() -> io::Result<()> {
     }
 
     // Loop to handle session switching without spawning new processes
+    let mut open_picker = start_in_session_chooser;
     let result = loop {
-        let result = run_remote(&mut terminal, &input);
+        let result = run_remote(&mut terminal, &input, open_picker);
+        open_picker = false;
         if crate::debug_log::reconnect_log_enabled() {
             crate::debug_log::reconnect_log(&format!(
                 "run_remote returned {} (switch pending={})",
