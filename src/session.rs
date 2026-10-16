@@ -1779,12 +1779,21 @@ const PID_REUSE_MARGIN_TICKS: u64 = 60 * 10_000_000; // 60s in 100ns ticks
 /// invocation. The process table answers instantly and definitively.
 ///
 /// Returns:
-///   Some(true)  - recorded PID is a live psmux-image process created no later
-///                 than the `.pid` file was written -> genuinely our server.
-///   Some(false) - PID gone, recycled by a non-psmux image, or recycled by a
-///                 psmux process created long after the file -> server is dead.
-///   None        - no usable `.pid` anchor (pre-#448 registry) -> caller must
-///                 fall back to the network probe.
+///   Some(true)  - the recorded PID is held by the very process that wrote the
+///                 `.pid` file -> genuinely our server.
+///   Some(false) - PID gone, or held by a process that provably is not the one
+///                 that wrote the file -> server is dead.
+///   None        - the anchor cannot settle it -> caller must fall back to the
+///                 network probe.
+///
+/// An image name is never sufficient reason to call a server dead. Windows
+/// resolves a live process's image name from the executable FILE, so renaming
+/// or moving that file silently changes what every running server reports; on
+/// 2026-09-10 renaming the installed binary in place made eight healthy
+/// sessions look foreign, and every command that trusted the name deleted their
+/// registry entries while the servers were still answering on their ports. The
+/// `.pid` body records `pid:creation_filetime`, and that pair identifies one
+/// process instance and survives any amount of renaming, so it decides instead.
 fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
     pid_anchor_verdict_with(
         port_path,
@@ -1806,42 +1815,73 @@ where
         return None;
     }
     let pid_path = port_path.with_extension("pid");
-    // Tolerate both `pid` and `pid:creation_filetime` bodies (the latter written
-    // so kill-server can verify identity); the anchor only needs the pid.
-    let (pid, _creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
-    let name = match name_of(pid) {
-        // No such process anywhere on the machine — not openable AND not in the
-        // process table. That is a genuinely dead PID, so the #448 fast reap
-        // still fires here.
-        //
-        // It used to be enough for the PID to be merely unopenable, on the
-        // assumption that a same-user psmux server is always openable with
-        // QUERY_LIMITED_INFORMATION. It is not: a server started from an
-        // OpenSSH logon lives in Terminal Services session 0 under the elevated
-        // token sshd mints, and an unelevated desktop shell in session 1 is
-        // refused the handle with ERROR_ACCESS_DENIED, so every desktop
-        // invocation, `psmux -V` included, deleted the live server's registry
-        // files (#650). See `get_process_name_or_snapshot` for the measured
-        // access matrix.
-        None => return Some(false),
-        Some(n) => n.to_ascii_lowercase(),
-    };
-    if !PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str()) {
-        // PID recycled by an unrelated application; our server is gone.
-        return Some(false);
+    // Tolerate both `pid` and `pid:creation_filetime` bodies; the recorded
+    // creation time is the identity evidence when it is present.
+    let (pid, recorded_creation) =
+        parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    // `name_of` is `get_process_name_or_snapshot`, so `None` here means no such
+    // process anywhere on the machine: not openable AND absent from the process
+    // table. Merely unopenable is NOT enough. A server started from an OpenSSH
+    // logon lives in Terminal Services session 0 under the elevated token sshd
+    // mints, and an unelevated desktop shell in session 1 is refused the handle
+    // with ERROR_ACCESS_DENIED, so every desktop invocation, `psmux -V`
+    // included, deleted the live server's registry files (#650). See
+    // `get_process_name_or_snapshot` for the measured access matrix.
+    let live = name_of(pid).map(|name| LiveAnchorProcess {
+        name: name.to_ascii_lowercase(),
+        creation: crate::platform::process_kill::process_creation_time(pid),
+    });
+    let pid_file_mtime = std::fs::metadata(&pid_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(system_time_to_filetime_ticks);
+    pid_anchor_decision(recorded_creation, live.as_ref(), pid_file_mtime)
+}
+
+/// What the process table currently says about the PID a `.pid` file records.
+/// Separated from [`pid_anchor_decision`] so the rule can be tested without a
+/// live server behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveAnchorProcess {
+    /// Lower-cased image-name stem, as the process table reports it NOW.
+    name: String,
+    /// Creation time in FILETIME ticks, when that query succeeded.
+    creation: Option<u64>,
+}
+
+/// The anchor rule itself. See [`pid_anchor_verdict`] for what the answers mean.
+fn pid_anchor_decision(
+    recorded_creation: Option<u64>,
+    live: Option<&LiveAnchorProcess>,
+    pid_file_mtime: Option<u64>,
+) -> Option<bool> {
+    // Nothing holds the PID at all: neither openable nor present in the
+    // process-table snapshot (#650), so the server that wrote the file is gone.
+    let Some(live) = live else { return Some(false) };
+
+    // Recorded PID plus recorded creation time name one process instance, and a
+    // later reuse of the PID cannot reproduce that pair. When both halves are
+    // available they settle the question outright, whatever the executable
+    // happens to be called at this moment.
+    if let (Some(recorded), Some(actual)) = (recorded_creation, live.creation) {
+        return Some(recorded == actual);
     }
-    // PID-reuse guard (same idea as the #447 reaper guard): a psmux process
-    // created well AFTER the .pid file was last written cannot be the server
-    // that wrote it. When either timestamp is unavailable, err towards alive.
-    if let Some(created_ft) = crate::platform::process_kill::process_creation_time(pid) {
-        if let Some(mtime_ft) = std::fs::metadata(&pid_path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(system_time_to_filetime_ticks)
-        {
-            if created_ft > mtime_ft.saturating_add(PID_REUSE_MARGIN_TICKS) {
-                return Some(false);
-            }
+
+    // No signature to compare: a pre-#448 `.pid` body, or the creation query
+    // failed. The image name is the only remaining hint and it is a weak one,
+    // so it may support "alive" but never "dead" on its own — an unrecognised
+    // name is inconclusive and the network probe decides.
+    if !PSMUX_SERVER_IMAGE_NAMES.contains(&live.name.as_str()) {
+        return None;
+    }
+
+    // Coarse reuse guard for that unsigned case (same idea as the #447 reaper
+    // guard): a psmux process created well AFTER the `.pid` file was last
+    // written cannot be the server that wrote it. When either timestamp is
+    // unavailable, err towards alive.
+    if let (Some(created_ft), Some(mtime_ft)) = (live.creation, pid_file_mtime) {
+        if created_ft > mtime_ft.saturating_add(PID_REUSE_MARGIN_TICKS) {
+            return Some(false);
         }
     }
     Some(true)
@@ -2262,6 +2302,13 @@ fn open_authed(
 /// Returns `None` on timeout, EOF, empty payload, or `ERROR:` reply.
 /// Returns `Some(line)` on a valid payload (newline trimmed).
 fn read_authed_line<R: std::io::BufRead>(br: &mut R) -> Option<String> {
+    read_authed_line_exact(br).map(|line| line.trim().to_string())
+}
+
+/// [`read_authed_line`] that returns the payload exactly as the server wrote
+/// it, less only its line ending. A session name can begin with a space, and
+/// trimming the whole reply removed it.
+fn read_authed_line_exact<R: std::io::BufRead>(br: &mut R) -> Option<String> {
     // First read: could be either the AUTH ack ("OK") or the payload
     // (if the ack was already pipelined into the same packet).
     let mut line = String::new();
@@ -2281,25 +2328,55 @@ fn read_authed_line<R: std::io::BufRead>(br: &mut R) -> Option<String> {
     if trimmed.is_empty() || trimmed == "OK" || trimmed.starts_with("ERROR:") {
         None
     } else {
-        Some(trimmed.to_string())
+        let payload = line.strip_suffix('\n').unwrap_or(&line);
+        Some(payload.strip_suffix('\r').unwrap_or(payload).to_string())
     }
 }
 
-/// Read all remaining bytes from an authenticated stream, stripping a
-/// leading `OK\n` AUTH ack if present.
-///
-/// Returns `None` on no payload, error response, or read failure.
-/// Returns `Some(payload)` with the AUTH ack removed and trailing
-/// whitespace stripped. Total read is capped by the underlying `Take`.
-fn read_authed_all<R: std::io::Read>(rd: &mut R) -> Option<String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AuthedResponse {
+    Accepted { payload: Option<String> },
+    ServerError(String),
+    TransportFailure,
+}
+
+/// Read and classify all remaining bytes from an authenticated stream.
+/// A leading `OK\n` AUTH ack proves that an empty command body is an accepted
+/// command, while EOF without that ack and read errors remain transport
+/// failures.
+fn read_authed_all_outcome<R: std::io::Read>(rd: &mut R) -> AuthedResponse {
     let mut buf = String::new();
-    std::io::Read::read_to_string(rd, &mut buf).ok()?;
-    let body = buf.strip_prefix("OK\n").or_else(|| buf.strip_prefix("OK\r\n")).unwrap_or(&buf);
-    let trimmed = body.trim();
-    if trimmed.is_empty() || trimmed.starts_with("ERROR:") {
-        None
+    if std::io::Read::read_to_string(rd, &mut buf).is_err() {
+        return AuthedResponse::TransportFailure;
+    }
+    let (body, authenticated) = if let Some(body) = buf.strip_prefix("OK\n") {
+        (body, true)
+    } else if let Some(body) = buf.strip_prefix("OK\r\n") {
+        (body, true)
     } else {
-        Some(trimmed.to_string())
+        (buf.as_str(), false)
+    };
+    let trimmed = body.trim();
+    if trimmed.starts_with("ERROR:") {
+        AuthedResponse::ServerError(trimmed.to_string())
+    } else if trimmed.is_empty() {
+        if authenticated {
+            AuthedResponse::Accepted { payload: None }
+        } else {
+            AuthedResponse::TransportFailure
+        }
+    } else {
+        AuthedResponse::Accepted { payload: Some(trimmed.to_string()) }
+    }
+}
+
+/// Preserve the established optional-payload behavior for existing callers.
+fn read_authed_all<R: std::io::Read>(rd: &mut R) -> Option<String> {
+    match read_authed_all_outcome(rd) {
+        AuthedResponse::Accepted { payload: Some(payload) } => Some(payload),
+        AuthedResponse::Accepted { payload: None }
+        | AuthedResponse::ServerError(_)
+        | AuthedResponse::TransportFailure => None,
     }
 }
 
@@ -2374,6 +2451,22 @@ pub fn fetch_authed_response_multi(
     read_authed_all(&mut br)
 }
 
+/// Like `fetch_authed_response_multi`, but preserves the distinction between
+/// an authenticated command accepted with no payload, a server error, and a
+/// transport/authentication failure.
+pub(crate) fn fetch_authed_response_multi_outcome(
+    addr: &str,
+    key: &str,
+    cmd: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> AuthedResponse {
+    let Some(mut br) = open_authed(addr, key, cmd, connect_timeout, read_timeout) else {
+        return AuthedResponse::TransportFailure;
+    };
+    read_authed_all_outcome(&mut br)
+}
+
 /// Fetch a one-line `session-info` response from a session server.
 ///
 /// Thin wrapper over `fetch_authed_response` retained for the call site
@@ -2385,6 +2478,18 @@ pub fn fetch_session_info(
     read_timeout: Duration,
 ) -> Option<String> {
     fetch_authed_response(addr, key, b"session-info\n", connect_timeout, read_timeout)
+}
+
+/// [`fetch_session_info`] with the reply exactly as the server wrote it, less
+/// its line ending, so a session name that begins with a space keeps it.
+pub(crate) fn fetch_session_info_exact(
+    addr: &str,
+    key: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Option<String> {
+    let mut br = open_authed(addr, key, b"session-info\n", connect_timeout, read_timeout)?;
+    read_authed_line_exact(&mut br)
 }
 
 /// Fan out `fetch_session_info` across many sessions in parallel.

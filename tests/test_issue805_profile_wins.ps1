@@ -45,7 +45,9 @@ $before = (& psmux ls 2>&1 | Out-String).Trim()
 Remove-Item Env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS -EA 0
 
 function Write-Profile([string]$body) {
-    Set-Content -Path $profileFile -Value $body -Encoding UTF8
+    # psmux sources profiles in a foreach loop. Stop after this private first
+    # profile so the real CurrentUser profiles cannot replace the test stubs.
+    Set-Content -Path $profileFile -Value ($body + "`nbreak") -Encoding UTF8
 }
 
 # Open a window running the private pwsh and report what the pane sees.
@@ -60,7 +62,9 @@ function Probe-Pane([string]$label) {
         Start-Sleep -Milliseconds 200
         $cap = & $PSMUX -L $ns capture-pane -p -t $tgt 2>&1 | Out-String
     } while ($cap -notmatch 'PS [A-Z]:\\' -and (Get-Date) -lt $deadline)
-    $cmd = "& { `$r = [ordered]@{}; foreach (`$nm in 'claude','env') { `$c = Get-Command `$nm -EA 0; `$r[`$nm+'_type'] = if (`$c) { [string]`$c.CommandType } else { 'none' }; `$r[`$nm+'_def'] = if (`$c) { [string]`$c.Definition } else { '' } }; `$r['teams'] = if (Test-Path Env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) { `$env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS } else { '<unset>' }; `$r['envrun'] = try { (env A805=shim_ok cmd /c 'echo %A805%' 2>`$null) -join '' } catch { 'error' }; `$r | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 '$out' }"
+    # Invoke only the known profile stub; never launch a real Claude provider.
+    $claudeProbe = if ($label -eq 'functions') { "`$savedProbePath=`$env:PATH; try { `$env:PATH=''; `$r['clauderun'] = (claude --teammate-mode in-process hello) -join '' } finally { `$env:PATH=`$savedProbePath }; " } else { '' }
+    $cmd = "& { `$r = [ordered]@{}; $claudeProbe foreach (`$nm in 'claude','env') { `$c = Get-Command `$nm -EA 0; `$r[`$nm+'_type'] = if (`$c) { [string]`$c.CommandType } else { 'none' }; `$r[`$nm+'_def'] = if (`$c) { [string]`$c.Definition } else { '' } }; `$r['teams'] = if (Test-Path Env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) { `$env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS } else { '<unset>' }; `$r['envrun'] = try { (env A805=shim_ok cmd /c 'echo %A805%' 2>`$null) -join '' } catch { 'error' }; `$r | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 '$out' }"
     & $PSMUX -L $ns send-keys -t $tgt -l $cmd 2>&1 | Out-Null
     & $PSMUX -L $ns send-keys -t $tgt Enter 2>&1 | Out-Null
     $deadline = (Get-Date).AddSeconds(20)
@@ -73,7 +77,7 @@ function Probe-Pane([string]$label) {
 }
 
 function Probe-Outside {
-    $j = & $PWSH -NoLogo -Command "`$r=[ordered]@{}; foreach (`$nm in 'claude','env') { `$c = Get-Command `$nm -EA 0; `$r[`$nm+'_type'] = if (`$c) { [string]`$c.CommandType } else { 'none' }; `$r[`$nm+'_def'] = if (`$c) { [string]`$c.Definition } else { '' } }; `$r | ConvertTo-Json -Compress"
+    $j = & $PWSH -NoLogo -NoProfile -Command "foreach (`$testProfile in @('$profileFile')) { . `$testProfile }; `$r=[ordered]@{}; foreach (`$nm in 'claude','env') { `$c = Get-Command `$nm -EA 0; `$r[`$nm+'_type'] = if (`$c) { [string]`$c.CommandType } else { 'none' }; `$r[`$nm+'_def'] = if (`$c) { [string]`$c.Definition } else { '' } }; `$r | ConvertTo-Json -Compress"
     return ($j | ConvertFrom-Json)
 }
 
@@ -87,14 +91,14 @@ try {
     if ($LASTEXITCODE -ne 0) { Write-Error "could not start session"; exit 2 }
 
     Write-Host "`n[1] user functions claude and env in the profile"
-    Write-Profile "function claude { 'USER-CLAUDE-WRAPPER' }`nfunction env { 'USER-ENV-FUNCTION' }"
+    Write-Profile "function claude { & { 'USER-CLAUDE-WRAPPER|' + (`$args -join '|') } --user-default @args }`nfunction env { 'USER-ENV-FUNCTION' }"
     $o = Probe-Outside
     Info "outside psmux: claude def = $($o.claude_def.Trim())"
     $p = Probe-Pane 'functions'
     if ($p) {
-        if ($p.claude_def -match 'USER-CLAUDE-WRAPPER') { Pass 'pane keeps the user claude function' } else { Fail "pane claude is not the user's: $($p.claude_def.Trim().Substring(0, [Math]::Min(80, $p.claude_def.Trim().Length)))" }
+        if ($p.clauderun -like 'USER-CLAUDE-WRAPPER|--user-default|*') { Pass 'pane keeps the user claude function' } else { Fail "pane claude is not the user's: $($p.claude_def.Trim().Substring(0, [Math]::Min(80, $p.claude_def.Trim().Length)))" }
         if ($p.env_def -match 'USER-ENV-FUNCTION') { Pass 'pane keeps the user env function' } else { Fail "pane env is not the user's" }
-        if ($p.claude_def -eq $o.claude_def) { Pass 'claude definition identical inside and outside psmux' } else { Fail 'claude definition differs inside vs outside psmux' }
+        if ($p.clauderun -eq 'USER-CLAUDE-WRAPPER|--user-default|--teammate-mode|in-process|hello') { Pass 'user defaults and explicit teammate mode compose' } else { Fail "claude arguments changed: $($p.clauderun)" }
     }
 
     Write-Host "`n[2] user aliases claude and env in the profile"
@@ -120,7 +124,7 @@ try {
         if ($p.claude_type -eq 'Function' -and $p.claude_def -match $wrapperMark) { Pass 'claude wrapper installed when the user has none' } else { Fail "claude wrapper missing ($($p.claude_type))" }
         if ($p.env_type -eq 'Function' -and $p.env_def -match '_shebang') { Pass 'env shim installed when the user has none' } else { Fail "env shim missing ($($p.env_type))" }
         if ($p.envrun -eq 'shim_ok') { Pass 'env shim runs env VAR=val command' } else { Fail "env shim run gave '$($p.envrun)'" }
-        if ($p.teams -eq '1') { Pass 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS defaults to 1' } else { Fail "agent teams default is $($p.teams)" }
+        if ($p.teams -eq '<unset>') { Pass 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS remains opt-in' } else { Fail "agent teams default is $($p.teams)" }
     }
 
     Write-Host "`n[5] user set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0 in the global environment"

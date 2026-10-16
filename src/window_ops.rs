@@ -915,7 +915,11 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
             col, row, vt_button, press, win_name));
         return;
     }
-    let vt_bridge = detect_vt_bridge(pane);
+    // A native INPUT_RECORD reader can run ssh/wsl as a tool without handing
+    // over its console. Keep SGR on the ConPTY parser in that case: injecting
+    // it as KEY_EVENTs turns ESC into Escape and the rest into typing.
+    let vt_bridge = !console_input_mode(pane).is_some_and(mode_reads_key_records)
+        && detect_vt_bridge(pane);
 
     if vt_bridge {
         // WSL/SSH bridge — bypass ConPTY, inject as KEY_EVENT records.

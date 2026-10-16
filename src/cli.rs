@@ -260,6 +260,11 @@ fn looks_like_another_flag(token: &str) -> bool {
 ///     "can't find window: -a") rather than erroring here;
 ///   * an OPTIONAL value (`::`) is never mandatory, and is not consumed when
 ///     the next token looks like another flag.
+///
+/// One fork exception: `send-keys` stops at its first key operand, which is any
+/// token [`send_keys_option_token`] does not accept, so a literal dash token
+/// after it is data and never a missing value. Every other command keeps the
+/// generic rule above.
 pub fn validate_flag_arguments<S: AsRef<str>>(command: &str, args: &[S]) -> Result<(), String> {
     let Some(template) = args_template(command) else {
         return Ok(());
@@ -269,11 +274,20 @@ pub fn validate_flag_arguments<S: AsRef<str>>(command: &str, args: &[S]) -> Resu
         FlagValue::None => flag_value_kind(extra, flag),
         kind => kind,
     };
+    let send_keys = is_send_keys_command(command);
     let mut i = 0;
     while i < args.len() {
         let token = args[i].as_ref();
         if !token.starts_with('-') || token == "-" || token == "--" {
             break; // positional, bare '-', or end-of-options: flags are over
+        }
+        // `send-keys` stops reading options at its first key operand, so a
+        // later dash token is data for the pane and not a flag to police.
+        // Without this the literal, value-less-looking `-t` in
+        // `send-keys -z -t` was read as a missing target and the whole command
+        // was rejected before anything was sent.
+        if send_keys && !send_keys_option_token(token) {
+            break;
         }
         i += 1; // the flag token itself is consumed
         let letters: Vec<char> = token.chars().skip(1).collect();
@@ -593,6 +607,24 @@ pub fn expand_flag_clusters<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<Str
 ///   - Only tokens starting with a single `-` (not `--`) are split.
 ///   - The flag letter must be ASCII alphabetic (`-t=foo` yes, `-1=bar` no).
 ///   - Long flags (`--name=value`), bare `-` and degenerate `-=` pass through.
+///
+/// One fork exception, for `send-keys` / `send` / `send-key` only:
+///   - Its flag region also ends at its first key operand, and that operand may
+///     itself begin with `-` (`send-keys -z` types `-z`). See
+///     [`send_keys_option_token`], which the walker in
+///     [`normalize_command_flags`] asks. Without it the generic rule above
+///     walked past `-z` and split a later `-t=foo`, so the pane got `-z-tfoo`
+///     instead of the literal `-z-t=foo`; it walked past an attached `-N3` the
+///     same way and delivered `-N3-tfoo`.
+///   - This pass also splits an attached `-tfoo`, which otherwise only
+///     [`normalize_attached_target_flag`] would. The server's dispatch route and
+///     the coalescing fast path run no other normalizer before the shared
+///     parser, so an unsplit `-tfoo` would be that parser's first key operand
+///     rather than a target.
+///   - An attached `-N3` is NOT split, on either pass, and is therefore that
+///     first key operand: it reaches the pane literally.
+///
+/// Every other command keeps the generic rule above.
 pub fn normalize_flag_equals(args: Vec<String>) -> Vec<String> {
     normalize_argv_flags(args, true, false)
 }
@@ -714,11 +746,21 @@ fn normalize_command_flags(
         FlagValue::None => flag_value_kind(extra, flag),
         kind => kind,
     };
+    let send_keys = is_send_keys_command(command);
     let mut i = 0;
     while i < args.len() {
         let tok = args[i].as_str();
         if tok == "--" || tok == "-" || !tok.starts_with('-') {
             break; // end of options, or the first operand: the rest is data
+        }
+        // `send-keys` ends its option region one token earlier than this
+        // generic rule does: at its first key operand, which is any token its
+        // own recognizer does not accept (see `send_keys_option_token`).
+        // Walking past that operand split a later `-t=foo` into `-t` `foo`, so
+        // `send-keys -l -z -t=foo` reached the pane as `-z-tfoo` instead of the
+        // literal `-z-t=foo`.
+        if send_keys && !send_keys_option_token(tok) {
+            break;
         }
         i += 1;
         if equals {
@@ -732,7 +774,15 @@ fn normalize_command_flags(
                 continue;
             }
         }
-        if attached_t
+        // `-tfoo`, the attached form of a target. The attached-target pass
+        // splits it for every command that has one. A `send-keys` line is split
+        // here as well, on the equals pass too, because the server's dispatch
+        // route and the coalescing fast path run ONLY `normalize_flag_equals`
+        // before the shared parser: an unsplit `-tfoo` would be that parser's
+        // first key operand instead of a target, and `send_keys_option_token`
+        // would then be recognizing a form nothing normalized. Attached `-N` is
+        // not split on either pass and is therefore an operand, not an option.
+        if (attached_t || send_keys)
             && tok.len() > 2
             && tok.starts_with("-t")
             && !tok.starts_with("--")
@@ -880,12 +930,28 @@ pub fn deferred_command_start<S: AsRef<str>>(command: &str, args: &[S]) -> Optio
     }
 }
 
+/// The bound within which a command's leading `-t` may be read: from here on
+/// the tokens are data, not options.
+///
+/// For most commands that is the deferred-command start or an explicit `--`,
+/// whichever comes first, and that is unchanged here. A `send-keys` line ends
+/// earlier, at its first key operand, and that operand may itself begin with
+/// `-`. The shared parser already knows where that boundary is and consumes real
+/// leading option values on the way to it, so `-t foo` keeps `foo` inside the
+/// option region while a later literal `-t bar` falls outside. Scanning the
+/// whole line instead let `bare_target_rewrite` resolve that literal
+/// `-t <name>` on live state and replace the user's key text with a `%id`.
 pub fn outer_target_scan_end<S: AsRef<str>>(command: &str, args: &[S]) -> usize {
-    deferred_command_start(command, args)
+    let generic = deferred_command_start(command, args)
         .into_iter()
         .chain(args.iter().position(|arg| arg.as_ref() == "--"))
         .min()
-        .unwrap_or(args.len())
+        .unwrap_or(args.len());
+    if !is_send_keys_command(command) {
+        return generic;
+    }
+    let borrowed: Vec<&str> = args.iter().map(|a| a.as_ref()).collect();
+    parse_send_keys_args(&borrowed).option_end.min(generic)
 }
 
 /// Split a command line that is already in argv form into its commands, the
@@ -1230,6 +1296,7 @@ SESSION COMMANDS:
     a, at, attach, attach-session
                             Attach to an existing session
         -t <name>           Target session name
+    pick                    Attach and open the session picker
     ls, list-sessions       List all active sessions
     has-session, has        Check if a session exists (exit code 0 = yes)
         -t <name>           Target session name
@@ -1443,6 +1510,7 @@ SET OPTIONS (use with: set -g <option> <value>):
     aggressive-resize   Bool Resize to smallest client (default: off)
     set-titles          Bool Update terminal title (default: off)
     set-titles-string   Str  Terminal title format
+    tab-colour          Str  Windows Terminal tab colour (empty clears it)
     default-shell       Str  Shell to launch (default: pwsh)
     default-command     Str  Alias for default-shell
     word-separators     Str  Copy-mode word delimiters (default: " -_@")
@@ -1591,6 +1659,45 @@ For more information: https://github.com/psmux/psmux
 "#, prog = prog, ver = VERSION);
 }
 
+pub(crate) fn send_keys_help_text() -> String {
+    let prog = get_program_name();
+    format!(r#"Send keys or text to a pane.
+
+USAGE:
+    {prog} send-keys [-l] [-N count] [-t target] [--] key ...
+    {prog} send      [-l] [-N count] [-t target] [--] key ...
+
+OPTIONS:
+    -l              Send literally (no key parsing)
+    -N <count>      Repeat the key sequence
+    -t <target>     Target pane
+    --help          Show this help without sending anything
+    --              End options; required when the first key starts with '--'
+
+EXAMPLES:
+    {prog} send "echo hello" Enter
+    {prog} send -- --help Enter
+"#)
+}
+
+pub fn print_send_keys_help() {
+    print!("{}", send_keys_help_text());
+}
+
+pub fn print_kill_server_help() {
+    let prog = get_program_name();
+    println!(r#"Kill psmux server processes and their sessions.
+
+USAGE:
+    {prog} kill-server
+    {prog} -L <name> kill-server
+
+OPTIONS:
+    -h, --help      Show this help without killing any sessions
+    -L <name>       Kill only sessions in this namespace; must precede the command
+"#);
+}
+
 pub fn print_version() {
     // First line MUST stay "tmux <version>" (and nothing else) for
     // compatibility with tools like libtmux/tmuxp that read the first line of
@@ -1626,6 +1733,7 @@ pub fn print_commands() {
   has-session               - Check if a session exists
   if-shell (if)             - Conditional command execution
   join-pane                 - Join a pane to a window
+  pick                      - Attach and open the session picker
   kill-pane                 - Kill a pane
   kill-server               - Kill the servers on this socket (-a: all namespaces)
   kill-session              - Kill a session
@@ -1684,6 +1792,191 @@ pub fn print_commands() {
   wait-for (wait)           - Wait for a signal
   zoom-pane (zoom)          - Toggle pane zoom
 "#);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedSendKeysArgs<'a> {
+    pub(crate) literal: bool,
+    pub(crate) paste_mode: bool,
+    pub(crate) copy_mode: bool,
+    pub(crate) hex_mode: bool,
+    pub(crate) reset: bool,
+    /// tmux `send-keys -M`: forward the mouse event of the running binding.
+    pub(crate) mouse_mode: bool,
+    pub(crate) has_repeat: bool,
+    pub(crate) repeat_count: usize,
+    pub(crate) target: Option<&'a str>,
+    pub(crate) operands: Vec<&'a str>,
+    /// Index of the first key operand in the input: the end of the option
+    /// region. Every token before it is an option or an option's consumed
+    /// value, and every token from it on is data for the pane. `args.len()`
+    /// when all of them are options. [`outer_target_scan_end`] reads this so a
+    /// literal detached `-t <name>` among the keys is never resolved as a
+    /// target.
+    pub(crate) option_end: usize,
+}
+
+fn send_keys_option_cluster(arg: &str) -> Option<&str> {
+    arg.strip_prefix('-').filter(|flags| {
+        !flags.is_empty()
+            && !flags.starts_with('-')
+            && flags.chars().all(|c| matches!(c, 'l' | 'p' | 'R' | 'X' | 'H' | 'M' | 'N' | 't'))
+    })
+}
+
+/// The `send-keys` spellings whose options this fork reads with
+/// [`parse_send_keys_args`]. Kept beside the recognizer so the normalizers,
+/// [`validate_flag_arguments`] and [`outer_target_scan_end`] all ask the same
+/// owner where the option region ends.
+fn is_send_keys_command(command: &str) -> bool {
+    matches!(command, "send-keys" | "send" | "send-key")
+}
+
+/// True while `token` is still inside a `send-keys` option region.
+///
+/// `send-keys` reads options only up to `--` or its first key operand, and a
+/// token [`send_keys_option_cluster`] does not recognize IS that operand, so
+/// every later token is data for the pane. Two spellings the cluster check
+/// cannot see also count as options, and only because a normalizer splits them
+/// into the flag and its value before the shared parser ever runs:
+///
+///   * the `=`-form of a value-taking flag, `-t=foo` and `-N=3`, split by the
+///     `equals` branch of [`normalize_command_flags`];
+///   * the attached form of `-t` alone, `-tfoo`, split by that function's
+///     attached branch, which runs for `send-keys` on both passes.
+///
+/// An attached `-N` is deliberately NOT an option: nothing splits `-N3`, on
+/// either pass, so it is the first key operand and reaches the pane literally.
+/// Accepting it here made the normalizer walk past a real operand and split the
+/// `-t=foo` after it, so `send-keys -l -N3 -t=foo` delivered `-N3-tfoo`.
+fn send_keys_option_token(token: &str) -> bool {
+    if send_keys_option_cluster(token).is_some() {
+        return true;
+    }
+    if let Some(flag) = equals_flag_letter(token) {
+        return matches!(flag, 't' | 'N');
+    }
+    let b = token.as_bytes();
+    b.len() > 2 && b[0] == b'-' && b[1] == b't'
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendKeysCliAction<'a> {
+    Execute,
+    Help,
+    InvalidLongOption(&'a str),
+}
+
+pub(crate) fn classify_send_keys_cli<'a>(args: &[&'a str]) -> SendKeysCliAction<'a> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--" {
+            return SendKeysCliAction::Execute;
+        }
+        if arg == "--help" {
+            return SendKeysCliAction::Help;
+        }
+        if arg.starts_with("--") {
+            return SendKeysCliAction::InvalidLongOption(arg);
+        }
+        let Some(flags) = send_keys_option_cluster(arg) else {
+            return SendKeysCliAction::Execute;
+        };
+        i += if flags.chars().last().is_some_and(|flag| matches!(flag, 't' | 'N')) {
+            2
+        } else {
+            1
+        };
+    }
+    SendKeysCliAction::Execute
+}
+
+pub(crate) fn parse_send_keys_args<'a>(args: &[&'a str]) -> ParsedSendKeysArgs<'a> {
+    let mut parsed = ParsedSendKeysArgs {
+        literal: false,
+        paste_mode: false,
+        copy_mode: false,
+        hex_mode: false,
+        reset: false,
+        mouse_mode: false,
+        has_repeat: false,
+        repeat_count: 1,
+        target: None,
+        operands: Vec::new(),
+        option_end: args.len(),
+    };
+    let mut parsing_options = true;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i];
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            i += 1;
+            continue;
+        }
+        let option_cluster = parsing_options.then(|| send_keys_option_cluster(arg)).flatten();
+        if let Some(flags) = option_cluster {
+            for flag in flags.chars() {
+                match flag {
+                    'l' => parsed.literal = true,
+                    'p' => parsed.paste_mode = true,
+                    'R' => parsed.reset = true,
+                    'X' => parsed.copy_mode = true,
+                    'H' => parsed.hex_mode = true,
+                    'M' => parsed.mouse_mode = true,
+                    'N' => parsed.has_repeat = true,
+                    _ => {}
+                }
+            }
+            if let Some(flag) = flags.chars().last().filter(|c| matches!(c, 't' | 'N')) {
+                if let Some(value) = args.get(i + 1).copied() {
+                    match flag {
+                        't' => parsed.target = Some(value),
+                        'N' => parsed.repeat_count = value.parse::<usize>().unwrap_or(1).max(1),
+                        _ => {}
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        parsing_options = false;
+        // Record the boundary once, at the first key operand. `i` is below
+        // `args.len()` whenever this runs, so the initial value cannot be
+        // mistaken for a boundary already found.
+        if parsed.option_end == args.len() {
+            parsed.option_end = i;
+        }
+        if !arg.is_empty() {
+            parsed.operands.push(arg);
+        }
+        i += 1;
+    }
+    parsed
+}
+
+pub(crate) fn build_send_keys_control_command(args: &[&str]) -> String {
+    let parsed = parse_send_keys_args(args);
+    let mut command = "send-keys".to_string();
+    if parsed.literal { command.push_str(" -l"); }
+    if parsed.paste_mode { command.push_str(" -p"); }
+    if parsed.reset { command.push_str(" -R"); }
+    if parsed.copy_mode { command.push_str(" -X"); }
+    if parsed.hex_mode { command.push_str(" -H"); }
+    if parsed.mouse_mode { command.push_str(" -M"); }
+    if parsed.has_repeat { command.push_str(&format!(" -N {}", parsed.repeat_count)); }
+    if !parsed.operands.is_empty() {
+        command.push_str(" --");
+        for operand in parsed.operands {
+            command.push(' ');
+            command.push_str(&crate::util::quote_arg(operand));
+        }
+    }
+    command
 }
 
 /// Strip the tmux exact-match marker from a raw target specification.
@@ -2194,6 +2487,19 @@ pub fn has_short_flag(args: &[&str], flag_char: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_keys_cli_classification_stops_at_the_operand_boundary() {
+        assert_eq!(classify_send_keys_cli(&["-l", "--help"]), SendKeysCliAction::Help);
+        assert_eq!(classify_send_keys_cli(&["-lt", "%1", "--help"]), SendKeysCliAction::Help);
+        assert_eq!(
+            classify_send_keys_cli(&["--hepl"]),
+            SendKeysCliAction::InvalidLongOption("--hepl")
+        );
+        assert_eq!(classify_send_keys_cli(&["--", "--help"]), SendKeysCliAction::Execute);
+        assert_eq!(classify_send_keys_cli(&["text", "--help"]), SendKeysCliAction::Execute);
+        assert_eq!(classify_send_keys_cli(&["-z", "--help"]), SendKeysCliAction::Execute);
+    }
 
     #[test]
     fn parse_target_window_name() {

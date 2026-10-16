@@ -538,7 +538,10 @@ fn pane_scope_target(raw: String) -> String {
         String::new()
     }
 }
-use crate::cli::{extract_flag_value, parse_set_option_args, parse_target};
+use crate::cli::{
+    classify_send_keys_cli, extract_flag_value, parse_send_keys_args,
+    parse_set_option_args, parse_target, send_keys_help_text, SendKeysCliAction,
+};
 use crate::util::base64_decode;
 use crate::control;
 
@@ -604,112 +607,43 @@ fn split_top_level_semicolons(s: &str) -> Vec<String> {
 /// control route used to carry its own copy that knew only -H and -l: -X
 /// typed its copy command's NAME into the pane, and -N and `--` were
 /// dropped (issue #799). The error is tmux's for a refused -X.
+///
+/// Flags and operands come from `cli::parse_send_keys_args`, so options are
+/// recognized only before `--` or the first key operand: `send-keys x -l`
+/// types `-l` into the pane instead of turning on literal mode and dropping
+/// the token, which is what scanning every argument for flag clusters did.
 fn send_keys_requests(args: &[&str], tx: &TargetedSender, client_id: u64) -> Result<(), String> {
-    // End-of-options: a bare `--` terminates flag parsing. Every token after
-    // it is an operand even if it begins with '-', and `--` itself is
-    // consumed. Without this, `send-keys -l -- -foo` dropped `--` as a dash
-    // token and dropped `-foo` because its first byte is '-', so a
-    // dash-leading literal had no deliverable spelling (issue #562).
-    let end_of_opts: Option<usize> = args.iter().position(|a| *a == "--");
-    let past_opts = |i: usize| -> bool { end_of_opts.is_some_and(|eo| i > eo) };
-    let is_marker = |i: usize| -> bool { end_of_opts == Some(i) };
-    // tmux short-flag clusters (e.g. iTerm2's `send -lt %1 l`): inspect
-    // each `-xyz` arg and check whether any of x/y/z is a known flag.
-    // Tokens at or after the `--` marker are operands, not flags.
-    let flag_has = |c: char| -> bool {
-        args.iter().enumerate().any(|(i, a)| {
-            !is_marker(i) && !past_opts(i)
-                && a.starts_with('-') && !a.starts_with("--")
-                && a.chars().skip(1).any(|fc| fc == c)
-        })
-    };
-    // Returns true if the previous arg is a short-flag cluster whose
-    // *trailing* character takes an operand (e.g. -t, -lt, -N).
-    let prev_consumes_operand = |i: usize| -> bool {
-        if i == 0 { return false; }
-        if is_marker(i - 1) || past_opts(i - 1) { return false; }
-        if let Some(prev) = args.get(i - 1) {
-            if prev.starts_with('-') && !prev.starts_with("--") && prev.len() >= 2 {
-                if let Some(last) = prev.chars().last() {
-                    return matches!(last, 't' | 'T' | 'N' | 'R' | 'c');
-                }
-            }
-        }
-        false
-    };
-    // A token counts as an operand (a key to deliver) when it is past the
-    // `--` marker, or when it is neither a flag cluster nor a flag's value.
-    // The `--` marker itself is never an operand.
-    let is_operand = |i: usize, a: &str| -> bool {
-        if is_marker(i) { return false; }
-        // An EMPTY argument sends nothing, as in tmux. Writing
-        // `send-keys -t x "X" ""` is an ordinary way to say "type X with no
-        // trailing newline", and the empty argument must produce no
-        // keystroke whatsoever.
-        //
-        // It used to qualify as an operand (an empty string does not start
-        // with '-') and travel on as a key NAMED "", which matched no key
-        // name and fell through to a handler that deleted the rest of the
-        // line. Measured against tmux 3.4 with an identical sequence:
-        //
-        //   type "echo arrow_ABC", then Left Left Left, then `"X" ""`
-        //     tmux   -> arrow_XABC
-        //     psmux  -> arrow_AX     (everything right of the cursor gone)
-        //
-        // It stayed hidden because it is invisible when the cursor is at the
-        // end of the line: only an edit in the MIDDLE of a line shows it.
-        // The check is before past_opts so an empty token after `--` is
-        // dropped too.
-        if a.is_empty() { return false; }
-        if past_opts(i) { return true; }
-        !a.starts_with('-') && !prev_consumes_operand(i)
-    };
-    let literal = flag_has('l');
-    let paste_mode = flag_has('p');
-    let has_x = flag_has('X');
-    let hex_mode = flag_has('H');
-    // tmux send-keys -M: forward the mouse event of the running mouse
-    // binding (see window_ops::send_mouse_event). It sends no keys.
-    let mouse_mode = flag_has('M');
-    // Parse -N <count> for repeat (look for any cluster ending in 'N')
-    let mut repeat_count: usize = 1;
-    if let Some(n_pos) = args.iter().enumerate().position(|(i, a)| !is_marker(i) && !past_opts(i) && a.starts_with('-') && !a.starts_with("--") && a.ends_with('N')) {
-        if let Some(count_str) = args.get(n_pos + 1) {
-            repeat_count = count_str.parse::<usize>().unwrap_or(1).max(1);
-        }
-    }
-    if mouse_mode {
+    let parsed = parse_send_keys_args(args);
+    let repeat_count = parsed.repeat_count;
+    if parsed.mouse_mode {
+        // tmux send-keys -M: forward the mouse event of the running mouse
+        // binding (see window_ops::send_mouse_event). It sends no keys.
         let _ = tx.send(CtrlReq::SendMouse(client_id));
-    } else if hex_mode {
+    } else if parsed.hex_mode {
         // tmux `send-keys -H`: every operand is one hexadecimal BYTE value.
         // tmux tags these keys KEYC_LITERAL and writes them to the pty as
         // single bytes ("can't be more than 8 bits"), so this is a byte
         // channel, not a codepoint channel.  Decode here and pass the raw
         // bytes through untouched so UTF-8 sequences and escape sequences
-        // survive verbatim.
+        // survive verbatim. A malformed operand is dropped rather than leaked
+        // into the pane as its literal token text.
         let mut bytes: Vec<u8> = Vec::new();
-        for (i, a) in args.iter().enumerate() {
-            if !is_operand(i, a) { continue; }
-            // A malformed operand is dropped rather than leaked into the
-            // pane as its literal token text.
-            if let Ok(byte) = u8::from_str_radix(a, 16) { bytes.push(byte); }
+        for operand in &parsed.operands {
+            if let Ok(byte) = u8::from_str_radix(operand, 16) { bytes.push(byte); }
         }
         if !bytes.is_empty() {
             for _ in 0..repeat_count {
                 let _ = tx.send(CtrlReq::SendBytes(bytes.clone()));
             }
         }
-    } else if has_x {
-        // send-keys -X copy-mode-command
-        let cmd_parts: Vec<&str> = args.iter().enumerate()
-            .filter(|(i, a)| is_operand(*i, a))
-            .map(|(_, a)| *a).collect();
-        // One request carrying the count: tmux hands -N to the copy
-        // command as its repeat (`wme->prefix`), and refuses -X outside
-        // a mode with "not in a mode" (cmd-send-keys.c).
+    } else if parsed.copy_mode {
+        // send-keys -X copy-mode-command. One request carrying the count:
+        // tmux hands -N to the copy command as its repeat (`wme->prefix`),
+        // and refuses -X outside a mode with "not in a mode"
+        // (cmd-send-keys.c).
         let (rtx, rrx) = mpsc::channel();
         let _ = tx.send(CtrlReq::SendKeysXRun {
-            cmd: cmd_parts.join(" "),
+            cmd: parsed.operands.join(" "),
             count: repeat_count,
             resp: Some(rtx),
         });
@@ -717,39 +651,33 @@ fn send_keys_requests(args: &[&str], tx: &TargetedSender, client_id: u64) -> Res
             return Err(e);
         }
     } else {
-        let keys: Vec<String> = args.iter()
-            .enumerate()
-            .filter(|(i, a)| is_operand(*i, a))
-            .map(|(_, a)| {
+        // An empty operand contributes no keystroke (tmux semantics);
+        // `parse_send_keys_args` already dropped it.
+        let mut any_hex = false;
+        let keys: Vec<String> = parsed.operands.iter()
+            .map(|a| {
                 // Convert real-tmux 0xNN hex codepoint syntax (sent by
                 // iTerm2's gateway: e.g. `send -t %1 0xd` for Enter) into
                 // the literal character so SendKeys forwards the right
                 // byte to the PTY instead of the string "0xd".
-                let s = *a;
-                if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                if let Some(rest) = a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")) {
                     if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
                         if let Ok(n) = u32::from_str_radix(rest, 16) {
                             if let Some(c) = char::from_u32(n) {
+                                any_hex = true;
                                 return c.to_string();
                             }
                         }
                     }
                 }
-                s.to_string()
+                (*a).to_string()
             })
             .collect();
         // If any key was a hex-converted single byte, force literal mode so
         // the byte is written verbatim and not parsed as a key name.
-        let any_hex = args.iter().any(|a| {
-            let s = *a;
-            if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit());
-            }
-            false
-        });
-        let effective_literal = literal || any_hex;
+        let effective_literal = parsed.literal || any_hex;
         for _ in 0..repeat_count {
-            if paste_mode {
+            if parsed.paste_mode {
                 let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
             } else {
                 // #490: hand the tokens over UNJOINED so quoted
@@ -759,6 +687,45 @@ fn send_keys_requests(args: &[&str], tx: &TargetedSender, client_id: u64) -> Res
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendKeysDispatchOutcome {
+    Dispatched,
+    Help,
+    InvalidLongOption(String),
+    ServerError(String),
+}
+
+/// The answer a send-keys line gets before any target is resolved, so help
+/// and a rejected option never reach a pane.
+fn classify_send_keys_before_targeting(args: &[&str]) -> Option<SendKeysDispatchOutcome> {
+    match classify_send_keys_cli(args) {
+        SendKeysCliAction::Execute => None,
+        SendKeysCliAction::Help => Some(SendKeysDispatchOutcome::Help),
+        SendKeysCliAction::InvalidLongOption(arg) => {
+            Some(SendKeysDispatchOutcome::InvalidLongOption(format!(
+                "unknown send-keys option '{}'; to send it literally, use: psmux send -- {}",
+                arg, arg
+            )))
+        }
+    }
+}
+
+/// Classify, then dispatch, one send-keys command line on both routes.
+fn dispatch_send_keys(args: &[&str], tx: &TargetedSender, client_id: u64) -> SendKeysDispatchOutcome {
+    if let Some(outcome) = classify_send_keys_before_targeting(args) {
+        return outcome;
+    }
+    // -R resets the target pane's parsed terminal state and screen, and the
+    // keys that follow it are delivered to the reset pane.
+    if parse_send_keys_args(args).reset {
+        let _ = tx.send(CtrlReq::ResetTerminal);
+    }
+    match send_keys_requests(args, tx, client_id) {
+        Ok(()) => SendKeysDispatchOutcome::Dispatched,
+        Err(error) => SendKeysDispatchOutcome::ServerError(error),
+    }
 }
 
 /// Try to decode a single `send`/`send-keys` command into the literal byte
@@ -774,55 +741,33 @@ fn send_keys_requests(args: &[&str], tx: &TargetedSender, client_id: u64) -> Res
 /// ESC byte and the `[A` and emits them as literal characters.  Coalescing
 /// guarantees the whole VT sequence reaches the shell in one read().
 fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
-    let toks = parse_command_line(line);
+    let toks = crate::cli::normalize_flag_equals(parse_command_line(line));
     if toks.is_empty() { return None; }
     let cmd = toks[0].as_str();
     if cmd != "send" && cmd != "send-keys" { return None; }
     let args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
+    // Only a command the send-keys classifier would execute may become bytes.
+    // Help and a rejected long option have to reach it intact, or a literal
+    // `send -lt %1 --help` would type "--help" into the pane.
+    if classify_send_keys_cli(&args) != SendKeysCliAction::Execute { return None; }
 
-    // Bail on modes that require special semantics.
-    let any_short = |c: char| {
-        args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.chars().skip(1).any(|fc| fc == c))
-    };
-    if any_short('X') || any_short('p') || any_short('N') || any_short('R') { return None; }
-    // A bare `--` means end-of-options, and the tokens after it are operands
-    // even if they begin with '-'. This coalescing fast path filters operands
-    // by `starts_with('-')`, which would drop them, so defer to the normal
-    // send-keys handler that understands `--` (issue #562).
-    if args.iter().any(|a| *a == "--") { return None; }
-
-    let prev_consumes_operand = |i: usize| -> bool {
-        if i == 0 { return false; }
-        if let Some(prev) = args.get(i - 1) {
-            if prev.starts_with('-') && !prev.starts_with("--") && prev.len() >= 2 {
-                if let Some(last) = prev.chars().last() {
-                    return matches!(last, 't' | 'T' | 'N' | 'R' | 'c');
-                }
-            }
-        }
-        false
-    };
-
-    // Find target (-t / -lt /...).  Default to %active if absent.
-    let mut target: Option<String> = None;
-    for (i, a) in args.iter().enumerate() {
-        if a.starts_with('-') && !a.starts_with("--") && a.ends_with('t') {
-            if let Some(t) = args.get(i + 1) { target = Some((*t).to_string()); break; }
-        }
+    let parsed = parse_send_keys_args(&args);
+    // -M forwards the running mouse binding's event and writes no keys at all,
+    // so it must reach the dispatcher rather than coalesce into an empty write.
+    if parsed.copy_mode || parsed.paste_mode || parsed.has_repeat || parsed.reset
+        || parsed.mouse_mode
+    {
+        return None;
     }
-
-    let literal = any_short('l');
-    // -H marks every operand as one raw hexadecimal byte (tmux KEYC_LITERAL).
-    let literal_byte = any_short('H');
+    let literal = parsed.literal;
+    let literal_byte = parsed.hex_mode;
     let mut bytes: Vec<u8> = Vec::new();
-    for (i, a) in args.iter().enumerate() {
-        if a.starts_with('-') { continue; }
-        if prev_consumes_operand(i) { continue; }
+    for a in parsed.operands {
         // An empty operand contributes no keystroke (tmux semantics), so it must
         // not reach the key lookup here either.
         if a.is_empty() { continue; }
         // Hex codepoint?
-        let s = *a;
+        let s = a;
         if literal_byte {
             match u8::from_str_radix(s, 16) {
                 Ok(byte) => { bytes.push(byte); continue; }
@@ -853,7 +798,7 @@ fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
         bytes.extend_from_slice(s.as_bytes());
     }
 
-    Some((target.unwrap_or_else(|| String::new()), bytes))
+    Some((parsed.target.unwrap_or("").to_string(), bytes))
 }
 
 /// The capture-pane forms that do not read the visible grid
@@ -2323,6 +2268,15 @@ if control_echo || control_noecho {
                 cmd_args
             }
         };
+        // A send-keys line is classified before any target is resolved, and
+        // its own `-t` comes from the parser: options stop at `--` or the
+        // first key operand, so the generic outer-`-t` scan below would read
+        // a literal `-t` token that is really a key for the pane.
+        let early_send_keys_outcome = matches!(cmd_name, "send-keys" | "send")
+            .then(|| classify_send_keys_before_targeting(&cmd_args))
+            .flatten();
+        let parsed_send_keys = matches!(cmd_name, "send-keys" | "send")
+            .then(|| parse_send_keys_args(&cmd_args));
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -2339,7 +2293,25 @@ if control_echo || control_noecho {
             matches!(cmd_name, "set-window-option" | "setw");
         let ctrl_set_args = ctrl_set_option
             .then(|| parse_set_option_args(&cmd_args));
-        if let Some(parsed_set) = ctrl_set_args.as_ref() {
+        if let Some(send_args) = parsed_send_keys.as_ref() {
+            if let Some(value) = send_args.target {
+                ctrl_raw_target = Some(crate::cli::strip_exact_match_prefix(value).to_string());
+                let parsed_target = parse_target(value);
+                if parsed_target.window.is_some() {
+                    ctrl_target_win = parsed_target.window;
+                    ctrl_target_win_is_id = parsed_target.window_is_id;
+                    ctrl_target_win_name = None;
+                } else if parsed_target.window_name.is_some() {
+                    ctrl_target_win_name = parsed_target.window_name;
+                    ctrl_target_win = None;
+                    ctrl_target_win_is_id = false;
+                }
+                if parsed_target.pane.is_some() {
+                    ctrl_target_pane = parsed_target.pane;
+                    ctrl_pane_is_id = parsed_target.pane_is_id;
+                }
+            }
+        } else if let Some(parsed_set) = ctrl_set_args.as_ref() {
             if let Some(value) = parsed_set.target {
                 ctrl_raw_target =
                     Some(crate::cli::strip_exact_match_prefix(value).to_string());
@@ -2384,7 +2356,7 @@ if control_echo || control_noecho {
             }
         }
 
-        let filtered_args = if ctrl_set_option {
+        let filtered_args = if parsed_send_keys.is_some() || ctrl_set_option {
             cmd_args.clone()
         } else {
             without_outer_target(cmd_name, &cmd_args)
@@ -2483,7 +2455,9 @@ if control_echo || control_noecho {
                 }
             }
         }
-        if focus_err.is_none() {
+        // A send-keys line that only asked for help, or that named an option
+        // this fork refuses, is answered below; it needs no temporary focus.
+        if focus_err.is_none() && early_send_keys_outcome.is_none() {
             if is_focus_cmd && matches!(cmd_name, "select-pane" | "selectp") {
                 // Issue #691: one request for the whole target, so the command
                 // fires its own hook (`after-select-pane`) once and never
@@ -2593,29 +2567,41 @@ if control_echo || control_noecho {
 
         // Dispatch command (use a oneshot for the response)
         let (resp_s, resp_r) = mpsc::channel::<String>();
-        let response_result = if let Some(err) = focus_err {
-            // Unresolvable -t target: skip dispatch entirely and surface
-            // the diagnostic through the %error path (sentinel encoding,
-            // same as dispatcher-signalled errors).
-            Some(Ok(format!("\u{0001}ERR\u{0001}{}", err)))
-        } else {
-            let targeted_tx = TargetedSender::new(&tx_ctrl, ctrl_command_target.take());
-            let dispatched = dispatch_control_command(
-                cmd_name, &filtered_args, &targeted_tx, resp_s,
-                ctrl_target_pane, ctrl_pane_is_id, ctrl_raw_target.as_deref(),
-                ctrl_client_id, ctrl_target_failed,
-            );
-            // Collect the response BEFORE acquiring the write lock, so the
-            // notification thread can still write while we wait.
-            if dispatched {
-                if early_begin {
-                    // A job takes as long as it takes; tmux waits for it.
-                    Some(resp_r.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected))
-                } else {
-                    Some(resp_r.recv_timeout(Duration::from_secs(5)))
-                }
+        let response_result = match early_send_keys_outcome {
+            // Help and a refused option are answered here: no target is
+            // resolved, nothing is dispatched and no pane is written to.
+            Some(SendKeysDispatchOutcome::Help) => Some(Ok(send_keys_help_text())),
+            Some(SendKeysDispatchOutcome::InvalidLongOption(error)) => {
+                Some(Ok(format!("\u{0001}ERR\u{0001}{}", error)))
+            }
+            Some(SendKeysDispatchOutcome::Dispatched)
+            | Some(SendKeysDispatchOutcome::ServerError(_)) => {
+                unreachable!("classification only yields Help or InvalidLongOption")
+            }
+            None => if let Some(err) = focus_err {
+                // Unresolvable -t target: skip dispatch entirely and surface
+                // the diagnostic through the %error path (sentinel encoding,
+                // same as dispatcher-signalled errors).
+                Some(Ok(format!("\u{0001}ERR\u{0001}{}", err)))
             } else {
-                None
+                let targeted_tx = TargetedSender::new(&tx_ctrl, ctrl_command_target.take());
+                let dispatched = dispatch_control_command(
+                    cmd_name, &filtered_args, &targeted_tx, resp_s,
+                    ctrl_target_pane, ctrl_pane_is_id, ctrl_raw_target.as_deref(),
+                    ctrl_client_id, ctrl_target_failed,
+                );
+                // Collect the response BEFORE acquiring the write lock, so the
+                // notification thread can still write while we wait.
+                if dispatched {
+                    if early_begin {
+                        // A job takes as long as it takes; tmux waits for it.
+                        Some(resp_r.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected))
+                    } else {
+                        Some(resp_r.recv_timeout(Duration::from_secs(5)))
+                    }
+                } else {
+                    None
+                }
             }
         };
 
@@ -2858,6 +2844,29 @@ loop {
     } else {
         args
     };
+    // Help and a refused long option are answered before any target is
+    // resolved, so `send-keys --help` never types into the focused pane.
+    if matches!(cmd, "send-keys" | "send") {
+        if let Some(outcome) = classify_send_keys_before_targeting(&args) {
+            match outcome {
+                SendKeysDispatchOutcome::Help => {
+                    let _ = write!(write_stream, "{}", send_keys_help_text());
+                }
+                SendKeysDispatchOutcome::InvalidLongOption(error) => {
+                    let _ = writeln!(write_stream, "ERROR: {}", error);
+                }
+                SendKeysDispatchOutcome::Dispatched | SendKeysDispatchOutcome::ServerError(_) => unreachable!(),
+            }
+            let _ = write_stream.flush();
+            if !persistent && pending_chain.is_empty() { break; }
+            line.clear();
+            continue;
+        }
+    }
+    // The send-keys target comes from the parser, not the generic outer-`-t`
+    // scan below: options stop at `--` or the first key operand.
+    let parsed_send_keys = matches!(cmd, "send-keys" | "send")
+        .then(|| parse_send_keys_args(&args));
 
 // Issue #635: a value-taking flag with nothing after it never runs. Checked
 // here, before any target resolution or temp focus, so the failure path has
@@ -2933,7 +2942,25 @@ let set_option_command = matches!(
     cmd,
     "set-option" | "set" | "set-window-option" | "setw"
 );
-if set_option_command {
+if let Some(send_args) = parsed_send_keys.as_ref() {
+    if let Some(value) = send_args.target {
+        raw_target = Some(crate::cli::strip_exact_match_prefix(value).to_string());
+        let parsed_target = parse_target(value);
+        if parsed_target.window.is_some() {
+            target_win = parsed_target.window;
+            target_win_is_id = parsed_target.window_is_id;
+            target_win_name = None;
+        } else if parsed_target.window_name.is_some() {
+            target_win_name = parsed_target.window_name;
+            target_win = None;
+            target_win_is_id = false;
+        }
+        if parsed_target.pane.is_some() {
+            target_pane = parsed_target.pane;
+            pane_is_id = parsed_target.pane_is_id;
+        }
+    }
+} else if set_option_command {
     if let Some(value) = parse_set_option_args(&args).target {
         raw_target = Some(crate::cli::strip_exact_match_prefix(value).to_string());
         let parsed_target = parse_target(value);
@@ -2977,7 +3004,7 @@ if set_option_command {
         i += 1;
     }
 }
-let args = if set_option_command {
+let args = if parsed_send_keys.is_some() || set_option_command {
     args
 } else {
     without_outer_target(cmd, &args)
@@ -3669,10 +3696,32 @@ match cmd {
     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
     "send-keys" | "send" => {
-        if let Err(e) = send_keys_requests(&args, tx, client_id) {
-            if !persistent {
-                let _ = writeln!(write_stream, "ERROR: {}", e);
+        // Dispatched keys fall through to the loop tail like every other
+        // fire-and-forget command, so a one-shot connection goes on to run a
+        // chained tail and answer send_control's `session-info` execution
+        // barrier. Ending the connection here returned the CLI while the keys
+        // were still queued. Help and a rejected option answer and stop.
+        match dispatch_send_keys(&args, tx, client_id) {
+            SendKeysDispatchOutcome::Dispatched => {}
+            SendKeysDispatchOutcome::ServerError(error) => {
+                if !persistent {
+                    let _ = writeln!(write_stream, "ERROR: {}", error);
+                    let _ = write_stream.flush();
+                }
+            }
+            SendKeysDispatchOutcome::Help => {
+                let _ = write!(write_stream, "{}", send_keys_help_text());
                 let _ = write_stream.flush();
+                if !persistent && pending_chain.is_empty() { break; }
+                line.clear();
+                continue;
+            }
+            SendKeysDispatchOutcome::InvalidLongOption(error) => {
+                let _ = writeln!(write_stream, "ERROR: {}", error);
+                let _ = write_stream.flush();
+                if !persistent && pending_chain.is_empty() { break; }
+                line.clear();
+                continue;
             }
         }
     }
@@ -3863,7 +3912,14 @@ match cmd {
     }
     "rename-session" | "rename" => {
         if let Some(name) = crate::cli::first_operand("rename-session", &args) {
-            let _ = tx.send(CtrlReq::RenameSession(name.to_string()));
+            let (rtx, rrx) = mpsc::channel();
+            let _ = tx.send(CtrlReq::RenameSession(name.to_string(), rtx));
+            if let Ok(Err(error)) = rrx.recv_timeout(std::time::Duration::from_secs(5)) {
+                if !persistent {
+                    let _ = writeln!(write_stream, "ERROR: {}", error);
+                    let _ = write_stream.flush();
+                }
+            }
         }
     }
     "claim-session" => {
@@ -6740,11 +6796,17 @@ fn dispatch_control_command(
             // (cmd-send-keys.c:253). The -H branch of the copy this replaced
             // returned without answering, so the dropped sender came out as
             // `command timed out` / %error (issue #799); every merged
-            // `send -l` took that branch too.
-            match send_keys_requests(args, tx, client_id) {
-                Ok(()) => { let _ = resp_tx.send(String::new()); }
-                Err(e) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
-            }
+            // `send -l` took that branch too. Help and a refused option are
+            // answered from here too, and reach no pane.
+            let response = match dispatch_send_keys(args, tx, client_id) {
+                SendKeysDispatchOutcome::Dispatched => String::new(),
+                SendKeysDispatchOutcome::Help => send_keys_help_text(),
+                SendKeysDispatchOutcome::InvalidLongOption(error)
+                | SendKeysDispatchOutcome::ServerError(error) => {
+                    format!("\u{0001}ERR\u{0001}{}", error)
+                }
+            };
+            let _ = resp_tx.send(response);
             true
         }
         "capture-pane" | "capturep" => {
@@ -6885,9 +6947,25 @@ fn dispatch_control_command(
         }
         "rename-session" | "rename" => {
             if let Some(name) = args.last() {
-                let _ = tx.send(CtrlReq::RenameSession(name.trim_matches('"').to_string()));
+                let (rtx, rrx) = mpsc::channel();
+                let _ = tx.send(CtrlReq::RenameSession(
+                    name.trim_matches('"').to_string(),
+                    rtx,
+                ));
+                match rrx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Err(error)) => {
+                        let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error));
+                    }
+                    Ok(Ok(())) => {
+                        let _ = resp_tx.send(String::new());
+                    }
+                    Err(_) => {
+                        let _ = resp_tx.send("\u{0001}ERR\u{0001}rename did not complete".to_string());
+                    }
+                }
+            } else {
+                let _ = resp_tx.send("\u{0001}ERR\u{0001}rename-session requires a name".to_string());
             }
-            let _ = resp_tx.send(String::new());
             true
         }
         "set-option" | "set" | "set-window-option" | "setw" => {

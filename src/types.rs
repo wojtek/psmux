@@ -277,10 +277,12 @@ pub struct Pane {
     /// Windows default, so it does NOT mean the child asked), while the raw
     /// mode shape says the child deliberately configured itself to read them.
     pub mouse_input_cache: Option<(Instant, Option<u32>)>,
-    /// True once psmux has written a WIN32 INPUT MODE key sequence
+    /// True once the pane application has requested WIN32 INPUT MODE or psmux
+    /// has written a WIN32 INPUT MODE key sequence
     /// (`ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`) into this pane's ConPTY input
-    /// pipe — today only `send-keys C-<letter>`, which needs that form so the
-    /// child sees a real `VK + LEFT_CTRL_PRESSED` record (issue #305).
+    /// pipe. Console TUIs request it with DEC private mode 9001; `send-keys
+    /// C-<letter>` also needs that form so the child sees a real
+    /// `VK + LEFT_CTRL_PRESSED` record (issue #305).
     ///
     /// It has to be remembered because writing one is a ONE-WAY latch on the
     /// other side: conhost's input state machine concludes the terminal speaks
@@ -293,8 +295,8 @@ pub struct Pane {
     /// sequence and is swallowed after it, while the same key written AS a
     /// win32 sequence arrives correctly either way.
     ///
-    /// So once this is set, `input::write_pane_input` encodes a lone Escape in
-    /// win32 form too, which is the only thing conhost still accepts.  It
+    /// So once this is set, `input::write_pane_input` encodes a lone Escape and
+    /// modified newline keys in win32 form, which is what conhost accepts. It
     /// belongs to the pane because the latch belongs to that one ConPTY: a new
     /// window is unaffected, and `respawn_active_pane` clears it with the rest
     /// of the per-ConPTY caches.
@@ -1899,6 +1901,8 @@ pub struct AppState {
     pub set_titles: bool,
     /// set-titles-string: format for terminal title
     pub set_titles_string: String,
+    /// tab-colour: host terminal tab colour (empty resets the terminal default)
+    pub tab_colour: String,
     /// update-environment: list of env var names to update from client on attach
     pub update_environment: Vec<String>,
     /// Environment variables set via set-environment
@@ -3224,6 +3228,7 @@ impl AppState {
             aggressive_resize: false,
             set_titles: false,
             set_titles_string: String::new(),
+            tab_colour: String::new(),
             update_environment: vec![
                 "DISPLAY".to_string(),
                 "KRB5CCNAME".to_string(),
@@ -3736,6 +3741,9 @@ pub enum CtrlReq {
     // re-split on whitespace — that collapsed runs of spaces inside quoted
     // arguments and stripped leading/trailing spaces.
     SendKeys(Vec<String>, bool),
+    /// send-keys -R: reset the parsed terminal state and screen.
+    /// Like every request from a targeted command, this carries its own target.
+    ResetTerminal,
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
@@ -3780,7 +3788,7 @@ pub enum CtrlReq {
     },
     KillSession,
     HasSession(mpsc::Sender<bool>),
-    RenameSession(String),
+    RenameSession(String, mpsc::Sender<Result<(), String>>),
     /// Claim a warm server: rename session + send response so CLI knows it's done.
     /// Fields: session name, optional client CWD, optional client priority,
     /// optional path to the client's environment block, optional initial

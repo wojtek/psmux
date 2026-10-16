@@ -41,18 +41,17 @@ fn write_registry(dir: &std::path::Path, session: &str, port: &str) -> (PathBuf,
     (port_path, key_path, sid_path)
 }
 
-/// Spawn a short-lived real process and return its PID after it has exited.
-/// This produces a PID that is genuinely dead (not fabricated), matching what
-/// a hard-killed session server leaves behind in its .pid file.
+/// The signed `.pid` body (`pid:creation`) of a server that is certainly gone.
+/// Windows assigns PIDs far below this value, so no process, running, exiting
+/// or recycled, can hold it. An exited child's real PID is not deterministic on
+/// a busy CI runner: the process table can still list it, or a protected
+/// process can take it over, while it cannot be opened. Under the fork's
+/// identity rule (FORK.md) that is inconclusive and runs the network probe
+/// these tests forbid.
 #[cfg(windows)]
-fn dead_pid() -> u32 {
-    let mut child = std::process::Command::new("cmd")
-        .args(["/c", "exit"])
-        .spawn()
-        .expect("spawn cmd");
-    let pid = child.id();
-    let _ = child.wait();
-    pid
+fn dead_pid_anchor() -> String {
+    const NEVER_ASSIGNED_PID: u32 = 0xFFFF_FFFC;
+    format_pid_file_contents(NEVER_ASSIGNED_PID, 1)
 }
 
 #[cfg(windows)]
@@ -61,7 +60,7 @@ fn dead_pid_anchor_reaps_registry_without_any_network_probe() {
     let dir = temp_psmux_dir("pid_anchor_dead");
     let (port_path, key_path, sid_path) = write_registry(&dir, "crashed", "54329");
     let pid_path = dir.join("crashed.pid");
-    fs::write(&pid_path, dead_pid().to_string()).unwrap();
+    fs::write(&pid_path, dead_pid_anchor()).unwrap();
 
     // The probe must never run: a dead .pid anchor is definitive on its own.
     cleanup_stale_port_files_in_with(&dir, |_, _| {
@@ -77,16 +76,21 @@ fn dead_pid_anchor_reaps_registry_without_any_network_probe() {
 
 #[cfg(windows)]
 #[test]
-fn pid_recycled_by_unrelated_image_is_reaped_without_probe() {
-    // The current test process is alive but its image is not `psmux.exe`
-    // (cargo test binaries are named psmux-<hash>), which models a PID that
-    // was recycled by an unrelated application after the server died.
+fn recycled_pid_is_reaped_without_probe_when_its_signature_does_not_match() {
+    // Fork identity rule (FORK.md; `pid_anchor_verdict`): the recorded pid:creation pair decides, never the image name.
+    // The current test process is alive, as an unrelated application holding
+    // a dead server's recycled PID would be. The `.pid` body records that PID
+    // with a creation time this process does not have, so the server that
+    // wrote it is provably gone.
     let dir = temp_psmux_dir("pid_anchor_recycled");
     let (port_path, _, _) = write_registry(&dir, "recycled", "54330");
-    fs::write(dir.join("recycled.pid"), std::process::id().to_string()).unwrap();
+    let pid = std::process::id();
+    let live_creation = crate::platform::process_kill::process_creation_time(pid)
+        .expect("the running test process has a creation time");
+    fs::write(dir.join("recycled.pid"), format_pid_file_contents(pid, live_creation - 1)).unwrap();
 
     cleanup_stale_port_files_in_with(&dir, |_, _| {
-        panic!("network probe must not run when the PID belongs to another image");
+        panic!("network probe must not run when the recorded signature does not match");
     });
 
     assert!(!port_path.exists(), "recycled-PID registry must be reaped");
@@ -137,10 +141,10 @@ fn cleanup_with_many_dead_pid_registries_is_fast() {
     // With the PID anchor, even 6 dead registries must clean up in well under
     // the cost of a single 100ms probe attempt.
     let dir = temp_psmux_dir("pid_anchor_speed");
-    let dead = dead_pid();
+    let dead = dead_pid_anchor();
     for i in 0..6 {
         write_registry(&dir, &format!("dead{i}"), &format!("5430{i}"));
-        fs::write(dir.join(format!("dead{i}.pid")), dead.to_string()).unwrap();
+        fs::write(dir.join(format!("dead{i}.pid")), &dead).unwrap();
     }
 
     let start = Instant::now();

@@ -3,7 +3,8 @@
 // or `env` the user defined in their profile was replaced in every pane (and
 // the claude wrapper cannot chain to a user function, its Get-Command filter
 // skips functions on purpose, #475). Each psmux definition must now be
-// skipped when the name is already a function, filter or alias.
+// skipped for filters and aliases. The fork composes a user claude function
+// with teammate mode instead of replacing its defaults.
 //
 // Also: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS was forced to 1 in every pane,
 // outside the claude-code-fix-tty gate and over a value the user had set.
@@ -12,7 +13,7 @@ use super::{build_psrl_init, build_psrl_init_noprofile, set_tmux_env, ENV_SHIM_P
 use portable_pty::CommandBuilder;
 
 const ENV_GUARD: &str = "if(-not((Test-Path Function:env) -or (Test-Path Alias:env))){ function Global:env { ";
-const CLAUDE_GUARD: &str = "-not((Test-Path Function:claude) -or (Test-Path Alias:claude))){ ";
+const CLAUDE_GUARD: &str = "-not (Test-Path Alias:claude) -and -not (Get-Command claude -CommandType Filter -EA 0)){ ";
 
 #[test]
 fn init_string_guards_env_and_claude_after_profile() {
@@ -80,9 +81,13 @@ fn after_shim(profile: &str) -> Option<String> {
 
 #[test]
 fn user_functions_win_over_the_shim() {
-    let Some(out) = after_shim("function claude { 'USER-CLAUDE' }; function env { 'USER-ENV' }") else { return };
-    assert!(out.contains("claude=Function|'USER-CLAUDE'"), "user claude function replaced:\n{out}");
-    assert!(out.contains("env=Function|'USER-ENV'"), "user env function replaced:\n{out}");
+    let probe = format!(
+        "function claude {{ 'USER-CLAUDE|--user-default|' + ($args -join '|') }}; function env {{ 'USER-ENV' }}; {ENV_SHIM_PS}; function Global:_psmux_tmcfg {{ $false }}; $env:PATH=''; claude hello; claude --teammate-mode in-process world; env"
+    );
+    let Some(out) = pwsh(&probe) else { return };
+    assert!(out.contains("USER-CLAUDE|--user-default|--teammate-mode|tmux|hello"), "user defaults or teammate mode lost:\n{out}");
+    assert!(out.contains("USER-CLAUDE|--user-default|--teammate-mode|in-process|world"), "explicit teammate mode changed:\n{out}");
+    assert!(out.contains("USER-ENV"), "user env function replaced:\n{out}");
 }
 
 #[test]
@@ -116,11 +121,11 @@ fn teams(builder: &CommandBuilder) -> Option<String> {
 }
 
 #[test]
-fn agent_teams_defaults_to_one_under_fix_tty() {
+fn agent_teams_stays_opt_in_under_fix_tty() {
     let mut b = CommandBuilder::new("pwsh");
     b.env_remove("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
     set_tmux_env(&mut b, 1, Some(1), None, "s", true, false);
-    assert_eq!(teams(&b).as_deref(), Some("1"));
+    assert_eq!(teams(&b), None);
 }
 
 #[test]

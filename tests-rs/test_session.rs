@@ -208,6 +208,45 @@ fn auth_rejected_returns_none() {
 }
 
 #[test]
+fn authed_multi_ok_eof_is_accepted_without_payload() {
+    let mut response = std::io::Cursor::new(b"OK\n");
+
+    assert_eq!(
+        read_authed_all_outcome(&mut response),
+        AuthedResponse::Accepted { payload: None }
+    );
+}
+
+#[test]
+fn authed_multi_error_is_server_error() {
+    let mut response = std::io::Cursor::new(b"OK\nERROR: x\n");
+
+    assert_eq!(
+        read_authed_all_outcome(&mut response),
+        AuthedResponse::ServerError("ERROR: x".to_string())
+    );
+}
+
+#[test]
+fn authed_multi_read_failure_is_transport_failure() {
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "forced read failure",
+            ))
+        }
+    }
+
+    assert_eq!(
+        read_authed_all_outcome(&mut FailingReader),
+        AuthedResponse::TransportFailure
+    );
+}
+
+#[test]
 fn stale_cleanup_removes_invalid_port_and_key() {
     let dir = temp_psmux_dir("stale_cleanup_invalid");
     let (port_path, key_path, sid_path) = write_registry_files(&dir, "bad", "not-a-port");
@@ -549,4 +588,69 @@ fn confirms_identity_rejects_recycled_pid() {
 fn confirms_identity_rejects_unqueryable_process() {
     // Process gone, or OpenProcess/GetProcessTimes failed: fail safe, no kill.
     assert!(!confirms_identity(None, 567890));
+}
+
+// --- pid_anchor_decision: an image name never proves a server is dead --------
+
+fn anchor_process(name: &str, creation: Option<u64>) -> LiveAnchorProcess {
+    LiveAnchorProcess { name: name.to_string(), creation }
+}
+
+#[test]
+fn pid_anchor_reports_dead_when_no_process_holds_the_pid() {
+    assert_eq!(pid_anchor_decision(Some(4242), None, Some(1000)), Some(false));
+}
+
+#[test]
+fn pid_anchor_trusts_the_recorded_signature_over_a_foreign_image_name() {
+    // The 2026-09-10 failure: the installed binary was renamed in place, so
+    // every live server began reporting an unrecognised image name while
+    // staying perfectly healthy. The recorded pid/creation pair still names
+    // that exact process, so the anchor must say alive.
+    let process = anchor_process("psmux.exe.pre-upstream-refresh-20260910", Some(4242));
+    assert_eq!(
+        pid_anchor_decision(Some(4242), Some(&process), Some(1000)),
+        Some(true)
+    );
+}
+
+#[test]
+fn pid_anchor_reports_dead_when_the_recorded_signature_does_not_match() {
+    // Same pid, different creation time: the pid was reused and the instance
+    // that wrote the file is provably gone.
+    let process = anchor_process("psmux", Some(9999));
+    assert_eq!(
+        pid_anchor_decision(Some(4242), Some(&process), Some(1000)),
+        Some(false)
+    );
+}
+
+#[test]
+fn pid_anchor_is_inconclusive_for_an_unsigned_entry_with_a_foreign_name() {
+    // A pre-#448 `.pid` body carries no creation time, so nothing confirms
+    // identity. An unrecognised name alone must not delete a registry entry;
+    // the caller falls back to the network probe.
+    let process = anchor_process("muxprobe", Some(4242));
+    assert_eq!(pid_anchor_decision(None, Some(&process), Some(1000)), None);
+}
+
+#[test]
+fn pid_anchor_accepts_an_unsigned_entry_with_a_known_name() {
+    let process = anchor_process("psmux", Some(1000));
+    assert_eq!(
+        pid_anchor_decision(None, Some(&process), Some(1000)),
+        Some(true)
+    );
+}
+
+#[test]
+fn pid_anchor_keeps_the_unsigned_reuse_guard() {
+    // No signature, recognised name, but created well after the `.pid` file was
+    // last written: it cannot be the server that wrote it.
+    let created = 1000u64 + PID_REUSE_MARGIN_TICKS + 1;
+    let process = anchor_process("psmux", Some(created));
+    assert_eq!(
+        pid_anchor_decision(None, Some(&process), Some(1000)),
+        Some(false)
+    );
 }

@@ -122,6 +122,13 @@ fn every_required_flag_of_every_command_is_rejected_when_dangling() {
     for (name, alias, template) in ARGS_TEMPLATES {
         for flag in required_flags(template) {
             let arg = format!("-{}", flag);
+            // The fork treats unsupported send-keys short options as the first
+            // literal key operand; only -t and -N require values on this route.
+            if *name == "send-keys" && !matches!(flag, 't' | 'N') {
+                ok(name, &[&arg]);
+                if !alias.is_empty() { ok(alias, &[&arg]); }
+                continue;
+            }
             let expected = format!("-{} expects an argument", flag);
             assert_eq!(err(name, &[&arg]), expected, "command {}", name);
             if !alias.is_empty() {

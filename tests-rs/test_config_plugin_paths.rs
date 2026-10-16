@@ -15,15 +15,18 @@ fn mock_app() -> AppState {
 struct EnvGuard {
     orig_userprofile: Option<String>,
     orig_home: Option<String>,
+    orig_xdg_config: Option<String>,
 }
 impl EnvGuard {
     fn new(home: &str) -> Self {
         let g = Self {
             orig_userprofile: std::env::var("USERPROFILE").ok(),
             orig_home: std::env::var("HOME").ok(),
+            orig_xdg_config: std::env::var("XDG_CONFIG_HOME").ok(),
         };
         std::env::set_var("USERPROFILE", home);
         std::env::set_var("HOME", home);
+        std::env::set_var("XDG_CONFIG_HOME", std::path::Path::new(home).join(".config"));
         g
     }
 }
@@ -32,6 +35,10 @@ impl Drop for EnvGuard {
         match &self.orig_userprofile {
             Some(v) => std::env::set_var("USERPROFILE", v),
             None => std::env::remove_var("USERPROFILE"),
+        }
+        match &self.orig_xdg_config {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         match &self.orig_home {
             Some(v) => std::env::set_var("HOME", v),

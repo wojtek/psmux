@@ -680,6 +680,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("terminal-overrides",         "\"\""),
     ("set-clipboard",              "external"),
     ("set-titles-string",          "\"\""),
+    ("tab-colour",                 "\"\""),
     // psmux extensions
     ("cursor-style",               "default"),
     ("cursor-blink",               "off"),

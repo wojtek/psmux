@@ -207,6 +207,7 @@ so muscle memory carries over.
 | `f` | Enter session-name filter mode (choose-session only) |
 | `p` | Toggle live preview |
 | `x` | Kill the highlighted entry (session in choose-session, window in choose-tree), with confirmation |
+| `$` | Rename the highlighted session (choose-session only) |
 | `Esc` | Answer a pending kill question with no; otherwise clear an active session filter; otherwise close the chooser |
 | `q` / `C-g` | Close the chooser (`q` types into an active session filter instead) |
 
@@ -219,6 +220,10 @@ filter text closes the picker.
 `Prefix + &` do, and as tmux's chooser does. Only `y` kills; every other key
 cancels, including `Enter`, which inside a chooser is the key that activates a
 row. The chooser stays open behind the question either way.
+
+Run `psmux pick` from a normal shell to attach and open the session picker in
+one step. `$` renames the highlighted session inside its own `-L` namespace, on
+a background worker, so `Enter` never waits on the network.
 
 `q` closes these choosers as it closes every tmux mode. Every other printable key not listed
 above is swallowed so it cannot leak into the focused pane. The pane's cursor is hidden while a

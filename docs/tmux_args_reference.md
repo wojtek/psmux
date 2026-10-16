@@ -34,6 +34,7 @@ This is the reference for the commands **psmux itself** accepts and the flags **
 | `choose-buffer` | `chooseb` | none | CLI, SRV, CFG |
 | `choose-client` | *(none)* | none | CLI, SRV, CFG |
 | `choose-session` | *(none)* | none | CLI, SRV, CFG |
+| `pick` | *(none)* | `t:` | CLI, SRV |
 | `choose-tree` | *(none)* | none | CLI, SRV, CFG |
 | `choose-window` | *(none)* | none | CLI, SRV, CFG |
 | `clear-history` | `clearhist` | `Ht:` | CLI, SRV, CFG |
@@ -156,6 +157,10 @@ Five mouse wire commands are an exception and are genuinely usable for scripting
 - Value: `-t` (target session)
 - A bare positional argument is also accepted as the session name, so `psmux attach work` works.
 - Not accepted: `-d`, `-D`, `-E`, `-r`, `-c`, `-f`, `-x`, `-y`
+
+**pick** (psmux extension)
+- Uses attach-session target resolution, then opens the full-width session picker immediately.
+- Inside an attached psmux client, forwards `choose-session` to that client.
 
 **has-session** (`has`)
 - Value: `-t` (target session). A leading `=` is stripped, matching tmux exact match semantics.
