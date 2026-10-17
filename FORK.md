@@ -3,9 +3,9 @@
 This fork follows upstream psmux and keeps only behavior the Elysium workflow
 still requires and upstream does not yet provide.
 
-The current base is `marlocarlo/master` at
-`e95398c9c9a6b858d4c52415d951b5380dbd3eda` (2026-10-17). The maintained layer
-is reapplied on that tip, without the previous fork history.
+Upstream is merged into the fork's `master`; the last merged upstream commit is
+`e95398c9c9a6b858d4c52415d951b5380dbd3eda` (2026-10-17). Diffing that commit
+against `master` shows the whole fork layer.
 
 ## Maintained differences
 
@@ -244,13 +244,19 @@ upstream owns alias expansion and where `normalize_flag_equals` runs.
 ## Updating upstream
 
 Before any fork-specific code change, fetch current `marlocarlo/master` and
-bring the fork's `master` forward first. Rebuild directly from that upstream tip
-and reapply only the maintained differences above. Land the verified result on
-the fork's `master`; routine maintenance of this fork does not use published
-side branches or pull requests within the fork. A temporary detached worktree
-is allowed when needed to protect active uncommitted files. If upstream now
-provides a maintained difference, keep upstream's implementation and remove the
-redundant fork patch. Do not merge accumulated fork history over the new base.
+merge it into the fork's `master` first; publishing `master` is then an ordinary
+push. `master` is never rewritten or force-pushed, because every machine's clone
+pulls it; a merge compares against the last merged upstream commit, so it
+resolves the same conflicts a rebuild from the upstream tip would. A rebuild
+with a force-push is the owner's decision, not routine maintenance. Resolve
+each conflict so both sides' intent survives, check every maintained difference
+above against what upstream changed, and update the last merged commit at the
+top of this file. If upstream now provides a maintained difference, keep
+upstream's implementation and remove the redundant fork patch. Never revive a
+fork change this file no longer lists, from older history or an old branch.
+Routine maintenance of this fork does not use published side branches or pull
+requests within the fork. A temporary detached worktree is allowed when needed
+to protect active uncommitted files.
 
 Run the focused, server-free Rust tests for the retained differences and
 `cargo check` locally. Run the complete suite only in CI or another disposable

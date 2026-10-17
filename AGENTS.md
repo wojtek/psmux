@@ -3,12 +3,20 @@
 ## Upstream-First Fork Maintenance
 
 - Treat current `marlocarlo/master` as the base for all psmux work. Before
-  changing fork behavior, fetch that branch and bring the fork forward first.
-- Rebuild from the current upstream tip and reapply only the deliberate
-  differences recorded in `FORK.md`. Do not merge accumulated fork history over
-  a newer upstream or revive an older fork change because it still exists in
-  history.
-- Land routine upstream refreshes and fork maintenance directly on the fork's
+  changing fork behavior, fetch that branch and merge it into the fork's
+  `master` first.
+- Bring upstream in with an ordinary merge into `master`; publishing `master` is
+  then an ordinary push. Never rewrite `master` or force-push it: every
+  machine's clone pulls it, and a rewrite would make each of them reset
+  instead. A merge compares against the last upstream commit already merged, so
+  it resolves the same conflicts a rebuild from the upstream tip would.
+  Rebuilding `master` from the upstream tip, which needs a force-push, is the
+  owner's decision, not routine maintenance.
+- Resolve each conflict so both sides' intent survives, then check every
+  difference in `FORK.md` against what upstream changed. `FORK.md` lists the
+  only deliberate differences: never merge an old branch or revive a fork change
+  it no longer lists, even though it still exists in history.
+- Land routine upstream merges and fork maintenance directly on the fork's
   `master`. Do not publish a side branch or open a pull request inside this fork
   for that work. A temporary detached worktree may be used to protect active
   uncommitted files, but it is not part of the repository workflow.
