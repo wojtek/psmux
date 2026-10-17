@@ -156,6 +156,11 @@ is reapplied on that tip, without the previous fork history.
   still reaches the child untouched, as upstream's #805 intended. Upstream's
   `set -g claude-code-fix-tty off` also stops the default, but it takes the
   teammate-mode flag injection with it, which is not the same choice.
+- Ctrl+Delete in the `prefix $` / `prefix ,` rename overlay clears the whole
+  name through the prompt editor's existing C-u action, so the name the overlay
+  opens on goes in one key. Upstream treats Ctrl+Delete there as a plain
+  Delete, which does nothing at the end of the prefilled name. `prompt_edit`
+  itself is unchanged.
 
 ## Upstream-owned and excluded behavior
 

@@ -7083,6 +7083,13 @@ fn run_remote_attachment(
                                 KeyCode::Backspace if renaming => {
                                     let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "backspace", || None);
                                 }
+                                // Ctrl+Delete clears the whole name, as C-u
+                                // does, so the name the overlay opens on goes
+                                // in one key instead of a Backspace per
+                                // character.
+                                KeyCode::Delete if renaming && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "c-u", || None);
+                                }
                                 KeyCode::Delete if renaming => {
                                     let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "delete", || None);
                                 }
