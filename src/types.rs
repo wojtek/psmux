@@ -24,6 +24,10 @@ pub const GIT_DIRTY: &str = env!("PSMUX_GIT_DIRTY");
 /// holds an ambiguous Escape (`ssh_input::escape_wait_ms`).
 pub const DEFAULT_ESCAPE_TIME_MS: u64 = 10;
 
+/// `AppState::last_window_idx` when the session has no last window (a fresh
+/// session, or after the last window was killed).
+pub const NO_LAST_WINDOW: usize = usize::MAX;
+
 /// Human-readable build provenance line, e.g.
 ///
 ///   `psmux 3.3.7 (a1b2c3d 2026-07-20)`
@@ -927,7 +931,7 @@ impl WarmPool {
         let wp = self.spares.pop_front();
         if let Some(ref w) = wp {
             // Handing this id out puts every lower id in the past, exactly as a
-            // cold spawn taking `ids.next_pane` does, so record it as issued.
+            // cold spawn taking `next_pane_id` does, so record it as issued.
             //
             // The pool is sorted and this took its front, so normally the id
             // handed out IS the lowest outstanding one and this changes
@@ -1262,7 +1266,8 @@ pub struct Window {
     /// True when the user has manually renamed this window (auto-rename won't override).
     /// Cleared when `set automatic-rename on` is explicitly set.
     pub manual_rename: bool,
-    /// Current position in the named layout cycle (0..4)
+    /// The last named layout applied, plus one (0: none yet, tmux
+    /// `lastlayout == -1`). See `layout::cycle_layout`.
     pub layout_index: usize,
     /// Per-pane MRU (most-recently-used) order: pane IDs ordered by recency.
     /// Front = most recently focused.  Used for:
@@ -1299,7 +1304,7 @@ pub struct FloatingPane {
     /// Border line style: a `pane-border-lines` value
     /// (single/double/heavy/simple/none). Empty or "single" => default single.
     pub border: String,
-    /// Unique pane id (shares the `ids.next_pane` space with tiled panes).
+    /// Unique pane id (shares the `next_pane_id` space with tiled panes).
     pub id: usize,
     pub title: String,
     /// Last `-P` position keyword (top-left/centre/...), kept so the float can
@@ -1495,56 +1500,6 @@ pub struct ShellEntry {
     pub value: String,
     /// A background worker for this command is currently in flight.
     pub running: bool,
-}
-
-#[derive(Debug)]
-pub struct ServerIds {
-    next_window: usize,
-    next_pane: usize,
-    next_forward: u64,
-}
-
-impl Default for ServerIds {
-    fn default() -> Self {
-        Self {
-            next_window: 1,
-            next_pane: 1,
-            next_forward: 1,
-        }
-    }
-}
-
-impl ServerIds {
-    pub fn peek_pane(&self) -> usize {
-        self.next_pane
-    }
-    pub fn commit_pane(&mut self, id: usize) {
-        debug_assert_eq!(id, self.next_pane);
-        self.next_pane += 1;
-    }
-    pub fn alloc_pane(&mut self) -> usize {
-        let id = self.next_pane;
-        self.next_pane += 1;
-        id
-    }
-    pub fn alloc_window(&mut self) -> usize {
-        let id = self.next_window;
-        self.next_window += 1;
-        id
-    }
-    pub fn alloc_forward(&mut self) -> u64 {
-        let id = self.next_forward;
-        self.next_forward += 1;
-        id
-    }
-    #[cfg(test)]
-    pub fn set_next_window(&mut self, id: usize) {
-        self.next_window = id;
-    }
-    #[cfg(test)]
-    pub fn set_next_pane(&mut self, id: usize) {
-        self.next_pane = id;
-    }
 }
 
 pub struct AppState {
@@ -1827,7 +1782,8 @@ pub struct AppState {
     /// each gets its reply when the prompt closes, as tmux's client waits.
     pub prompt_waiters: Vec<(u64, std::sync::mpsc::Sender<String>)>,
     pub created_at: chrono::DateTime<Local>,
-    pub ids: ServerIds,
+    pub next_win_id: usize,
+    pub next_pane_id: usize,
     /// Pane ids already auto-healed once by `@heal-crashed-panes`. A pane is
     /// respawned at most once so a shell that crashes on every startup can't
     /// spin an infinite respawn loop; after one heal it falls through to the
@@ -1842,7 +1798,10 @@ pub struct AppState {
     pub wait_channels: std::collections::HashMap<String, WaitChannel>,
     /// Pipe pane processes
     pub pipe_panes: Vec<PipePaneState>,
-    /// Last active window index (for last-window command)
+    /// Vec position of the last window (last-window, `!`, the `-` flag).
+    /// [`NO_LAST_WINDOW`] until a window has been left: a fresh session has
+    /// none, and tmux reports none (#601 follow up). Read it through
+    /// [`AppState::last_window_pos`], which also refuses the current window.
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
@@ -1990,10 +1949,12 @@ pub struct AppState {
     pub format_shell_cache: std::sync::Mutex<std::collections::HashMap<String, ShellEntry>>,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
-    /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
-    pub main_pane_width: u16,
-    /// main-pane-height: percentage for main pane in main-horizontal layout (0 = use 60% heuristic)
-    pub main_pane_height: u16,
+    /// main-pane-width as written: cells or `N%` of the window less the
+    /// border (tmux options-table.c default "80", layout_set_main_v).
+    pub main_pane_width: String,
+    /// main-pane-height as written: cells or `N%` (tmux default "24",
+    /// layout_set_main_h).
+    pub main_pane_height: String,
     /// status-left-length: max display width for status-left (default 10)
     pub status_left_length: usize,
     /// status-right-length: max display width for status-right (default 40)
@@ -2031,6 +1992,11 @@ pub struct AppState {
     /// `file:line: message` (file comes from config::current_config_file()).
     /// None when parsing a single runtime command.
     pub config_warn_line: Option<usize>,
+    /// Set while a runtime source-file is parsed (config::source_runtime): from
+    /// the file's first command on, its lines are kept here in order for the
+    /// source job instead of being applied or dropped (issue #842). None for
+    /// every other parse, the startup config included.
+    pub source_defer: Option<SourceDefer>,
     /// set-clipboard: "on", "off", "external" (default "external", as tmux)
     pub set_clipboard: String,
     /// One-shot clipboard text to be sent to the client via OSC 52 (set by yank, consumed by dump-state).
@@ -2145,6 +2111,8 @@ pub struct AppState {
     /// Panes extracted for cross-session forwarding, keyed by forward_id.
     /// The source server keeps these alive so the real ConPTY continues running.
     pub forwarded_panes: HashMap<u64, ForwardedPane>,
+    /// Counter for generating unique forward IDs.
+    pub next_forward_id: u64,
 }
 
 /// What a tmux window target spec resolved to, the output of
@@ -2911,8 +2879,7 @@ impl AppState {
         }
         match body {
             "!" => {
-                let p = self.last_window_idx;
-                if p < self.windows.len() { Ok(WindowTarget::Pos(p)) } else { Err(missing()) }
+                match self.last_window_pos() { Some(p) => Ok(WindowTarget::Pos(p)), None => Err(missing()) }
             }
             "^" => Ok(WindowTarget::Pos(0)),
             "$" => Ok(WindowTarget::Pos(last_pos)),
@@ -3071,9 +3038,31 @@ impl AppState {
         }
     }
 
+    /// The last window's Vec position, or None when the session has none.
+    ///
+    /// tmux keeps the current window off the session's last-window stack
+    /// (session.c:508-509 removes it before pushing the old current), so
+    /// `#{window_last_flag}` (format.c:3120) is never 1 on the current window
+    /// and `last-window` there is `no last window` (cmd-select-window.c:118).
+    /// `last_window_idx` is a single Vec slot, so it can equal the current
+    /// window (a kill that hands focus to it, for one); that reads as none.
+    pub fn last_window_pos(&self) -> Option<usize> {
+        let p = self.last_window_idx;
+        let current = self.temp_focus_saved_active.unwrap_or(self.active_idx);
+        (p < self.windows.len() && p != current).then_some(p)
+    }
+
     /// Call right after `windows.remove(pos)`. Drops the parallel index and,
     /// when `renumber-windows` is on, renumbers the survivors contiguously.
+    /// The last window slot follows its window down, or is cleared when the
+    /// removed window WAS the last window (tmux winlink_stack_remove in
+    /// session_detach), instead of naming whatever slid into the slot.
     pub fn on_window_removed(&mut self, pos: usize) {
+        if self.last_window_idx == pos {
+            self.last_window_idx = NO_LAST_WINDOW;
+        } else if self.last_window_idx != NO_LAST_WINDOW && self.last_window_idx > pos {
+            self.last_window_idx -= 1;
+        }
         if self.window_indices.len() == self.windows.len() + 1 && pos < self.window_indices.len() {
             self.window_indices.remove(pos);
             if self.renumber_windows {
@@ -3187,14 +3176,15 @@ impl AppState {
             prompt_request_seq: 0,
             prompt_waiters: Vec::new(),
             created_at: Local::now(),
-            ids: ServerIds::default(),
+            next_win_id: 1,
+            next_pane_id: 1,
             healed_pane_ids: std::collections::HashSet::new(),
             client_prefix_active: false,
             sync_input: false,
             hooks: std::collections::HashMap::new(),
             wait_channels: std::collections::HashMap::new(),
             pipe_panes: Vec::new(),
-            last_window_idx: 0,
+            last_window_idx: NO_LAST_WINDOW,
             last_pane_path: Vec::new(),
             history_limit: 2000,
             display_time_ms: 750,
@@ -3272,8 +3262,8 @@ impl AppState {
             last_status_interval_fire: std::time::Instant::now(),
             format_shell_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             status_justify: "left".to_string(),
-            main_pane_width: 0,
-            main_pane_height: 0,
+            main_pane_width: "80".to_string(),
+            main_pane_height: "24".to_string(),
             status_left_length: 10,
             status_right_length: 40,
             status_lines: 1,
@@ -3287,6 +3277,7 @@ impl AppState {
             terminal_overrides: Vec::new(),
             config_warnings: Vec::new(),
             config_warn_line: None,
+            source_defer: None,
             set_clipboard: "external".to_string(),
             clipboard_osc52: None,
             bell_forward: false,
@@ -3317,6 +3308,7 @@ impl AppState {
             click_state: None,
             click_finish_at: None,
             forwarded_panes: HashMap::new(),
+            next_forward_id: 1,
         }
     }
 
@@ -3494,6 +3486,67 @@ pub struct DisplayFlags {
     pub ignore_keys: bool,
 }
 
+/// The lines of a runtime source-file kept for the source job (issue #842).
+/// tmux runs a sourced file's commands one at a time after the parse
+/// (cfg.c:155 to :204); psmux keeps them here from the first command on, the
+/// option lines after it too, so they still run in file order.
+#[derive(Debug, Default)]
+pub struct SourceDefer {
+    /// The first command has been reached: every line from here on is kept.
+    pub triggered: bool,
+    pub lines: Vec<DeferredConfigLine>,
+}
+
+/// One kept line, with the file and line it came from for its warnings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredConfigLine {
+    pub file: String,
+    pub line: Option<usize>,
+    pub kind: DeferredKind,
+    /// The files being sourced where this line was read, outermost first
+    /// (config::source_key). A `source-file` it runs later is checked
+    /// against them, so a file cannot source itself through the job either.
+    pub ancestors: Vec<String>,
+}
+
+/// What config::source_runtime returns: the lines kept for the source job,
+/// and the errors found while parsing, which are every warning the parse
+/// recorded: in a runtime source each is an error for the client, as tmux
+/// reports a missing file or an invalid option (issue #842).
+#[derive(Debug, Default)]
+pub struct SourceParse {
+    pub lines: Vec<DeferredConfigLine>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeferredKind {
+    /// A command, run through the connection dispatcher.
+    Command(String),
+    /// A line the config parser applies itself (`set`, `bind`, `source-file`,
+    /// `if-shell`, ...), parsed again on the server loop when its turn comes.
+    Directive(String),
+    /// A whole `if-shell ... { } { }` block, as text for parse_config_content,
+    /// so its condition is tested when its turn comes, not at parse time.
+    Block(String),
+}
+
+/// What a client that ran `source-file` is told once the file has run: the
+/// output of its commands and the errors they reported.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SourceOutcome {
+    pub output: String,
+    pub errors: Vec<String>,
+}
+
+/// The result of parsing one kept config line: its warnings, and any lines it
+/// kept in turn (a `source-file`'s commands, an `if-shell` branch).
+#[derive(Debug, Default)]
+pub struct SourceReplayResult {
+    pub warnings: Vec<String>,
+    pub deferred: Vec<DeferredConfigLine>,
+}
+
 pub enum CtrlReq {
     /// A pane parser thread published new screen state.
     ///
@@ -3514,8 +3567,8 @@ pub enum CtrlReq {
     ClientActivity(u64),
     NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>, NewWindowPlacement, Option<mpsc::Sender<Result<(), String>>>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489), placement (-t/-a/-b/-k/-S), outcome
     NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>, NewWindowPlacement),  // cmd, name, detached, start_dir, format, resp ("ERROR: ..." on failure), title (-T), empty (-E), env (-e, #489), placement
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T), env (-e, #489), zoom (-Z)
-    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T), env (-e, #489), zoom (-Z)
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, crate::pane::SplitPlacement, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, placement (-l, -b, -f), error_resp, title (-T), env (-e, #489), zoom (-Z)
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, crate::pane::SplitPlacement, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, placement (-l, -b, -f), format, resp, title (-T), env (-e, #489), zoom (-Z)
     /// new-pane: create a floating pane over the active window's layout.
     /// Flags match tmux: `-X`/`-Y` position, `-x`/`-y` size, `-B` border,
     /// `-T` title, `-c` dir, `-d` detached, `-P` print (returns the pane id).
@@ -3855,7 +3908,12 @@ pub enum CtrlReq {
     DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>, Option<ClientSel>, DisplayFlags),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms, -c client, -l/-N
     /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
     DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>, Option<ClientSel>, DisplayFlags),  // resp, format, pane_id, set_status_bar, duration_override_ms, -c client, -l/-N
-    LastWindow,
+    /// `last-window` / `select-window -l`.  With no last window tmux fails
+    /// with `no last window` at exit 1 (cmd-select-window.c:118-120); the
+    /// reply carries that to a CLI or control caller (None: nobody waits).
+    LastWindow {
+        resp: Option<mpsc::Sender<Result<(), String>>>,
+    },
     /// `last-pane` / `select-pane -l`.
     ///
     /// tmux's cmd-select-pane.c:166-177 takes the window's last pane, falls
@@ -4028,9 +4086,20 @@ pub enum CtrlReq {
     /// so `-g` was dropped on the floor and a plain `-w` printed every name
     /// including the ones the window does not own (#648, #655).
     ShowWindowOptionsFor(mpsc::Sender<String>, String, crate::server::options::WindowListing),
-    /// `(path, done)`: `done` is dropped once the file has run, which is how a
-    /// one-shot `source-file` knows when to answer (#734 follow up).
-    SourceFile(String, Option<mpsc::Sender<()>>),
+    /// `(path, done)`: `done` answers once the file and its commands have run,
+    /// which is how a one-shot `source-file` knows when to answer (#734 follow
+    /// up). With commands to run, the source job answers it (issue #842).
+    SourceFile(String, Option<mpsc::Sender<SourceOutcome>>),
+    /// A config line a source job kept, parsed now on the server loop with its
+    /// file and line (issue #842, config::replay_deferred_line).
+    SourceReplay(DeferredConfigLine, mpsc::Sender<SourceReplayResult>),
+    /// A source job has run its last line: its warnings, and the answer for
+    /// the client that ran `source-file`, if that client waits.
+    SourceJobDone {
+        warnings: Vec<String>,
+        outcome: SourceOutcome,
+        waiter: Option<mpsc::Sender<SourceOutcome>>,
+    },
     /// Expand `#{...}` format variables against the live server state and send
     /// the result back: `(format_string, reply)`.
     ///
@@ -5103,10 +5172,6 @@ mod tests_issue601_602_move_swap_window;
 #[cfg(test)]
 #[path = "../tests-rs/test_new_window_index_target.rs"]
 mod tests_new_window_index_target;
-
-#[cfg(test)]
-#[path = "../tests-rs/test_server_ids.rs"]
-mod tests_server_ids;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_preview_window_state.rs"]

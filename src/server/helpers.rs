@@ -457,7 +457,7 @@ pub(crate) fn list_windows_json_with_tabs(app: &AppState) -> io::Result<String> 
             active: is_active,
             activity: w.activity_flag,
             bell: w.bell_flag,
-            last: i == app.last_window_idx,
+            last: app.last_window_pos() == Some(i),
             tab_text: tab,
             ps_status: crate::program_status::window_status(w),
             // Records stay out of the frame JSON: no client reads them, and

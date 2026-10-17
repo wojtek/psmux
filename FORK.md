@@ -4,7 +4,7 @@ This fork follows upstream psmux and keeps only behavior the Elysium workflow
 still requires and upstream does not yet provide.
 
 The current base is `marlocarlo/master` at
-`a055bf1fa1f1f76d1b9fc5d0fadf3a2b8c406424` (2026-10-16). The maintained layer
+`e95398c9c9a6b858d4c52415d951b5380dbd3eda` (2026-10-17). The maintained layer
 is reapplied on that tip, without the previous fork history.
 
 ## Maintained differences
@@ -106,7 +106,9 @@ is reapplied on that tip, without the previous fork history.
 - The session option `tab-colour` applies a Windows Terminal tab color without
   rewriting the normal 0-255 text palette and resets it when cleared, when the
   client switches to a session without one, and when it detaches. Upstream added
-  `key-table` beside it in the option catalog but not `tab-colour`.
+  `key-table` beside it in the option catalog but not `tab-colour`. The catalog
+  entry is also what lets `tab-colour` past upstream's unknown option name
+  refusal (#846, `is_valid_option_name`).
 - A Ctrl+V fallback never sends the clipboard to a pane hidden behind a psmux
   dialog. `route_active_paste!` extends upstream's `route_paste_to_overlay`
   routing to the picker's rename field, and `clipboard_read_back_allowed` skips
@@ -115,11 +117,13 @@ is reapplied on that tip, without the previous fork history.
   open. Clock mode keeps it, because a paste there only closes the clock.
   Upstream's paste delivery and duplicate accounting remain intact.
 - Console-backed SSH VT input translates Ctrl+J, modified Enter, and Escape into
-  Win32 input records when a Windows pane application such as Codex requests DEC
-  private mode 9001 (`win32_input_special_key_seq`, reached from
-  `write_pane_input`). Upstream's `named_key_record` cannot cover these: it only
-  reads complete VT named-key sequences of three bytes or more starting with
-  `ESC`, so a bare LF and an `ESC CR` pair fall through to it.
+  Win32 input records when the pane's console host has asked for win32 input
+  mode (`win32_input_special_key_seq`, reached from `write_pane_input`). The
+  request is upstream's #845 flag, read through `pane_host_parses_win32_input`
+  and gated like upstream's own records by `win32_key_record_allowed`.
+  Upstream's `named_key_record` cannot cover these: it only reads complete VT
+  named-key sequences of three bytes or more starting with `ESC`, so a bare LF
+  and an `ESC CR` pair fall through to it.
 - Server liveness trusts the recorded `pid:creation_filetime` pair over the
   process image name (`pid_anchor_decision`). An image name may support "alive"
   but never "dead" on its own, so renaming or moving a running binary cannot make
@@ -214,6 +218,13 @@ Copy-mode requests retain upstream's counted `SendKeysXRun` and error replies
 (`853c934`); rendering retains the atomic frame path (`ae29378`). `send-keys -M`
 keeps upstream's `CtrlReq::SendMouse(client_id)` (#799), which the fork's earlier
 parser did not know.
+
+Upstream #845 owns recording a pane's win32 input mode request:
+`vt100::Screen::win32_input_requested` is set by `CSI ?9001h`, stays set
+through `CSI ?9001l`, RIS and clear-history, and every record writer checks it.
+The fork's own `MODE_WIN32_INPUT` mode bit and `win32_input_mode()`, which
+`CSI ?9001l` cleared, are dropped, so `screen.rs` is upstream's again; the SSH
+VT input repair above reads upstream's flag.
 
 Current upstream owns the base Win32-input-mode Escape repair, local Windows
 Ctrl+Enter-to-LF delivery used by physical Ctrl+J, modified-Enter behavior,

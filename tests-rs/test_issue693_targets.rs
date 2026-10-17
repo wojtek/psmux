@@ -306,7 +306,7 @@ fn issue693_the_relative_flags_still_beat_the_target() {
     let (p, _) = select_window_requests(&["-p"], Some("{end}"), Some(0), false, None);
     assert!(matches!(p[0], CtrlReq::PrevWindow));
     let (l, _) = select_window_requests(&["-l"], Some("!"), Some(0), false, None);
-    assert!(matches!(l[0], CtrlReq::LastWindow));
+    assert!(matches!(l[0], CtrlReq::LastWindow { .. }));
 }
 
 #[test]

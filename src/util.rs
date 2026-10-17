@@ -463,7 +463,7 @@ pub enum LayoutSimple {
 
 pub fn list_windows_json(app: &AppState) -> io::Result<String> {
     let mut v: Vec<WinInfo> = Vec::new();
-    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, bell: w.bell_flag, last: i == app.last_window_idx, tab_text: String::new(), ps_status: crate::program_status::window_status(w), ps_panes: crate::program_status::window_records(w), idx: app.win_display_index(i), ws_style: None, wsc_style: None, wsa_style: None, wsb_style: None, wsl_style: None }); }
+    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, bell: w.bell_flag, last: app.last_window_pos() == Some(i), tab_text: String::new(), ps_status: crate::program_status::window_status(w), ps_panes: crate::program_status::window_records(w), idx: app.win_display_index(i), ws_style: None, wsc_style: None, wsa_style: None, wsb_style: None, wsl_style: None }); }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
 }

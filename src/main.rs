@@ -2981,6 +2981,8 @@ fn run_main() -> io::Result<()> {
                 let mut title_arg: Option<String> = None;
                 let mut env_args: Vec<String> = Vec::new();
                 let mut zoom_after_split = false;
+                let mut before = false;
+                let mut full = false;
                 let mut sw_positional: Vec<String> = Vec::new();
                 let mut sw_saw_ddash = false;
                 {
@@ -3003,7 +3005,22 @@ fn run_main() -> io::Result<()> {
                             "-d" => { detached = true; }
                             "-P" => { print_info = true; }
                             "-Z" => { zoom_after_split = true; }
-                            "-b" | "-f" | "-I" => { /* ignored for compatibility */ }
+                            // -b: new pane before (top/left); -f: full window
+                            // width/height (tmux SPAWN_BEFORE / SPAWN_FULLSIZE).
+                            "-b" => { before = true; }
+                            "-f" => { full = true; }
+                            "-I" => { /* ignored for compatibility */ }
+                            // A cluster of argument-less flags (`-hb`, `-fvd`).
+                            _ if a.len() > 2 && a[1..].chars().all(|c| "bdfhIPvZ".contains(c)) => {
+                                for c in a[1..].chars() {
+                                    match c {
+                                        'h' => flag = "-h", 'v' => flag = "-v",
+                                        'd' => detached = true, 'P' => print_info = true,
+                                        'Z' => zoom_after_split = true, 'b' => before = true,
+                                        'f' => full = true, _ => {}
+                                    }
+                                }
+                            }
                             _ if a.starts_with('-') => { /* unknown flag, skip */ }
                             _ => { sw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
                         }
@@ -3029,6 +3046,8 @@ fn run_main() -> io::Result<()> {
                 if detached { cmd_line.push_str(" -d"); }
                 if print_info { cmd_line.push_str(" -P"); }
                 if zoom_after_split { cmd_line.push_str(" -Z"); }
+                if before { cmd_line.push_str(" -b"); }
+                if full { cmd_line.push_str(" -f"); }
                 if let Some(ref fmt) = format_str {
                     cmd_line.push_str(&format!(" -F {}", crate::util::quote_arg(&fmt)));
                 }
@@ -4394,7 +4413,13 @@ fn run_main() -> io::Result<()> {
             }
             // last-window - Select last used window
             "last-window" | "last" => {
-                send_control("last-window\n".to_string())?;
+                // tmux: `no last window` at exit 1 (cmd-select-window.c:118).
+                // Fire and forget here exited 0 with nothing to go back to.
+                let resp = send_control_with_response("last-window\n".to_string())?;
+                if resp.trim_start().starts_with("ERROR") {
+                    eprintln!("psmux: {}", resp.trim_start().trim_start_matches("ERROR:").trim());
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             // last-pane - Select last used pane
@@ -4663,15 +4688,33 @@ fn run_main() -> io::Result<()> {
             // source-file - Load a configuration file
             "source-file" | "source" => {
                 let mut quiet = false;
+                // -n: parse only. tmux runs nothing from the file
+                // (cmd-source-file.c:193, cfg.c:182). The flag was
+                // read and then dropped here, so `source-file -n` ran the
+                // whole file, and since the server runs a file's commands
+                // (#842) a syntax check made windows and killed panes.
+                let mut parse_only = false;
                 let mut file_path: Option<String> = None;
                 let mut i = 1;
                 while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-q" => { quiet = true; }
-                        "-n" => { /* parse only, don't execute */ }
-                        "-v" => { /* verbose */ }
-                        s if !s.starts_with('-') => { file_path = Some(s.to_string()); }
-                        _ => {}
+                    let a = cmd_args[i].as_str();
+                    if a.starts_with('-') && a.len() > 1 && a != "--" {
+                        // tmux's flags `Fnqv` and `-t target`, alone or in a
+                        // cluster such as `-nq`; the value of -t is not a path.
+                        let flags = &a[1..];
+                        for (pos, c) in flags.char_indices() {
+                            match c {
+                                'q' => quiet = true,
+                                'n' => parse_only = true,
+                                't' => {
+                                    if pos + 1 == flags.len() { i += 1; }
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if a != "--" {
+                        file_path = Some(a.to_string());
                     }
                     i += 1;
                 }
@@ -4688,6 +4731,10 @@ fn run_main() -> io::Result<()> {
                             eprintln!("psmux: {}: {}", expanded, e);
                             std::process::exit(1);
                         }
+                    } else if parse_only {
+                        // Nothing is run or applied. psmux has no parse only
+                        // mode that reports the file's parse errors, so a
+                        // readable file is all -n checks here.
                     } else {
                         // The server answers once the file has run (#734 follow
                         // up), so this returns when its commands are done, as
@@ -4695,7 +4742,23 @@ fn run_main() -> io::Result<()> {
                         // inserted commands before the item continues).
                         let resp = crate::session::send_control_with_response_wait(
                             format!("source-file {}\n", crate::util::quote_arg(&expanded)))?;
-                        if !resp.is_empty() { print!("{}", resp); }
+                        // The commands' output goes to stdout. A command that
+                        // failed is an `ERROR:` line: its message goes to
+                        // stderr and the exit status is 1, as tmux's client
+                        // reports cmdq_error (issue #842).
+                        let mut failed = false;
+                        let mut out = String::new();
+                        for l in resp.split_inclusive('\n') {
+                            match l.strip_prefix("ERROR: ") {
+                                Some(msg) => {
+                                    eprintln!("psmux: {}", msg.trim_end());
+                                    failed = true;
+                                }
+                                None => out.push_str(l),
+                            }
+                        }
+                        if !out.is_empty() { print!("{}", out); }
+                        if failed { std::process::exit(1); }
                     }
                 }
                 return Ok(());

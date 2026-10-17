@@ -3,6 +3,7 @@ pub(crate) mod options;
 pub(crate) mod option_catalog;
 pub(crate) mod connection;
 pub(crate) mod temp_target;
+pub(crate) mod source_job;
 
 use std::io::{self, Write};
 use std::sync::mpsc;
@@ -14,13 +15,15 @@ use std::net::TcpListener;
 use portable_pty::native_pty_system;
 use ratatui::prelude::Rect;
 
-use crate::types::{AppState, CtrlReq, Mode, FocusDir, LayoutKind, PipePaneState, VERSION,
+#[cfg(test)]
+use crate::types::LayoutKind;
+use crate::types::{AppState, CtrlReq, Mode, FocusDir, PipePaneState, VERSION,
     WaitChannel, WaitForOp, Node, Action, Bind};
 use crate::platform::install_console_ctrl_handler;
-use crate::pane::{create_window, create_window_with_env, create_window_raw, split_active_with_env, kill_active_pane, kill_pane_by_id, spawn_warm_pane};
+use crate::pane::{create_window, create_window_with_env, create_window_raw, kill_active_pane, kill_pane_by_id, spawn_warm_pane};
 use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all_children,
     find_window_index_by_id, focus_pane_by_id, focus_pane_by_index, get_active_pane_id,
-    get_split_mut, path_exists};
+    path_exists};
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
@@ -37,8 +40,7 @@ use crate::window_ops::{toggle_zoom, remote_mouse_down, remote_mouse_drag, remot
     swap_pane, swap_pane_with_path, unzoom_if_zoomed, resize_pane_vertical,
     resize_pane_horizontal, resize_pane_absolute, rotate_panes, respawn_active_pane,
     handle_pane_mouse, copy_drag_begin, handle_split_set_sizes, handle_split_resize_done};
-use crate::config::{load_config, parse_key_string, format_key_binding, normalize_key_for_binding,
-    parse_config_content};
+use crate::config::{load_config, parse_key_string, format_key_binding, normalize_key_for_binding};
 use crate::commands::{parse_command_to_action, parse_menu_definition, execute_command_string};
 use crate::util::{list_windows_json, list_tree_json, list_windows_tmux, base64_encode};
 use crate::control;
@@ -184,7 +186,11 @@ fn file_sink_drive_is_remote(_path: &str) -> bool {
 #[cfg(windows)]
 fn ctrl_key_record_seq_for_active(app: &mut AppState, c: char, shift: bool) -> Option<String> {
     let seq = crate::input::ctrl_key_win32_seq(c, shift)?;
-    if crate::input::active_pane_is_record_reader(app) {
+    // Issue #845: a host that never asked for win32 input mode cannot parse
+    // the record, so the key falls back to tmux's byte.
+    if crate::input::active_pane_host_parses_win32_input(app)
+        && crate::input::active_pane_is_record_reader(app)
+    {
         Some(seq)
     } else {
         None
@@ -3262,7 +3268,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         CtrlReq::FocusWindowByName(_) => "FocusWindowByName",
                         CtrlReq::ValidateTarget { .. } => "ValidateTarget",
                         CtrlReq::FocusWindowCmd(_) => "FocusWindowCmd",
-                        CtrlReq::LastWindow => "LastWindow",
+                        CtrlReq::LastWindow { .. } => "LastWindow",
                         CtrlReq::MouseDown(..) => "MouseDown",
                         CtrlReq::MouseDownRight(..) => "MouseDownRight",
                         CtrlReq::MouseDownMiddle(..) => "MouseDownMiddle",
@@ -3383,9 +3389,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let inner_w = sw.saturating_sub(2).max(1);
                         let cmdstr = cmd.clone().unwrap_or_default();
                         let sd = start_dir.clone().map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
-                        let pane_id = app.ids.peek_pane();
+                        let pane_id = app.next_pane_id;
                         if let Some(mut pane) = crate::popup::create_popup_pane(&cmdstr, sd.as_deref(), inner_h, inner_w, pane_id, &app.session_name, &app.environment, &app.env_scopes.child_removals(&app.environment), app.host_colors.as_ref()) {
-                            app.ids.commit_pane(pane_id);
+                            app.next_pane_id += 1;
                             let t = title.clone().unwrap_or_default();
                             if !t.is_empty() { pane.title = t.clone(); pane.title_locked = true; }
                             let win = &mut app.windows[app.active_idx];
@@ -3399,8 +3405,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // No server chdir here: the pane's start directory is handed to the
                     // shell alone, never to the ConPTY host. See the #630 note on
                     // CtrlReq::NewWindow above.
-                    let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let split_succeeded = match split_active_with_env(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets) {
+                    let prev_pane_id = crate::tree::get_active_pane_id(&app.windows[app.active_idx].root, &app.windows[app.active_idx].active_path);
+                    let split_succeeded = match crate::pane::split_active_placed(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets, split_size) {
                         Err(e) => {
                             let msg = format!("split-window: {e}");
                             app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
@@ -3412,22 +3418,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             true
                         }
                     };
-                    // Apply size if specified: (value, true) = percentage, (value, false) = cell count
-                    if let Some((val, is_pct)) = split_size {
-                        let pct = if is_pct {
-                            val.clamp(1, 99)
-                        } else {
-                            // Convert cell count to percentage based on split direction
-                            let area = app.last_window_area;
-                            let total = if k == LayoutKind::Horizontal { area.width } else { area.height };
-                            if total > 0 { ((val as u32 * 100) / total as u32).clamp(1, 99) as u16 } else { 50 }
-                        };
-                        let win = &mut app.windows[app.active_idx];
-                        if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &prev_path) {
-                            sizes[0] = 100 - pct;
-                            sizes[1] = pct;
-                        }
-                    }
+                    // `-l` is applied by the split itself, in cells (tmux
+                    // layout_split_sizes); it used to be rewritten here as a
+                    // percentage of the WINDOW after a 50/50 split.
                     // -T: the just-created pane is currently active in this
                     // window, so set its title before any detached revert.
                     if let Some(t) = title {
@@ -3443,12 +3436,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             &app.windows[app.active_idx].root,
                             &app.windows[app.active_idx].active_path,
                         );
-                        // Revert focus to the previously active pane.
-                        // After split, prev_path now points to a Split node;
-                        // the original pane is child [0] of that Split.
-                        let mut revert_path = prev_path;
-                        revert_path.push(0);
-                        app.windows[app.active_idx].active_path = revert_path;
+                        // Revert focus to the previously active pane, found
+                        // by id: with -b it is no longer child 0, and a split
+                        // into a same-kind parent did not nest it at all.
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = prev_pane_id.and_then(|id| crate::tree::find_path_by_id(&win.root, id)) {
+                            win.active_path = p;
+                        }
                         // Detached splits never focus the new pane — remove
                         // from MRU entirely so directional nav tie-breaks by
                         // pane_index among equally-unvisited candidates (#70).
@@ -3464,6 +3458,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.temp_focus_saved_active = None;
                     }
                     if zoom_after_split && split_succeeded {
+                        // Give every pane its new cell BEFORE zooming: a zoom
+                        // skips the hidden panes, so the pane just split stayed
+                        // at its old height (tmux layout_fix_panes runs first).
+                        resize_all_panes(&mut app);
                         toggle_zoom(&mut app);
                     }
                     // Replenish warm pane for the next new-window/split
@@ -3481,8 +3479,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // No server chdir here: the pane's start directory is handed to the
                     // shell alone, never to the ConPTY host. See the #630 note on
                     // CtrlReq::NewWindow above.
-                    let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let split_succeeded = match split_active_with_env(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets) {
+                    let prev_pane_id = crate::tree::get_active_pane_id(&app.windows[app.active_idx].root, &app.windows[app.active_idx].active_path);
+                    let split_succeeded = match crate::pane::split_active_placed(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref(), &env_sets, split_size) {
                         Err(e) => {
                             app.status_message = Some((format!("split-window: {e}"), std::time::Instant::now(), None));
                             eprintln!("psmux: split-window error: {e}");
@@ -3490,21 +3488,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         Ok(()) => true,
                     };
-                    // Apply size if specified: (value, true) = percentage, (value, false) = cell count
-                    if let Some((val, is_pct)) = split_size {
-                        let pct = if is_pct {
-                            val.clamp(1, 99)
-                        } else {
-                            let area = app.last_window_area;
-                            let total = if k == LayoutKind::Horizontal { area.width } else { area.height };
-                            if total > 0 { ((val as u32 * 100) / total as u32).clamp(1, 99) as u16 } else { 50 }
-                        };
-                        let win = &mut app.windows[app.active_idx];
-                        if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &prev_path) {
-                            sizes[0] = 100 - pct;
-                            sizes[1] = pct;
-                        }
-                    }
                     // -T: set the new (currently active) pane's title.
                     if let Some(t) = title {
                         let win = &mut app.windows[app.active_idx];
@@ -3522,9 +3505,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             &app.windows[app.active_idx].root,
                             &app.windows[app.active_idx].active_path,
                         );
-                        let mut revert_path = prev_path;
-                        revert_path.push(0);
-                        app.windows[app.active_idx].active_path = revert_path;
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = prev_pane_id.and_then(|id| crate::tree::find_path_by_id(&win.root, id)) {
+                            win.active_path = p;
+                        }
                         // Detached splits: remove from MRU (#70 pane_index tie-break)
                         if let Some(nid) = new_pane_id {
                             let win = &mut app.windows[app.active_idx];
@@ -3535,6 +3519,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.temp_focus_saved_active = None;
                     }
                     if zoom_after_split && split_succeeded {
+                        // Give every pane its new cell BEFORE zooming: a zoom
+                        // skips the hidden panes, so the pane just split stayed
+                        // at its old height (tmux layout_fix_panes runs first).
+                        resize_all_panes(&mut app);
                         toggle_zoom(&mut app);
                     }
                     let _ = resp.send(pane_info);
@@ -4799,6 +4787,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                                         }
                                                     }
                                                     send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                                } else if !crate::input::active_pane_host_parses_win32_input(&mut app) {
+                                                    // Issue #845: this pane's console host
+                                                    // predates win32 input mode (it never
+                                                    // asked for ?9001h) and would drop or
+                                                    // print the record, so the key goes as
+                                                    // tmux's control byte.
+                                                    send_text_to_active(&mut app, &String::from(ctrl as char))?;
                                                 } else {
                                                     let vk = crate::platform::mouse_inject::char_to_vk(c);
                                                     let scan = crate::platform::mouse_inject::vk_to_scan(vk);
@@ -5891,16 +5886,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     let _ = resp.send(result);
                 }
-                CtrlReq::LastWindow => {
-                    if app.windows.len() > 1 && app.last_window_idx < app.windows.len() {
-                        switch_with_copy_save(&mut app, |app| {
-                            let tmp = app.active_idx;
-                            app.active_idx = app.last_window_idx;
-                            app.last_window_idx = tmp;
-                        });
+                CtrlReq::LastWindow { resp } => {
+                    match app.last_window_pos() {
+                        Some(last) => {
+                            switch_with_copy_save(&mut app, |app| {
+                                let tmp = app.active_idx;
+                                app.active_idx = last;
+                                app.last_window_idx = tmp;
+                            });
+                            meta_dirty = true;
+                            hook_event = Some("after-select-window");
+                            if let Some(r) = resp { let _ = r.send(Ok(())); }
+                        }
+                        // cmd-select-window.c:118-120.  psmux exited 0 in
+                        // silence here, with no window to go back to.
+                        None => {
+                            if let Some(r) = resp { let _ = r.send(Err("no last window".to_string())); }
+                        }
                     }
-                    meta_dirty = true;
-                    hook_event = Some("after-select-window");
                 }
                 CtrlReq::LastPane { resp } => {
                     match last_pane_path(&app) {
@@ -6487,9 +6490,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::SourceFile(path, done) => {
-                    // `done` is dropped at the end of this arm, after the
-                    // file has run: that is the one-shot source-file's answer.
-                    let _done = done;
+                    // `done` is the one-shot source-file's answer: sent at the
+                    // end of this arm when the file kept no command, or by the
+                    // source job once the file's commands have run.
                     // tmux's source-file only runs the file's commands
                     // (cmd-source-file.c): bindings made before it stay, so
                     // a `bind` from the CLI and the files a plugin manager
@@ -6504,26 +6507,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.key_tables.clear();
                         crate::config::populate_default_bindings(&mut app);
                     }
-                    // Use config helper for standard source-file behavior (-F support,
-                    // nested parse context). Keep direct glob handling for wildcard sources.
-                    let is_format_expand = path.starts_with("-F ") || path.starts_with("-F\t");
-                    let path_for_glob = if is_format_expand { path[3..].trim() } else { &path };
-                    if !is_format_expand && (path_for_glob.contains('*') || path_for_glob.contains('?')) {
-                        let expanded = if path_for_glob.starts_with('~') {
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            path_for_glob.replacen('~', &home, 1)
-                        } else {
-                            path_for_glob.to_string()
-                        };
-                        if let Ok(entries) = glob::glob(&expanded) {
-                            for entry in entries.flatten() {
-                                if let Ok(contents) = std::fs::read_to_string(&entry) {
-                                    parse_config_content(&mut app, &contents);
-                                }
-                            }
-                        }
-                    } else {
-                        crate::config::source_file(&mut app, &path);
+                    // Options and bindings before the file's first command
+                    // apply now; the commands, and every line after the first
+                    // of them, come back in file order for the source job,
+                    // which runs them one after another as tmux's queue does
+                    // (issue #842). The -F form and globs are handled there.
+                    let parsed = crate::config::source_runtime(&mut app, &path);
+                    // A sourced file can set command-alias, which the
+                    // connection dispatcher reads from its own copy.
+                    if let Ok(mut map) = shared_aliases_main.write() {
+                        *map = app.command_aliases.clone();
                     }
                     // A runtime source-file can record warnings (e.g. an
                     // unreadable path); flush them like the startup load does
@@ -6537,6 +6530,54 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // dump-state instead of getting an NC fast-path reply.
                     state_dirty = true;
                     meta_dirty = true;
+                    match (parsed.lines.is_empty(), app.control_port, app.control_tx.clone()) {
+                        (false, Some(port), Some(job_tx)) => {
+                            // The job answers `done` once the last line ran.
+                            source_job::spawn_source_job(
+                                port,
+                                app.session_key.clone(),
+                                job_tx,
+                                parsed.lines,
+                                app.config_warnings.clone(),
+                                parsed.errors,
+                                done,
+                            );
+                        }
+                        _ => {
+                            // Nothing to run, or a file that sources itself,
+                            // refused before any of it took effect.
+                            if let Some(done) = done {
+                                let _ = done.send(crate::types::SourceOutcome {
+                                    output: String::new(),
+                                    errors: parsed.errors,
+                                });
+                            }
+                        }
+                    }
+                }
+                CtrlReq::SourceReplay(item, resp) => {
+                    // A config line a source job kept, now that the commands
+                    // before it have run (issue #842).
+                    let result = crate::config::replay_deferred_line(&mut app, &item);
+                    if let Ok(mut map) = shared_aliases_main.write() {
+                        *map = app.command_aliases.clone();
+                    }
+                    resize_all_panes(&mut app);
+                    state_dirty = true;
+                    meta_dirty = true;
+                    let _ = resp.send(result);
+                }
+                CtrlReq::SourceJobDone { warnings, outcome, waiter } => {
+                    // The source's warnings, the parse's and the commands',
+                    // are reported now that the whole file has run.
+                    app.config_warnings = warnings;
+                    write_config_warnings_log(&app.config_warnings);
+                    crate::config::summarize_config_warnings(&mut app);
+                    state_dirty = true;
+                    meta_dirty = true;
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(outcome);
+                    }
                 }
                 CtrlReq::MoveWindow { src, dst, detach, kill, renumber, after, before, resp } => {
                     // tmux cmd-move-window.c. Both outcomes mark the state
@@ -6574,6 +6615,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // #559: a spec that resolves to no window is an error the
                     // caller must see (tmux: "can't find window: N", exit 1).
                     let resolved = (|| -> Result<(usize, usize), String> {
+                        // A window of another session lives in another server.
+                        // The resolver drops the session part, so `xa:0` named
+                        // THIS session's window 0: the swap either exited 0 doing
+                        // nothing or swapped two windows of the wrong session.
+                        // Refuse it the way move-window does (#602 follow up).
+                        for spec in [src.as_deref(), Some(dst.as_str())].into_iter().flatten() {
+                            if let Some(s) = crate::commands::foreign_session_in_spec(&app, spec) {
+                                return Err(crate::commands::cross_session_refusal("swap-window", &s));
+                            }
+                        }
                         let spos = match src.as_deref() {
                             Some(s) => app.resolve_window_spec(s, false)?.pos()
                                 .ok_or_else(|| format!("can't find window: {}", s))?,
@@ -6585,7 +6636,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     })();
                     match resolved {
                         Err(msg) => {
-                            app.status_message = Some((format!("swap-window: {}", msg), Instant::now(), None));
+                            let shown = if msg.starts_with("swap-window:") { msg.clone() } else { format!("swap-window: {}", msg) };
+                            app.status_message = Some((shown, Instant::now(), None));
                             state_dirty = true;
                             let _ = resp.send(Err(msg));
                         }
@@ -7826,7 +7878,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let sd = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let inner_h = fh.saturating_sub(2).max(1);
                     let inner_w = fw.saturating_sub(2).max(1);
-                    let pane_id = app.ids.peek_pane();
+                    let pane_id = app.next_pane_id;
                     // -E: an empty pane has no process (blank until respawn-pane).
                     let pane_opt = if empty {
                         crate::popup::create_empty_pane(inner_h, inner_w, pane_id)
@@ -7850,7 +7902,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         )
                     };
                     if let Some(mut pane) = pane_opt {
-                        app.ids.commit_pane(pane_id);
+                        app.next_pane_id += 1;
                         let title_str = title.clone().unwrap_or_default();
                         if !title_str.is_empty() {
                             pane.title = title_str.clone();

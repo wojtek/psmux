@@ -42,6 +42,7 @@ pub fn handle_pane_forward_extract(
         }
     }
     // Extract the pane node from the tree
+    tree::normalize_window_sizes(&mut app.windows[win_idx]);
     let src_root = std::mem::replace(
         &mut app.windows[win_idx].root,
         Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] },
@@ -103,7 +104,8 @@ pub fn handle_pane_forward_extract(
     };
     let listen_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let shutdown = Arc::new(AtomicBool::new(false));
-    let fwd_id = app.ids.alloc_forward();
+    let fwd_id = app.next_forward_id;
+    app.next_forward_id += 1;
     // The writer was already taken during pane creation and stored in pane.writer
     let pty_writer = pane.writer;
     let pane_local_id = pane.id;
@@ -248,15 +250,15 @@ pub fn handle_pane_forward_inject(
     // pane does not keep the id it had in the source session (tmux keeps it);
     // see docs/design/multi-session-server.md.
     let pane_id = {
-        let dropped = app.warm_pane.set_issued_floor(app.ids.peek_pane());
+        let dropped = app.warm_pane.set_issued_floor(app.next_pane_id);
         if dropped > 0 {
             crate::warm_trace!(
                 "pool: id floor raised to {} by a cross session join, discarded {} spare(s)",
-                app.ids.peek_pane(), dropped
+                app.next_pane_id, dropped
             );
         }
-        let id = app.ids.peek_pane();
-        app.ids.commit_pane(id);
+        let id = app.next_pane_id;
+        app.next_pane_id += 1;
         id
     };
     // Create the proxy pane

@@ -1042,7 +1042,8 @@ pub(crate) fn select_window_requests(
         return (vec![CtrlReq::PrevWindow], None);
     }
     if args.iter().any(|a| *a == "-l") {
-        return (vec![CtrlReq::LastWindow], None);
+        let (s, r) = mpsc::channel();
+        return (vec![CtrlReq::LastWindow { resp: Some(s) }], Some(r));
     }
     // Issue #693 item 4: everything the `-t` can name goes through the ONE
     // resolver move-window and swap-window have used since #602, which is
@@ -3306,6 +3307,13 @@ match cmd {
             .filter(|w| w[0] == "-e")
             .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
             .collect();
+        // -b: new pane top/left (SPAWN_BEFORE); -f: span the whole window
+        // (SPAWN_FULLSIZE). Both used to be parsed by nobody.
+        let split_size = crate::pane::SplitPlacement {
+            size: split_size,
+            before: crate::cli::has_short_flag(&args, 'b'),
+            full: crate::cli::has_short_flag(&args, 'f'),
+        };
         // tmux parity (#582): same `--` argv handling as new-window above.
         let cmd_str: Option<String> = if let Some(pos) = args.iter().position(|a| *a == "--") {
             let tail = &args[pos + 1..];
@@ -4229,7 +4237,16 @@ match cmd {
         }
         if !persistent && pending_chain.is_empty() { break; }
     }
-    "last-window" | "last" => { let _ = tx.send(CtrlReq::LastWindow); }
+    "last-window" | "last" => {
+        let (resp_s, resp_r) = mpsc::channel();
+        let _ = tx.send(CtrlReq::LastWindow { resp: Some(resp_s) });
+        if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+            if !persistent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+            }
+        }
+    }
     "last-pane" | "lastp" if last_pane_input_toggle(&args).is_some() => {
         // last-pane -d / -e: select-pane -l -d / -e, the -t naming the
         // window whose last pane it is; nothing is selected.
@@ -5060,6 +5077,25 @@ match cmd {
         let target_window: String = extract_flag_value(&args, "-t")
             .map(|t| t.trim_matches('"').to_string())
             .unwrap_or_default();
+        // A name no option table knows, user options aside, is what tmux
+        // calls an invalid option: cmd-show-options.c:117 fails with
+        // "invalid option: NAME" unless -q (#846). It used to print an empty
+        // value at rc 0, or read back whatever text an earlier `set` stored.
+        if let Some(name) = opt_name.filter(|n| {
+            !crate::server::option_catalog::is_valid_option_name(n)
+        }) {
+            if !has_q {
+                let output = format!("ERROR: invalid option: {}\n", name);
+                if persistent {
+                    let _ = tx.send(CtrlReq::ShowTextPopup("show-options".to_string(), output));
+                } else {
+                    let _ = write_stream.write_all(output.as_bytes());
+                    let _ = write_stream.flush();
+                }
+            }
+            if !persistent && pending_chain.is_empty() { break; }
+            continue;
+        }
         // A user option is answered from the table the flags pick, and one
         // that table does not hold is "invalid option: @name" at rc 1, which
         // `-q` silences (cmd-show-options.c). It used to print the bare name
@@ -5271,16 +5307,51 @@ match cmd {
         if !persistent && pending_chain.is_empty() { break; }
     }
     "source-file" | "source" => {
-        let format_expand = args.iter().any(|a| *a == "-F");
-        let parse_only = args.iter().any(|a| *a == "-n");
-        let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+        // tmux's flags `Fnqv` and `-t target` (cmd-source-file.c:42), alone or
+        // in a cluster such as `-qF`; the value of -t is not a path.
+        let mut format_expand = false;
+        let mut parse_only = false;
+        let mut quiet = false;
+        let mut paths: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            if !paths.is_empty() {
+                paths.push(a);
+            } else if a == "--" {
+                paths.extend(args[i + 1..].iter().copied());
+                break;
+            } else if a.starts_with('-') && a.len() > 1 {
+                let flags = &a[1..];
+                for (pos, c) in flags.char_indices() {
+                    match c {
+                        'F' => format_expand = true,
+                        'n' => parse_only = true,
+                        'q' => quiet = true,
+                        't' => {
+                            if pos + 1 == flags.len() {
+                                i += 1;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                paths.push(a);
+            }
+            i += 1;
+        }
         if !parse_only {
-            if let Some(path) = non_flag_args.first() {
-                let source_spec = if format_expand {
-                    format!("-F {}", path)
-                } else {
-                    path.to_string()
-                };
+            if let Some(path) = paths.first() {
+                // -q goes along so a missing file stays silent in the server
+                // too (config::parse_source_spec reads both flags).
+                let source_spec = format!(
+                    "{}{}{}",
+                    if quiet { "-q " } else { "" },
+                    if format_expand { "-F " } else { "" },
+                    path
+                );
                 // A one-shot source-file answers once the file has run, as
                 // tmux's does: cmd-source-file.c returns CMD_RETURN_WAIT and
                 // the item continues only when the inserted commands are done
@@ -5289,11 +5360,27 @@ match cmd {
                 // running the file (if-shell conditions are shells), so the
                 // caller's next query queued behind the whole file and timed
                 // out on a loaded machine (#734 follow up, side findings 2B).
-                let (done_tx, done_rx) = mpsc::channel::<()>();
+                let (done_tx, done_rx) = mpsc::channel::<crate::types::SourceOutcome>();
                 let waiter = (!persistent).then_some(done_tx);
                 let _ = tx.send(CtrlReq::SourceFile(source_spec, waiter));
-                // Disconnected once the server loop drops the sender.
-                let _ = done_rx.recv();
+                // The file's commands print what they print, and each error
+                // is an `ERROR:` line, which makes the CLI exit 1 as tmux's
+                // client does (issue #842). Written with write_all so this
+                // source-file itself does not count as failed: tmux runs the
+                // rest of the line (`source-file f \; display x`) whatever a
+                // command inside the file did.
+                if let Ok(outcome) = done_rx.recv() {
+                    let mut reply = outcome.output;
+                    if !reply.is_empty() && !reply.ends_with('\n') {
+                        reply.push('\n');
+                    }
+                    for e in &outcome.errors {
+                        reply.push_str(&format!("ERROR: {}\n", e));
+                    }
+                    if !reply.is_empty() {
+                        let _ = write_stream.write_all(reply.as_bytes());
+                    }
+                }
             }
         }
     }
@@ -6780,6 +6867,11 @@ fn dispatch_control_command(
                 .filter(|w| w[0] == "-e")
                 .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
                 .collect();
+            let split_size = crate::pane::SplitPlacement {
+                size: split_size,
+                before: crate::cli::has_short_flag(&args, 'b'),
+                full: crate::cli::has_short_flag(&args, 'f'),
+            };
             let (rtx, rrx) = mpsc::channel::<String>();
             if print_info {
                 let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title, env_sets, zoom_after_split));
@@ -7211,6 +7303,19 @@ fn dispatch_control_command(
             let target_window2: String = extract_flag_value(&args, "-t")
                 .map(|t| t.trim_matches('"').to_string())
                 .unwrap_or_default();
+            // A name no option table knows: "invalid option", silenced by
+            // `-q` (cmd-show-options.c:117, #846). Same as the one-shot route.
+            if let Some(name) = opt_name.as_deref().filter(|n| {
+                !crate::server::option_catalog::is_valid_option_name(n)
+            }) {
+                let reply = if combined_has2('q') {
+                    String::new()
+                } else {
+                    format!("\u{0001}ERR\u{0001}invalid option: {}", name)
+                };
+                let _ = resp_tx.send(reply);
+                return true;
+            }
             // A user option the chosen table does not hold is "invalid
             // option" like tmux; `-q` silences it. Same as the one-shot route.
             if let Some(name) = opt_name.as_deref().filter(|n| n.starts_with('@')) {
@@ -7708,8 +7813,12 @@ fn dispatch_control_command(
             true
         }
         "last-window" | "last" => {
-            let _ = tx.send(CtrlReq::LastWindow);
-            let _ = resp_tx.send(String::new());
+            let (resp_s, resp_r) = mpsc::channel();
+            let _ = tx.send(CtrlReq::LastWindow { resp: Some(resp_s) });
+            match resp_r.recv_timeout(Duration::from_secs(5)) {
+                Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                _ => { let _ = resp_tx.send(String::new()); }
+            }
             true
         }
         "last-pane" | "lastp" if last_pane_input_toggle(args).is_some() => {

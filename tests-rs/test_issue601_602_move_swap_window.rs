@@ -333,3 +333,64 @@ fn move_window_to_its_own_index_is_a_no_op_not_an_error() {
     assert_eq!(app.move_window(Some("1"), Some("1"), true, false, false, false), Ok(()));
     assert_eq!(render(&app), before);
 }
+
+// ---------------------------------------------------------------------------
+// #601 follow up: a session with no last window reports none
+//
+// tmux 3.4, `new-session -n main; new-window -d -t :1 -n lazygit;
+// new-window -d -t :2 -n claude; select-window -t :0`:
+//   list-windows        0:main* 1:lazygit 2:claude      (psmux said 0:main*-)
+//   last-window         rc 1 "no last window"           (psmux: rc 0, nothing)
+// The current window is never on tmux's last-window stack (session.c:508).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_fresh_session_has_no_last_window() {
+    let app = AppState::new("t601".to_string());
+    assert_eq!(app.last_window_idx, NO_LAST_WINDOW);
+    let app = app_from(&[(0, "main"), (1, "lazygit"), (2, "claude")]);
+    assert_eq!(app.last_window_pos(), None, "nothing has been left yet");
+    assert!(app.resolve_window_spec("!", false).is_err(), "`!` names no window yet");
+}
+
+#[test]
+fn the_current_window_is_never_the_last_window() {
+    let mut app = app_from(&[(0, "main"), (1, "lazygit")]);
+    app.active_idx = 1;
+    app.last_window_idx = 1;
+    assert_eq!(app.last_window_pos(), None);
+    app.last_window_idx = 0;
+    assert_eq!(app.last_window_pos(), Some(0));
+    // A targeted request moves active_idx for its duration; the flag still
+    // answers for the window the user is on.
+    app.temp_focus_saved_active = Some(0);
+    assert_eq!(app.last_window_pos(), None);
+}
+
+#[test]
+fn killing_the_last_window_clears_it_and_lower_kills_shift_it() {
+    // Killed window WAS the last window: tmux drops it from the stack.
+    let mut app = app_from(&[(0, "claude"), (1, "lazygit"), (2, "main")]);
+    app.active_idx = 0;
+    app.last_window_idx = 1;
+    app.windows.remove(1);
+    app.on_window_removed(1);
+    assert_eq!(app.last_window_pos(), None, "was: the `-` moved onto 2:main");
+
+    // A window below the last window dies: the slot follows its window.
+    let mut app = app_from(&[(0, "a"), (1, "b"), (2, "c")]);
+    app.active_idx = 1;
+    app.last_window_idx = 2;
+    app.windows.remove(0);
+    app.on_window_removed(0);
+    app.active_idx -= 1; // callers shift the current window themselves
+    assert_eq!(app.last_window_pos().map(|p| app.windows[p].name.clone()), Some("c".to_string()));
+
+    // A window above it dies: nothing moves.
+    let mut app = app_from(&[(0, "a"), (1, "b"), (2, "c")]);
+    app.active_idx = 1;
+    app.last_window_idx = 0;
+    app.windows.remove(2);
+    app.on_window_removed(2);
+    assert_eq!(app.last_window_pos(), Some(0));
+}

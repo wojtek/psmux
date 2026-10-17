@@ -377,13 +377,13 @@ fn default_status_right_style() {
 #[test]
 fn default_main_pane_width() {
     let app = mock_app();
-    assert_eq!(app.main_pane_width, 0);
+    assert_eq!(app.main_pane_width, "80", "tmux options-table.c default");
 }
 
 #[test]
 fn default_main_pane_height() {
     let app = mock_app();
-    assert_eq!(app.main_pane_height, 0);
+    assert_eq!(app.main_pane_height, "24", "tmux options-table.c default");
 }
 
 #[test]
@@ -939,14 +939,14 @@ fn config_file_mode_style() {
 fn config_file_main_pane_width() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g main-pane-width 80\n");
-    assert_eq!(app.main_pane_width, 80);
+    assert_eq!(app.main_pane_width, "80");
 }
 
 #[test]
 fn config_file_main_pane_height() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g main-pane-height 40\n");
-    assert_eq!(app.main_pane_height, 40);
+    assert_eq!(app.main_pane_height, "40");
 }
 
 #[test]
@@ -1349,11 +1349,12 @@ fn config_flag_a_append_user_option() {
 
 #[test]
 fn config_flag_q_quiet() {
-    // -q should silently accept unknown options
+    // -q silences an unknown option the way tmux's -q does: no warning, and,
+    // as in tmux, nothing is stored (#846).
     let mut app = mock_app();
     parse_config_content(&mut app, "set -gq nonexistent-unknown value\n");
-    // No crash, option stored in user_options because it has hyphens
-    assert!(app.user_options.contains_key("nonexistent-unknown"));
+    assert!(!app.user_options.contains_key("nonexistent-unknown"));
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
 }
 
 #[test]
@@ -1547,14 +1548,14 @@ fn cli_set_status_justify() {
 fn cli_set_main_pane_width() {
     let mut app = mock_app();
     execute_command_string(&mut app, "set-option -g main-pane-width 60").unwrap();
-    assert_eq!(app.main_pane_width, 60);
+    assert_eq!(app.main_pane_width, "60");
 }
 
 #[test]
 fn cli_set_main_pane_height() {
     let mut app = mock_app();
     execute_command_string(&mut app, "set-option -g main-pane-height 30").unwrap();
-    assert_eq!(app.main_pane_height, 30);
+    assert_eq!(app.main_pane_height, "30");
 }
 
 #[test]

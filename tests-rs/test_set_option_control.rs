@@ -220,12 +220,12 @@ fn main_pane_dimensions_are_strings_that_accept_percentages() {
         }
     }
 
-    // psmux stores both as a percentage, so the documented tmux spelling has to
-    // reach the stored value, not just survive validation.
+    // tmux keeps the value as written (a cell count or a percentage) and
+    // resolves it when the layout is applied, so the percent has to survive.
     use crate::server::options::parse_main_pane_size;
-    assert_eq!(parse_main_pane_size("50%"), Some(50));
-    assert_eq!(parse_main_pane_size("50"), Some(50));
-    assert_eq!(parse_main_pane_size(" 10% "), Some(10));
+    assert_eq!(parse_main_pane_size("50%").as_deref(), Some("50%"));
+    assert_eq!(parse_main_pane_size("50").as_deref(), Some("50"));
+    assert_eq!(parse_main_pane_size(" 10% ").as_deref(), Some("10%"));
     assert_eq!(parse_main_pane_size("wide"), None);
 }
 

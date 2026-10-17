@@ -3593,94 +3593,128 @@ mod window_ops_tests {
 }
 
 pub fn resize_pane_vertical(app: &mut AppState, amount: i16) {
-    let win = &mut app.windows[app.active_idx];
-    if win.active_path.is_empty() { return; }
-    
-    for depth in (0..win.active_path.len()).rev() {
-        let parent_path = win.active_path[..depth].to_vec();
-        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
-            if *kind == LayoutKind::Vertical {
-                let idx = win.active_path[depth];
-                if idx < sizes.len() {
-                    if idx + 1 < sizes.len() {
-                        let new_size = (sizes[idx] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx] as i16;
-                        sizes[idx] = new_size;
-                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
-                    } else if idx > 0 {
-                        // tmux parity (#81): last child has no bottom border.
-                        // Resize the previous sibling with the same amount so
-                        // the border moves in the arrow direction.
-                        let new_size = (sizes[idx - 1] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx - 1] as i16;
-                        sizes[idx - 1] = new_size;
-                        sizes[idx] = (sizes[idx] as i16 - diff).max(1) as u16;
-                    }
-                }
-                return;
-            }
-        }
-    }
+    resize_active_pane_cells(app, LayoutKind::Vertical, amount as i32);
 }
 
 pub fn resize_pane_horizontal(app: &mut AppState, amount: i16) {
-    let win = &mut app.windows[app.active_idx];
-    if win.active_path.is_empty() { return; }
-    
-    for depth in (0..win.active_path.len()).rev() {
-        let parent_path = win.active_path[..depth].to_vec();
-        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
-            if *kind == LayoutKind::Horizontal {
-                let idx = win.active_path[depth];
-                if idx < sizes.len() {
-                    if idx + 1 < sizes.len() {
-                        let new_size = (sizes[idx] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx] as i16;
-                        sizes[idx] = new_size;
-                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
-                    } else if idx > 0 {
-                        // tmux parity (#81): last child has no right border.
-                        // Resize the previous sibling with the same amount so
-                        // the border moves in the arrow direction.
-                        let new_size = (sizes[idx - 1] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx - 1] as i16;
-                        sizes[idx - 1] = new_size;
-                        sizes[idx] = (sizes[idx] as i16 - diff).max(1) as u16;
-                    }
-                }
-                return;
+    resize_active_pane_cells(app, LayoutKind::Horizontal, amount as i32);
+}
+
+/// Cells the cell `node` (currently `size` cells along the axis) can give up
+/// before it or any pane inside it goes under the minimum: tmux
+/// `layout_resize_check` (layout.c). A split of the same kind can give what
+/// all its children can; a split the other way only what its tightest child
+/// can.
+fn resize_available(node: &Node, size: u16, is_h: bool) -> u16 {
+    let min = if is_h { crate::pane::MIN_PTY_COLS } else { 1 };
+    match node {
+        Node::Leaf(_) => size.saturating_sub(min),
+        Node::Split { kind, sizes, children } => {
+            let same = matches!(kind, LayoutKind::Horizontal) == is_h;
+            // A split with nothing in it constrains nothing (a placeholder).
+            if children.is_empty() { return size.saturating_sub(min); }
+            if sizes.len() != children.len() { return 0; }
+            if same {
+                children.iter().zip(sizes.iter()).map(|(c, &s)| resize_available(c, s, is_h)).sum()
+            } else {
+                children.iter().map(|c| resize_available(c, size, is_h)).min().unwrap_or(0)
             }
         }
     }
 }
 
-/// Absolute resize: set the active pane's share to an exact size.
-/// axis is "x" (width/horizontal) or "y" (height/vertical).
-pub fn resize_pane_absolute(app: &mut AppState, axis: &str, target: u16) {
-    let win = &mut app.windows[app.active_idx];
-    if win.active_path.is_empty() { return; }
-    let target_kind = if axis == "x" { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-    for depth in (0..win.active_path.len()).rev() {
-        let parent_path = win.active_path[..depth].to_vec();
-        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
-            if *kind == target_kind {
-                let idx = win.active_path[depth];
-                if idx < sizes.len() {
-                    let old = sizes[idx];
-                    let new = target.max(1);
-                    let diff = new as i16 - old as i16;
-                    sizes[idx] = new;
-                    // Absorb the difference from a neighbour
-                    if idx + 1 < sizes.len() {
-                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
-                    } else if idx > 0 {
-                        sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
-                    }
-                }
-                return;
+/// tmux `layout_resize_layout` on one split's cells, in cells: grow or shrink
+/// cell `idx` by `change`, taking the space from the nearest cell that can
+/// spare it (toward the tail, then with `opposite` toward the head) exactly as
+/// layout_resize_pane_grow / layout_resize_pane_shrink do. Returns the
+/// change actually made.
+fn resize_cells(sizes: &mut [u16], children: &[Node], idx: usize, change: i32, opposite: bool, is_h: bool) -> i32 {
+    let n = sizes.len();
+    let avail = |sizes: &[u16], i: usize| resize_available(&children[i], sizes[i], is_h) as i32;
+    let mut needed = change;
+    while needed != 0 {
+        if needed > 0 {
+            let mut remove = (idx + 1..n).find(|&i| avail(sizes, i) > 0);
+            if remove.is_none() && opposite {
+                remove = (0..idx).rev().find(|&i| avail(sizes, i) > 0);
             }
+            let Some(r) = remove else { break };
+            let amt = avail(sizes, r).min(needed);
+            sizes[idx] += amt as u16;
+            sizes[r] -= amt as u16;
+            needed -= amt;
+        } else {
+            let Some(r) = (0..=idx).rev().find(|&i| avail(sizes, i) > 0) else { break };
+            if idx + 1 >= n { break; }
+            let amt = avail(sizes, r).min(-needed);
+            sizes[idx + 1] += amt as u16;
+            sizes[r] -= amt as u16;
+            needed += amt;
         }
     }
+    change - needed
+}
+
+/// The split that `resize-pane` acts on for the active pane, and the cell in
+/// it: tmux walks up from the pane to the nearest parent of the resize's
+/// kind (layout_resize_pane). Returns (parent path, cell index).
+fn resize_target(win: &crate::types::Window, kind: LayoutKind) -> Option<(Vec<usize>, usize)> {
+    for depth in (0..win.active_path.len()).rev() {
+        let parent_path = win.active_path[..depth].to_vec();
+        let mut cur = &win.root;
+        let mut ok = true;
+        for &i in &parent_path {
+            match cur { Node::Split { children, .. } => match children.get(i) { Some(c) => cur = c, None => { ok = false; break; } }, Node::Leaf(_) => { ok = false; break; } }
+        }
+        if !ok { continue; }
+        if let Node::Split { kind: k, .. } = cur {
+            if *k == kind { return Some((parent_path, win.active_path[depth])); }
+        }
+    }
+    None
+}
+
+/// `resize-pane -L/-R/-U/-D N` on the active pane, in cells, with tmux's
+/// layout_resize_pane: a positive `change` moves the border after the pane's
+/// cell right/down; the last cell in a split moves the border before it,
+/// so the border always goes the way the arrow points (#81).
+///
+/// This used to add N to a percentage weight, so one step moved a border
+/// 1.2 columns on a 120 column window and every few steps skipped a column
+/// (61 -> 63), and on 30 rows three `-D 1` moved nothing at all.
+pub fn resize_active_pane_cells(app: &mut AppState, kind: LayoutKind, change: i32) {
+    if app.active_idx >= app.windows.len() { return; }
+    let win = &mut app.windows[app.active_idx];
+    if win.active_path.is_empty() || change == 0 { return; }
+    crate::tree::normalize_window_sizes(win);
+    let Some((parent_path, mut idx)) = resize_target(win, kind) else { return };
+    let is_h = matches!(kind, LayoutKind::Horizontal);
+    if let Some(Node::Split { sizes, children, .. }) = get_split_mut(&mut win.root, &parent_path) {
+        if sizes.len() != children.len() || sizes.len() < 2 { return; }
+        if idx + 1 == sizes.len() { idx -= 1; }
+        resize_cells(sizes, children, idx, change, true, is_h);
+    }
+}
+
+/// Absolute resize: `resize-pane -x/-y N` (tmux layout_resize_pane_to). The
+/// change is worked out on the pane's cell (or the ancestor that sits in a
+/// split of that kind): the last cell measures it from the other side, as
+/// tmux does, and then it is an ordinary layout_resize_pane.
+/// axis is "x" (width/horizontal) or "y" (height/vertical).
+pub fn resize_pane_absolute(app: &mut AppState, axis: &str, target: u16) {
+    if app.active_idx >= app.windows.len() { return; }
+    let kind = if axis == "x" { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+    let change = {
+        let win = &mut app.windows[app.active_idx];
+        if win.active_path.is_empty() { return; }
+        crate::tree::normalize_window_sizes(win);
+        let Some((parent_path, idx)) = resize_target(win, kind) else { return };
+        let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &parent_path) else { return };
+        if idx >= sizes.len() { return; }
+        let size = sizes[idx] as i32;
+        if idx + 1 == sizes.len() { size - target as i32 } else { target as i32 - size }
+    };
+    resize_active_pane_cells(app, kind, change);
 }
 
 /// `rotate-window`: move every pane one slot along the window's pane order.
@@ -3925,6 +3959,7 @@ pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPa
     // when the source window disappears (its Vec position may shift).
     let prev_active_id = app.windows.get(app.active_idx).map(|w| w.id);
 
+    crate::tree::normalize_window_sizes(&mut app.windows[src_idx]);
     let src_root = std::mem::replace(&mut app.windows[src_idx].root,
         Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
     let (remaining, extracted) = crate::tree::extract_node(src_root, &src_path);
@@ -3953,7 +3988,7 @@ pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPa
         root: pane_node,
         active_path: vec![],
         name: win_name,
-        id: app.ids.alloc_window(),
+        id: app.next_win_id,
         area: app.client_area,
         window_size: None,
         window_options: Default::default(),
@@ -3972,6 +4007,7 @@ pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPa
         floating: Vec::new(),
         floating_focus: None,
     });
+    app.next_win_id += 1;
     app.on_window_appended();
     let new_win_id = app.windows.last().map(|w| w.id);
     if src_empty {
@@ -4023,7 +4059,11 @@ pub fn clear_active_pane_history(app: &mut AppState) {
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
         p.leave_copy_snapshot();
         if let Ok(mut parser) = p.term.lock() {
+            let host_win32_input = parser.screen().win32_input_requested();
             *parser = vt100::Parser::new(p.last_rows, p.last_cols, history_limit);
+            // The console host is unchanged, and it asked for win32 input mode
+            // only once, at startup (issue #845).
+            parser.screen_mut().set_win32_input_requested(host_win32_input);
         }
     }
 }
@@ -4348,6 +4388,10 @@ pub fn heal_respawn_pane(
 #[cfg(test)]
 #[path = "../tests-rs/test_issue81_resize_direction.rs"]
 mod test_issue81_resize_direction;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_split_resize_tmux_cells.rs"]
+mod test_split_resize_tmux_cells;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue400_swap_pane_index_order.rs"]

@@ -77,6 +77,202 @@ pub fn split_with_gaps(is_horizontal: bool, sizes: &[u16], area: Rect) -> Vec<Re
     rects
 }
 
+/// The narrowest cell the layout hands out on an axis: tmux's `PANE_MINIMUM`
+/// (1) for rows, `MIN_PTY_COLS` for columns (see `split_with_gaps`).
+fn min_cell(is_horizontal: bool) -> u16 {
+    if is_horizontal { crate::pane::MIN_PTY_COLS } else { 1 }
+}
+
+/// Rewrite every split's `sizes` as the CELL extents its children have in
+/// `area`, the representation tmux keeps (`layout_cell` sx/sy).
+///
+/// `sizes` are relative weights that `split_with_gaps` scales to the area, so
+/// a 50/50 or percentage weight cannot express "move this border one cell":
+/// adding 1 to a percent moved it 1.2 cells and rounded, which skipped 62 on
+/// the way from 61 to 63 on a 120 column window. Once the weights ARE the
+/// cells (and add up to the area less the borders) the scaling is exact, so
+/// split and resize can do tmux's arithmetic on them directly. The geometry
+/// does not change: these are exactly the rects already on screen.
+pub fn normalize_sizes_to_cells(node: &mut Node, area: Rect) {
+    if let Node::Split { kind, sizes, children } = node {
+        if children.is_empty() { return; }
+        let effective: Vec<u16> = if sizes.len() == children.len() { sizes.clone() }
+            else { vec![(100 / children.len().max(1)) as u16; children.len()] };
+        let is_h = matches!(*kind, LayoutKind::Horizontal);
+        let rects = split_with_gaps(is_h, &effective, area);
+        *sizes = rects.iter().map(|r| if is_h { r.width } else { r.height }).collect();
+        for (child, r) in children.iter_mut().zip(rects.iter()) {
+            normalize_sizes_to_cells(child, *r);
+        }
+    }
+}
+
+/// `normalize_sizes_to_cells` for a whole window, against the area it is
+/// laid out in. A window that has not been laid out yet (zero area) keeps
+/// its weights.
+pub fn normalize_window_sizes(win: &mut crate::types::Window) {
+    let area = win.area;
+    // A zoomed window's weights are the 100/0 zoom mask, not its layout.
+    if area.width == 0 || area.height == 0 || win.zoom_saved.is_some() { return; }
+    normalize_sizes_to_cells(&mut win.root, area);
+}
+
+/// tmux `layout_split_sizes` (layout.c): `ss` is the cell being split, `size`
+/// the requested size of the NEW pane (`-l`), or None for the middle split.
+/// Returns (top/left, bottom/right).
+///
+///     s2 = size < 0 ? (ss + 1) / 2 - 1 : before ? ss - size - 1 : size
+///     s2 clamped to [PANE_MINIMUM, ss - 2],  s1 = ss - 1 - s2
+///
+/// so an even cell gives the first pane the extra cell (120 -> 60 | 59) and
+/// `-b -l N` makes the new, first, pane N wide.
+pub fn tmux_split_sizes(ss: u16, size: Option<u16>, before: bool, min: u16) -> (u16, u16) {
+    let ss = ss as i32;
+    let mut s2 = match size {
+        None => (ss + 1) / 2 - 1,
+        Some(n) if before => ss - n as i32 - 1,
+        Some(n) => n as i32,
+    };
+    if s2 < min as i32 { s2 = min as i32; } else if s2 > ss - 2 { s2 = ss - 2; }
+    let s2 = s2.max(0);
+    let s1 = (ss - 1 - s2).max(0);
+    (s1 as u16, s2 as u16)
+}
+
+/// Split the leaf at `path` the way tmux's `layout_split_pane` does and return
+/// the new leaf's path.
+///
+/// * sizes come from `tmux_split_sizes` on the leaf's current cell, so the
+///   split is in cells, not halves of a percentage;
+/// * `before` (`-b`, SPAWN_BEFORE) puts the new pane top/left of the old one;
+/// * when the leaf's parent is already a split of the same kind, the new cell
+///   is inserted into that parent beside the leaf (layout.c: "If the parent
+///   exists and is of the same type as the split, create a new cell and insert
+///   it after this one") instead of nesting a two pane split inside it, which
+///   is what `#{window_layout}` and every later resize see.
+///
+/// `size` is `-l`: (cells, false) or (percent, true). `area` is the window's area. On a path that does not name a leaf the new
+/// leaf is killed (its ConPTY would leak) and None comes back.
+pub fn split_leaf_tmux(root: &mut Node, path: &[usize], area: Rect, kind: LayoutKind, new_leaf: Node, size: Option<(u16, bool)>, before: bool) -> Option<Vec<usize>> {
+    // A path through a leaf, or past the end, names nothing to split: the
+    // new pane is killed so its ConPTY does not leak. (A path naming a split
+    // wraps that split, as replace_leaf_with_split always did.)
+    if get_node(root, path).is_none() {
+        kill_node(new_leaf);
+        return None;
+    }
+    normalize_sizes_to_cells(root, area);
+    let is_h = matches!(kind, LayoutKind::Horizontal);
+    let cell = node_rect(root, area, path).unwrap_or(area);
+    let ss = if is_h { cell.width } else { cell.height };
+    // `-l N%` is a share of the pane being split (cmd-split-window.c takes
+    // curval from wp->sx / wp->sy), truncated as args_percentage does.
+    let size = size.map(|(v, pct)| if pct { (ss as u32 * v as u32 / 100) as u16 } else { v });
+    let (s1, s2) = tmux_split_sizes(ss, size, before, min_cell(is_h));
+    let (old_size, new_size) = if before { (s2, s1) } else { (s1, s2) };
+
+    if let Some((&idx, parent_path)) = path.split_last() {
+        if let Some(Node::Split { kind: pk, sizes, children }) = get_split_mut(root, &parent_path.to_vec()) {
+            if *pk == kind && sizes.len() == children.len() {
+                let at = if before { idx } else { idx + 1 };
+                sizes[idx] = old_size;
+                sizes.insert(at, new_size);
+                children.insert(at, new_leaf);
+                let mut np = parent_path.to_vec();
+                np.push(at);
+                return Some(np);
+            }
+        }
+    }
+    let target = node_at_mut(root, path)?;
+    let old = std::mem::replace(target, Node::Split { kind, sizes: vec![], children: vec![] });
+    if let Node::Split { sizes, children, .. } = target {
+        if before {
+            children.push(new_leaf); children.push(old);
+            *sizes = vec![new_size, old_size];
+        } else {
+            children.push(old); children.push(new_leaf);
+            *sizes = vec![old_size, new_size];
+        }
+    }
+    let mut np = path.to_vec();
+    np.push(if before { 0 } else { 1 });
+    Some(np)
+}
+
+/// `split-window -f` (SPAWN_FULLSIZE in layout_split_pane): the new pane
+/// takes a full width column or full height row of the window, the existing
+/// layout shrinks into the rest. When the root already splits the same way the
+/// new cell joins it (its children are resized into the old share first);
+/// otherwise the root is wrapped in a new split. Returns the new leaf's path.
+pub fn split_full_tmux(root: &mut Node, area: Rect, kind: LayoutKind, new_leaf: Node, size: Option<(u16, bool)>, before: bool) -> Vec<usize> {
+    normalize_sizes_to_cells(root, area);
+    let is_h = matches!(kind, LayoutKind::Horizontal);
+    let ss = if is_h { area.width } else { area.height };
+    // `-f -l N%` is a share of the window (cmd-split-window.c curval = w->sx).
+    let size = size.map(|(v, pct)| if pct { (ss as u32 * v as u32 / 100) as u16 } else { v });
+    let (s1, s2) = tmux_split_sizes(ss, size, before, min_cell(is_h));
+    let (old_size, new_size) = if before { (s2, s1) } else { (s1, s2) };
+    if let Node::Split { kind: rk, sizes, children } = root {
+        if *rk == kind && sizes.len() == children.len() && !children.is_empty() {
+            // layout_resize_child_cells into old_size, then the new cell.
+            let shrunk = if is_h { Rect::new(0, 0, old_size, area.height) } else { Rect::new(0, 0, area.width, old_size) };
+            let rects = split_with_gaps(is_h, sizes, shrunk);
+            *sizes = rects.iter().map(|r| if is_h { r.width } else { r.height }).collect();
+            if before {
+                sizes.insert(0, new_size);
+                children.insert(0, new_leaf);
+                return vec![0];
+            }
+            sizes.push(new_size);
+            children.push(new_leaf);
+            return vec![children.len() - 1];
+        }
+    }
+    let old = std::mem::replace(root, Node::Split { kind, sizes: vec![], children: vec![] });
+    if let Node::Split { sizes, children, .. } = root {
+        if before {
+            children.push(new_leaf); children.push(old);
+            *sizes = vec![new_size, old_size];
+        } else {
+            children.push(old); children.push(new_leaf);
+            *sizes = vec![old_size, new_size];
+        }
+    }
+    vec![if before { 0 } else { 1 }]
+}
+
+/// The rect the node at `path` occupies when `root` is laid out in `area`.
+pub fn node_rect(root: &Node, area: Rect, path: &[usize]) -> Option<Rect> {
+    let mut cur = root;
+    let mut rect = area;
+    for &i in path {
+        match cur {
+            Node::Split { kind, sizes, children } => {
+                let effective: Vec<u16> = if sizes.len() == children.len() { sizes.clone() }
+                    else { vec![(100 / children.len().max(1)) as u16; children.len()] };
+                let rects = split_with_gaps(matches!(*kind, LayoutKind::Horizontal), &effective, rect);
+                rect = *rects.get(i)?;
+                cur = children.get(i)?;
+            }
+            Node::Leaf(_) => return None,
+        }
+    }
+    Some(rect)
+}
+
+/// Drop `sizes[idx]` and give its cells, and the border that went with it, to
+/// the cell that takes the space in tmux's `layout_destroy_cell`: the previous
+/// sibling, or the next one when the first cell goes. Equalising the survivors
+/// (or rescaling them to 100) moved every other border in the window.
+pub fn merge_freed_size(sizes: &mut Vec<u16>, idx: usize) {
+    if idx >= sizes.len() { return; }
+    let freed = sizes.remove(idx);
+    if sizes.is_empty() { return; }
+    let other = if idx == 0 { 0 } else { idx - 1 };
+    sizes[other] = sizes[other].saturating_add(freed).saturating_add(1);
+}
+
 pub fn active_pane_mut<'a>(node: &'a mut Node, path: &Vec<usize>) -> Option<&'a mut Pane> {
     let mut cur = node;
     for &idx in path.iter() {
@@ -161,7 +357,14 @@ pub struct Grafted {
 pub fn graft_pane(win: &mut crate::types::Window, path: &Vec<usize>, kind: LayoutKind, new_leaf: Node, before: bool, focus_new: bool) -> Option<Grafted> {
     let new_id = match &new_leaf { Node::Leaf(p) => Some(p.id), Node::Split { .. } => collect_pane_ids(&new_leaf).first().copied() };
     let prev_id = get_active_pane_id(&win.root, &win.active_path);
-    replace_leaf_with_split_ordered(&mut win.root, path, kind, new_leaf, before);
+    // cmd-join-pane.c splits the target with the same layout_split_pane as
+    // split-window, so the joined pane gets the same cells (60 | 59 on 120).
+    if win.area.width > 0 && win.area.height > 0 {
+        let area = win.area;
+        split_leaf_tmux(&mut win.root, path, area, kind, new_leaf, None, before)?;
+    } else {
+        replace_leaf_with_split_ordered(&mut win.root, path, kind, new_leaf, before);
+    }
     let new_path = new_id.and_then(|id| find_path_by_id(&win.root, id))?;
     let prev_active_path = prev_id.and_then(|id| find_path_by_id(&win.root, id));
     if focus_new {
@@ -197,9 +400,10 @@ pub fn remove_node(n: Node, path: &Vec<usize>) -> Node {
         Node::Leaf(p) => {
             Node::Leaf(p)
         }
-        Node::Split { kind, sizes, children } => {
+        Node::Split { kind, mut sizes, children } => {
             if path.is_empty() { return Node::Split { kind, sizes, children }; }
             let idx = path[0];
+            let n = children.len();
             let mut new_children: Vec<Node> = Vec::new();
             for (i, child) in children.into_iter().enumerate() {
                 if i == idx {
@@ -211,13 +415,27 @@ pub fn remove_node(n: Node, path: &Vec<usize>) -> Node {
             }
             if new_children.len() == 1 { new_children.into_iter().next().unwrap() }
             else {
-                let mut eq = vec![100 / new_children.len() as u16; new_children.len()];
-                let rem = 100 - eq.iter().sum::<u16>();
-                if let Some(last) = eq.last_mut() { *last += rem; }
-                Node::Split { kind, sizes: eq, children: new_children }
+                let sizes = survivor_sizes(&mut sizes, n, idx, new_children.len());
+                Node::Split { kind, sizes, children: new_children }
             }
         }
     }
+}
+
+/// The sizes of a split after child `idx` left it (`n` children before,
+/// `left` after). A child that went away hands its cells to its neighbour
+/// (`merge_freed_size`); a child that stayed (the removal was deeper down)
+/// keeps every size as it was.
+fn survivor_sizes(sizes: &mut Vec<u16>, n: usize, idx: usize, left: usize) -> Vec<u16> {
+    if sizes.len() == n && left + 1 == n {
+        merge_freed_size(sizes, idx);
+        return sizes.clone();
+    }
+    if sizes.len() == left { return sizes.clone(); }
+    let mut eq = vec![100 / left.max(1) as u16; left];
+    let rem = 100u16.saturating_sub(eq.iter().sum::<u16>());
+    if let Some(last) = eq.last_mut() { *last += rem; }
+    eq
 }
 
 /// Extract (detach) a node from the tree at the given path WITHOUT killing it.
@@ -229,8 +447,9 @@ pub fn extract_node(root: Node, path: &[usize]) -> (Option<Node>, Option<Node>) 
     }
     match root {
         Node::Leaf(p) => (Some(Node::Leaf(p)), None), // path doesn't exist
-        Node::Split { kind, sizes, children } => {
+        Node::Split { kind, mut sizes, children } => {
             let idx = path[0];
+            let n = children.len();
             if idx >= children.len() {
                 return (Some(Node::Split { kind, sizes, children }), None);
             }
@@ -247,10 +466,8 @@ pub fn extract_node(root: Node, path: &[usize]) -> (Option<Node>, Option<Node>) 
                 } else if remaining.len() == 1 {
                     Some(remaining.into_iter().next().unwrap())
                 } else {
-                    let mut eq = vec![100 / remaining.len() as u16; remaining.len()];
-                    let rem = 100 - eq.iter().sum::<u16>();
-                    if let Some(last) = eq.last_mut() { *last += rem; }
-                    Some(Node::Split { kind, sizes: eq, children: remaining })
+                    let sizes = survivor_sizes(&mut sizes, n, idx, remaining.len());
+                    Some(Node::Split { kind, sizes, children: remaining })
                 };
                 (tree, extracted)
             } else {
@@ -271,10 +488,8 @@ pub fn extract_node(root: Node, path: &[usize]) -> (Option<Node>, Option<Node>) 
                 } else if new_children.len() == 1 {
                     Some(new_children.into_iter().next().unwrap())
                 } else {
-                    let mut eq = vec![100 / new_children.len() as u16; new_children.len()];
-                    let rem = 100 - eq.iter().sum::<u16>();
-                    if let Some(last) = eq.last_mut() { *last += rem; }
-                    Some(Node::Split { kind, sizes: eq, children: new_children })
+                    let sizes = survivor_sizes(&mut sizes, n, idx, new_children.len());
+                    Some(Node::Split { kind, sizes, children: new_children })
                 };
                 (tree, extracted)
             }
@@ -300,6 +515,42 @@ pub fn compute_rects(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, Rect)>)
     }
     let mut path = Vec::new();
     rec(node, area, &mut path, out);
+}
+
+/// The rects `#{pane_left}`, `#{pane_top}` and friends report: the layout's,
+/// and while the window is zoomed, the layout it had before the zoom with
+/// the zoomed pane over the whole window.
+///
+/// tmux (window_zoom) lays out only the zoomed pane and leaves every other
+/// pane's xoff/yoff/sx/sy as they were, so list-panes on a zoomed window
+/// shows the zoomed pane at 0,0 at full size and the rest where they were.
+/// The weights during a zoom are the 100/0 mask, so computing from them put
+/// the zoomed pane at x 3 and squeezed the hidden ones into two column
+/// slivers at the edge.
+pub fn format_rects(win: &crate::types::Window, out: &mut Vec<(Vec<usize>, Rect)>) {
+    let Some(saved) = win.zoom_saved.as_ref() else {
+        compute_rects(&win.root, win.area, out);
+        return;
+    };
+    fn rec(node: &Node, area: Rect, path: &mut Vec<usize>, saved: &[(Vec<usize>, Vec<u16>)], out: &mut Vec<(Vec<usize>, Rect)>) {
+        match node {
+            Node::Leaf(_) => out.push((path.clone(), area)),
+            Node::Split { kind, sizes, children } => {
+                let base = saved.iter().find(|(p, _)| p == path).map(|(_, s)| s).unwrap_or(sizes);
+                let effective: Vec<u16> = if base.len() == children.len() { base.clone() }
+                    else { vec![(100 / children.len().max(1)) as u16; children.len()] };
+                let rects = split_with_gaps(matches!(*kind, LayoutKind::Horizontal), &effective, area);
+                for (i, child) in children.iter().enumerate() {
+                    if i < rects.len() { path.push(i); rec(child, rects[i], path, saved, out); path.pop(); }
+                }
+            }
+        }
+    }
+    let mut path = Vec::new();
+    rec(&win.root, win.area, &mut path, saved, out);
+    if let Some((_, r)) = out.iter_mut().find(|(p, _)| *p == win.active_path) {
+        *r = win.area;
+    }
 }
 
 /// The pseudoconsole size a pane gets for the layout slot it owns.
@@ -616,18 +867,27 @@ pub fn prune_exited(n: Node, remain_on_exit: bool, kill_descendants: bool) -> (O
         }
         Node::Split { kind, sizes, children } => {
             let mut new_children: Vec<Node> = Vec::new();
-            let mut new_sizes: Vec<u16> = Vec::new();
+            let mut new_sizes: Vec<u16> = if sizes.len() == children.len() { sizes.clone() }
+                else { vec![(100 / children.len().max(1)) as u16; children.len()] };
             let mut newly_dead = 0;
-            for (i, child) in children.into_iter().enumerate() {
+            let mut kept: Vec<Option<Node>> = Vec::new();
+            for child in children.into_iter() {
                 let (pruned, dead_count) = prune_exited(child, remain_on_exit, kill_descendants);
                 newly_dead += dead_count;
-                if let Some(c) = pruned {
-                    new_children.push(c);
-                    new_sizes.push(sizes.get(i).copied().unwrap_or(0));
-                }
+                kept.push(pruned);
             }
+            // Back to front, so each gone child's index into `new_sizes` is
+            // still its own when its cells go to its neighbour (tmux
+            // layout_destroy_cell). The other borders stay where they were.
+            for i in (0..kept.len()).rev() {
+                if kept[i].is_none() && new_sizes.len() > 1 { merge_freed_size(&mut new_sizes, i); }
+            }
+            for c in kept.into_iter().flatten() { new_children.push(c); }
             if new_children.is_empty() { (None, newly_dead) }
             else if new_children.len() == 1 { (Some(new_children.remove(0)), newly_dead) }
+            else if new_sizes.len() == new_children.len() && new_sizes.iter().any(|&s| s > 0) {
+                (Some(Node::Split { kind, sizes: new_sizes, children: new_children }), newly_dead)
+            }
             else {
                 // Redistribute removed pane's percentage proportionally among survivors
                 let total: u16 = new_sizes.iter().sum();
@@ -1197,6 +1457,7 @@ pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool, bool)> {
         // remain-on-exit on` kept dead panes alive everywhere; the reporter's
         // ordinary PowerShell panes stopped closing after `exit` because of it.
         let remain = crate::server::options::window_flag(app, i, "remain-on-exit", global_remain);
+        normalize_window_sizes(&mut app.windows[i]);
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
         let (pruned_result, newly_dead_count) = prune_exited(root, remain, kill_descendants);
         if newly_dead_count > 0 {

@@ -148,7 +148,7 @@ if ("$historyLimitBaseline" -match '^\d+$') {
 Write-Test "show-options -v unknown option"
 $val = Psmux show-options -v nonexistent-option -t feat3 | Out-String
 $val = $val.Trim()
-if ("$val" -eq "" -or "$val" -match "unknown") { Write-Pass "show-options -v unknown returns empty/error" }
+if ("$val" -eq "" -or "$val" -match "unknown|invalid option: nonexistent-option") { Write-Pass "show-options -v unknown returns empty/error (tmux: invalid option)" }
 else { Write-Fail "show-options -v unknown got: '$val'" }
 
 # #655: a plain `-w` listing is the window's OWN table, which is empty on a

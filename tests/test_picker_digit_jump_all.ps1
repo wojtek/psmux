@@ -78,7 +78,11 @@ Add-Result "tree picker open collapses windows" `
 
 Write-Test "Open clears buffer_num_buffer when picker opens"
 Add-Result "buffer picker open clears buffer (CLI path)" `
-    ($src -match '(?s)do_choose_buffer\s*\{[^}]*buffer_num_buffer\.clear\(\)') ""
+    (($src -match '(?s)do_choose_buffer\s*\{[^}]*buffer_num_buffer\.clear\(\)') -or
+     # Since #839 both openers (prefix = and the prompt) share open_buffer_chooser!,
+     # which does the clear; the call site only invokes the macro.
+     (($src -match '(?s)macro_rules!\s*open_buffer_chooser\s*\{[^}]*buffer_num_buffer\.clear\(\)') -and
+      ($src -match '(?s)if\s+do_choose_buffer\s*\{\s*open_buffer_chooser!\(\)'))) ""
 
 # ── Digit handlers ─────────────────────────────────────────────
 Write-Test "Handler: a digit resolves a visible line and rewrites itself to Enter"

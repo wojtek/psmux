@@ -671,8 +671,8 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("visual-bell",                "off"),
     ("bell-action",                "any"),
     // Layout
-    ("main-pane-width",            "0 (60% heuristic)"),
-    ("main-pane-height",           "0 (60% heuristic)"),
+    ("main-pane-width",            "80"),
+    ("main-pane-height",           "24"),
     // Copy / Clipboard
     ("copy-command",               "\"\""),
     // Unicode

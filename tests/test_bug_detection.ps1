@@ -156,7 +156,7 @@ $keys2 = & $PSMUX list-keys -t $S2 2>&1
 $keys2Text = ($keys2 -join "`n")
 
 Write-Test "BUG2: Count how many times 'l' appears in list-keys"
-$lBindings = $keys2 | Where-Object { "$_".Trim() -match 'bind-key -T prefix l ' }
+$lBindings = $keys2 | Where-Object { "$_".Trim() -cmatch 'bind-key -T prefix l ' }  # -cmatch: prefix L (switch-client -l, tmux default) is a different key
 $lCount = ($lBindings | Measure-Object).Count
 Write-Info "Lines with 'bind-key -T prefix l':"
 $lBindings | ForEach-Object { Write-Info "  $_" }
@@ -222,7 +222,7 @@ if ($hasDefaultN) {
 }
 
 Write-Test "BUG3b: User binding 'l -> select-pane -R' registered"
-$lBindings3 = $keys3 | Where-Object { "$_".Trim() -match 'bind-key -T prefix l ' }
+$lBindings3 = $keys3 | Where-Object { "$_".Trim() -cmatch 'bind-key -T prefix l ' }  # -cmatch: prefix L (switch-client -l, tmux default) is a different key
 Write-Info "All 'l' bindings:"
 $lBindings3 | ForEach-Object { Write-Info "  $_" }
 

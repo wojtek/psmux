@@ -117,7 +117,7 @@ fn issue690_relative_flags_are_the_whole_operation() {
 
     let last = select_window_requests(&["-l"], None, Some(0), false, None).0;
     assert_eq!(last.len(), 1);
-    assert!(matches!(last[0], CtrlReq::LastWindow));
+    assert!(matches!(last[0], CtrlReq::LastWindow { .. }));
 
     // ... and with a session-only -t, which is how the suites spell it.
     assert_eq!(count(&["-p"], None, false, Some("sess")), 1);

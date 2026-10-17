@@ -605,7 +605,7 @@ pub(crate) fn cross_session_refusal(cmd: &str, session: &str) -> String {
     let why = match cmd {
         "swap-pane" => "each session runs in its own psmux server; use join-pane to move a pane between sessions",
         "link-window" => "a window cannot be shared by two psmux servers",
-        "move-window" => "each session runs in its own psmux server; use join-pane to move its panes between sessions",
+        "move-window" | "swap-window" => "each session runs in its own psmux server; use join-pane to move its panes between sessions",
         _ => "each session runs in its own psmux server",
     };
     format!("{}: source is in session {} (cross-session {} is not supported: {})", cmd, session, cmd, why)
@@ -723,6 +723,7 @@ pub(crate) fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pa
             if let Some(Node::Split { sizes, .. }) = crate::tree::get_split_mut(&mut win.root, &p) { *sizes = sz; }
         }
     }
+    crate::tree::normalize_window_sizes(&mut app.windows[src_idx]);
     let src_root = std::mem::replace(&mut app.windows[src_idx].root,
         Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
     let (remaining, extracted) = crate::tree::extract_node(src_root, &src_path);
@@ -2180,12 +2181,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "last-window" | "last" => {
-            if app.last_window_idx < app.windows.len() {
+            if let Some(last) = app.last_window_pos() {
                 switch_with_copy_save(app, |app| {
                     let tmp = app.active_idx;
-                    app.active_idx = app.last_window_idx;
+                    app.active_idx = last;
                     app.last_window_idx = tmp;
                 });
+            } else {
+                app.status_message = Some(("no last window".to_string(), std::time::Instant::now(), None));
             }
         }
         "select-window" | "selectw" => {
@@ -2577,13 +2580,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "source-file" | "source" => {
-            // Always apply locally first for immediate visual feedback,
-            // then forward to server for authoritative state update.
-            if let Some(path) = parts.get(1) {
-                crate::config::source_file(app, path);
-            }
+            // With a server, the server runs the file once: its source-file
+            // runs the file's commands in order (issue #842). Running it here
+            // as well, as this arm used to, ran the file twice, so a hook's
+            // `source-file` made every window in it twice.
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+            } else if let Some(path) = parts.get(1) {
+                crate::config::source_file(app, path);
             }
         }
         "send-keys" | "send" => {
@@ -2856,6 +2860,9 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     if let Ok(mut parser) = p.term.lock() {
                         let mut fresh = vt100::Parser::new(p.last_rows, p.last_cols, history_limit);
                         fresh.screen_mut().set_allow_alternate_screen(allow_alt);
+                        // Same console host, so the same answer to "does it
+                        // parse win32 input records" (issue #845).
+                        fresh.screen_mut().set_win32_input_requested(parser.screen().win32_input_requested());
                         *parser = fresh;
                     }
                 }

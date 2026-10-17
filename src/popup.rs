@@ -410,7 +410,7 @@ pub fn open_display_popup(
             start_dir.as_deref(),
             rows,
             cols,
-            app.ids.peek_pane(),
+            app.next_pane_id,
             session_name,
             env,
             &app.env_scopes.child_removals(&app.environment),

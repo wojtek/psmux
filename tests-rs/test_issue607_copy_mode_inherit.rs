@@ -54,9 +54,9 @@ fn pane_in_copy(app: &AppState, id: usize) -> bool {
 /// Returns None when a pseudo console cannot be opened at all, so the test is
 /// skipped rather than failed on a machine that cannot make one.
 fn empty_pane(app: &mut AppState) -> Option<(usize, Node)> {
-    let id = app.ids.peek_pane();
+    let id = app.next_pane_id;
     let pane = crate::popup::create_empty_pane(24, 80, id)?;
-    app.ids.commit_pane(id);
+    app.next_pane_id += 1;
     Some((id, Node::Leaf(pane)))
 }
 
@@ -127,7 +127,7 @@ fn a_new_window_does_not_open_in_copy_mode() {
         root: leaf,
         active_path: vec![],
         name: "w1".to_string(),
-        id: app.ids.alloc_window(),
+        id: app.next_win_id,
         area: app.client_area,
         window_size: None,
         window_options: Default::default(),
@@ -144,6 +144,7 @@ fn a_new_window_does_not_open_in_copy_mode() {
         floating: Vec::new(),
         floating_focus: None,
     });
+    app.next_win_id += 1;
     app.active_idx = app.windows.len() - 1;
     retarget_mode_to_active_pane(&mut app, prev);
 

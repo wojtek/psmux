@@ -1,6 +1,21 @@
 # Design: a shared multi session server (issue #798)
 
-Status: proposal. Nothing in this document is implemented. Every number below was
+Status: proposal. Nothing in this document is implemented.
+
+> **Owner ruling, 2026-10-17. This overrides anything below that disagrees with it.**
+>
+> 1. The shared server is a **switch**, not a structural change. It is turned on with
+>    `PSMUX_SERVER_MODE=shared` (or `set -s server-mode shared`) and turned off by
+>    unsetting it. With the switch off, psmux runs exactly the code it runs today.
+> 2. **Everything** for the shared server lives behind that switch. No PR may change
+>    the code path a default (per session) build runs, not even as a "zero behaviour
+>    change" refactor. Stage 0 as first written (refactors of the shared code paths)
+>    is withdrawn; the stage 0a id allocator (PR #838, 13064512) was merged and then
+>    reverted for this reason.
+> 3. There is **no planned default flip**. Stage 4 is withdrawn. One server per session
+>    stays the default; the shared mode stays opt in for as long as the owner decides.
+> 4. Multiple servers stay possible: each `-L` namespace is its own server, and in
+>    shared mode each one hosts many sessions, like tmux. Every number below was
 measured on master `98392248` (psmux 3.4.0, Windows 11 26200) with a private
 `PSMUX_DATA_DIR` and a unique `-L` namespace, or counted with `grep` over `src/`,
 `crates/`, `tests/` and `tests-rs/` at that commit. Where something could not be
@@ -15,9 +30,9 @@ three conditions:
 
 1. Multiple servers must still be possible: each `-L` namespace is one server, and
    each server hosts many sessions, exactly like tmux.
-2. It ships opt in, step by step, and today's one server per session model stays the
-   default until the shared mode has passed the full test sweep across several
-   releases.
+2. It ships as an opt in switch, step by step, and today's one server per session
+   model stays the default. Turning the switch off must always give back exactly
+   today's behaviour (see the owner ruling at the top).
 3. Every step must be shippable, reversible and tested on its own, because a bug in
    the process model is the kind that takes weeks to find on a project with 3.7k stars.
 
@@ -44,7 +59,8 @@ Goals
 
 Non goals
 
-* Changing the default in the same release that introduces the mode.
+* Changing the default. The shared mode is opt in only (owner ruling).
+* Changing the code that a default (per session) build runs.
 * A Unix socket, or any change to the TCP plus key file transport.
 * Moving a live ConPTY between processes (section 4.3 explains why).
 * Merging namespaces. `-L a` and `-L b` stay separate processes forever, which is
@@ -300,9 +316,14 @@ Every stage is a separate release train item, ships behind a switch where it cha
 behaviour, has its own test gate, and can be reverted without touching the stages
 before it.
 
-### Stage 0: make the code ready, zero behaviour change
+### Stage 0: withdrawn (owner ruling, 2026-10-17)
 
-The default build behaves byte for byte as today. Each item is its own PR.
+The items below were written as refactors of the code every build runs. Under the
+owner ruling they may not land that way. Where the shared server needs any of them
+(an id allocator, a session id on requests, per session loop state, option layering,
+an exit funnel), it gets its own version inside the shared mode code, entered only
+when the switch is on. The list stays here as a record of what the shared mode has to
+provide, not as a plan for the default path. Each item, when built, is its own PR.
 
 * **0a. Server owned id allocator.** Move `next_win_id`, `next_pane_id` and the
   forward id counter out of `AppState` into a `ServerIds` struct owned by the server
@@ -393,9 +414,10 @@ Gate: section 7 in full, twice (both modes), plus the shared mode only suites.
 * `switch-client -t`, `-n`, `-p`, `-l` and `choose-tree` switch sessions inside the
   server; the `SWITCH` reconnect remains for targets on other servers.
 
-### Stage 4: default flip
+### Stage 4: withdrawn (owner ruling, 2026-10-17)
 
-Only after all of the following hold:
+There is no planned default flip. The text below is kept only as a record of the old
+plan. If the owner ever reconsiders, these were the minimum conditions:
 
 * Three consecutive releases with shared mode available, and the full sweep green in
   both modes on every release candidate.
@@ -508,6 +530,15 @@ Shared mode specific gates:
   restart the namespace; nothing on disk needs converting.
 
 ## 11. The first contributor sized PR
+
+**Superseded by the owner ruling.** The PR described below (stage 0a) was merged as
+#838 and reverted, because it changed code every build runs. The first PR now is the
+switch itself: read `PSMUX_SERVER_MODE` / `server-mode` where a server is about to be
+started, with `per-session` (the default) taking exactly today's path, unchanged, and
+`shared` entering new code of its own. A test must prove that with the switch unset
+the default path is untouched (same ids, same files, same processes as master).
+
+The original stage 0a text, for the record:
 
 **Stage 0a: a server owned id allocator, no behaviour change.**
 

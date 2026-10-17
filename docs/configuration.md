@@ -134,6 +134,8 @@ Details worth knowing:
 
 ## All Set Options
 
+As in tmux, a name that is neither in this table, nor in tmux's own options table, nor a `@user` option is refused: `set-option` and `show-options` fail with `invalid option: NAME`, and `-q` makes that a silent success that sets nothing. In a config file it is reported as `unknown option 'NAME'` and skipped. A tmux option psmux does not implement (`visual-silence`, `lock-command` and so on) is accepted and read back as text. Use `set-environment`, not `set-option`, for environment variables.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `prefix` | Key | `C-b` | Prefix key |
@@ -192,6 +194,8 @@ Details worth knowing:
 | `bell-action` | Str | `any` | Bell action: controls audible bell forwarding and status bar flag (`any`, `none`, `current`, `other`) |
 | `visual-bell` | Bool | `off` | Visual bell indicator |
 | `allow-passthrough` | Str | `off` | Allow terminal passthrough sequences (`on`/`off`/`all`) |
+| `extended-keys` | Choice | `off` | tmux compatibility (`off`/`on`/`always`): stored and reported so a program probing `show -gv extended-keys` reads what tmux gives. psmux does not need it: extended keys from the terminal are always decoded, and modifiers reach panes through win32 input mode |
+| `extended-keys-format` | Choice | `xterm` | tmux compatibility (`csi-u`/`xterm`): stored and reported, not consulted |
 | `allow-rename` | Bool | `on` | Allow programs to set window title via escape sequences |
 | `allow-set-title` | Bool | `off` | Allow programs to set pane title via OSC 0/2 escape sequences (see [pane-titles.md](pane-titles.md)) |
 | `allow-predictions` | Bool | `off` | Preserve PSReadLine prediction settings (see below) |
@@ -202,8 +206,8 @@ Details worth knowing:
 | `codepoint-widths` | Str | | Comma separated overrides for how many columns Unicode codepoints occupy (see [Codepoint widths](#codepoint-widths)) |
 | `terminal-overrides` | Str | | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen (see [Terminal overrides](#terminal-overrides)) |
 | `set-clipboard` | Str | `external` | Clipboard interaction (`on`/`off`/`external`). A copy mode yank reaches the Windows clipboard on every value, with OSC 52 to the outer terminal unless `off`. An application's own OSC 52 creates a paste buffer only on `on`, as in tmux; on `external` psmux still forwards it to the outer terminal and the Windows clipboard, where tmux ignores it; `off` ignores it |
-| `main-pane-width` | Int | `0` | Main pane width in main-vertical layout |
-| `main-pane-height` | Int | `0` | Main pane height in main-horizontal layout |
+| `main-pane-width` | String | `80` | Main pane width in the main-vertical layout, in cells or a percentage such as `30%` |
+| `main-pane-height` | String | `24` | Main pane height in the main-horizontal layout, in cells or a percentage such as `30%` |
 | `session-group` | Str | | Name of the session group this session joins. `none` or an empty value clears it. See [Session Groups](#session-groups) |
 | `command-alias` | Str | | Define your own command alias as `alias=expansion`. See [Command Aliases](#command-aliases) |
 
@@ -1077,6 +1081,22 @@ This re-executes every line in the config file, applying any changes to options,
 Like tmux, `source-file` only runs the file's commands: bindings made before it stay. A `bind` typed at
 the CLI survives, and files sourced one after another (a plugin manager's, for example) all keep
 their bindings.
+
+The file's commands run in order, each once the one before it has finished, as tmux runs them: a
+`split-window` after a `new-window` splits the new window. The options and bindings before the file's
+first command apply at once; everything from that command on waits its turn. `psmux source-file`
+returns once the commands have run and prints what they print. Every problem in the file is an
+error, as in tmux: a command that fails, a nested file that cannot be read, an unknown option or a
+bad value. `source-file` prints each on stderr and exits 1, and the rest of the file still runs.
+With `-q`, a file that does not exist is skipped without a word.
+
+A file may source other files, and a path may be a glob. A nested file's commands run where its
+`source-file` line stands, before the rest of the outer file, down to 50 levels as in tmux (deeper
+is `too many nested files`). A file that would source a file already being sourced, itself or one
+further out, is an error. When the `source-file` line always runs, `source-file` refuses the whole
+file before any of its lines take effect; one in a key binding, a `%if` block or an `if-shell` block
+is checked only if and when it runs, so a reload key such as `bind r { source-file ~/.tmux.conf }` is
+fine. tmux has no such check and runs a self-sourcing file until the nesting limit.
 
 One deliberate difference from tmux: sourcing the config file the server **started with** (the `-f`
 file or `PSMUX_CONFIG_FILE`, otherwise the first of `~/.psmux.conf`, `~/.psmuxrc`, `~/.tmux.conf`,
