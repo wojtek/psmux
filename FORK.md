@@ -258,10 +258,15 @@ Routine maintenance of this fork does not use published side branches or pull
 requests within the fork. A temporary detached worktree is allowed when needed
 to protect active uncommitted files.
 
-Run the focused, server-free Rust tests for the retained differences and
-`cargo check` locally. Run the complete suite only in CI or another disposable
-Windows environment, as required by `AGENTS.md`, before replacing the installed
-executable.
+Run `cargo check` and the focused, server-free Rust tests for the retained
+differences and for whatever a merge had to resolve. A build that compiles and
+passes them is installed; the owner's daily use is the acceptance check. The
+complete suite is not a condition for installing, and it runs only in CI or
+another disposable Windows environment, as `AGENTS.md` requires, because some
+of its tests create real sessions. GitHub Actions stays off for this fork:
+GitHub disabled the inherited workflows to save compute, and the owner chose not
+to re-enable them, so a push runs nothing and the workflow files stay as
+upstream ships them.
 
 The retained #805 and dangling-flag tests follow the fork's function composition,
 opt-in agent teams and literal send-keys boundary. Plugin discovery fixtures set
