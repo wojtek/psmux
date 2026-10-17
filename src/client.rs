@@ -7074,6 +7074,15 @@ fn run_remote_attachment(
                                     && paste_burst_active
                                     && (!key.modifiers.contains(KeyModifiers::CONTROL)
                                         || is_altgr_char(c, key.modifiers)) => {}
+                                // Ctrl+Backspace and Ctrl+Delete clear the
+                                // whole name, as C-u does, so the name the
+                                // overlay opens on goes in one key instead of
+                                // a Backspace per character. A terminal on the
+                                // VT input route that sends Ctrl+Backspace as
+                                // 0x08 delivers C-h, which stays a Backspace.
+                                KeyCode::Backspace | KeyCode::Delete if renaming && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "c-u", || None);
+                                }
                                 // The copy-mode prompt editor, as it stands,
                                 // reused here: tmux reaches this overlay
                                 // through `command-prompt`, which has the full
@@ -7082,13 +7091,6 @@ fn run_remote_attachment(
                                 // this, only called.
                                 KeyCode::Backspace if renaming => {
                                     let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "backspace", || None);
-                                }
-                                // Ctrl+Delete clears the whole name, as C-u
-                                // does, so the name the overlay opens on goes
-                                // in one key instead of a Backspace per
-                                // character.
-                                KeyCode::Delete if renaming && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "c-u", || None);
                                 }
                                 KeyCode::Delete if renaming => {
                                     let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &mut prompt_saved, "delete", || None);
